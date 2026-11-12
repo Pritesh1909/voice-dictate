@@ -57,7 +57,7 @@ def test_pages_have_learning_specs():
     privacy = {s.label: s for s in group("Extras", "Privacy and files")}
     keep = privacy["Keep recordings for learning"]
     assert (keep.key, keep.kind, keep.help) == (
-        ("learning", "keep_recordings"), "switch", "On this PC only, deleted after 14 days.")
+        ("learning", "keep_recordings"), "switch", "On this PC only, deleted after the number of days below.")
     days = privacy["Keep recordings for (days)"]
     assert (days.key, days.kind, days.help, days.lo, days.hi) == (
         ("learning", "keep_days"), "int", "1-365.", 1, 365)

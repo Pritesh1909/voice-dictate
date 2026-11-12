@@ -209,7 +209,7 @@ PAGES: list[tuple[str, list[tuple[str, list[Spec]]]]] = [
             S(("history", "max_items"), "int", "History length (dictations)",
               "10-5000, the oldest dropped first.", lo=10, hi=5000, step=10),
             S(("learning", "keep_recordings"), "switch", "Keep recordings for learning",
-              "On this PC only, deleted after 14 days."),
+              "On this PC only, deleted after the number of days below."),
             S(("learning", "keep_days"), "int", "Keep recordings for (days)", "1-365.", lo=1, hi=365),
             S(None, "action", "Recordings", "Saved dictations used for learning.",
               choices=(("delete_recordings", "Delete all"), ("open_recordings", "Open folder"))),
