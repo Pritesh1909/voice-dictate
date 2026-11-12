@@ -108,6 +108,7 @@ class Config:
     context_folders: tuple[str, ...]               # environment variables expanded
     context_max_terms: int
     context_refresh_minutes: int
+    context_code_apps: tuple[str, ...]             # app_key() names
     apps: tuple[tuple[str, AppOverride], ...]      # (exe name, lower case, without ".exe"; overrides)
     source_mtime: float = field(default=0.0, compare=False)
 
@@ -192,6 +193,7 @@ def parse(text: str, defaults_text: str | None = None) -> Config:
         context_folders=tuple(os.path.expandvars(f) for f in _str_list(d, "context", "folders")),
         context_max_terms=_get(d, "context", "max_terms", int, lambda v: 0 <= v <= 500),
         context_refresh_minutes=_get(d, "context", "refresh_minutes", int, lambda v: 1 <= v <= 1440),
+        context_code_apps=tuple(app_key(x) for x in _str_list(d, "context", "code_apps")),
         apps=_apps(d),
     )
 

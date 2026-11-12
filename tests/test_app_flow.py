@@ -99,6 +99,8 @@ def make_app(engine, audio=None, live=False, **cfg_over):
     app = App.__new__(App)          # no tray, hotkey, microphone or model process
     app.cfg, app.cleaner = cfg, Cleaner.from_config(cfg)
     app.target_exe, app._cleaners, app.model = "", {}, None   # per-program clean-up (cleaner_for)
+    app.target_hwnd, app.target_terms, app.learned = 0, [], []  # "scratch that" window, context words, learned
+    app._check_learned = lambda: None                            # no learned.toml here
     app.engine, app.recorder = engine, FakeRecorder(speech() if audio is None else audio)
     app.overlay = app.icon = None
     app.sounds = types.SimpleNamespace(play=lambda name: None)

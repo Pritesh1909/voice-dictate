@@ -13,6 +13,10 @@ Nothing leaves the laptop, and no admin rights are needed.
 | Dictate (hold mode) | Hold **Ctrl+Q** while speaking, then let go |
 | Cancel a recording | **Esc** (nothing is typed) |
 | Retype the last result | Tray icon → *Copy last dictation*, then paste |
+| Fix a word for next time | Tray icon → *Correct last dictation…*: fix the text, tick the spellings to learn, *Save* |
+| New line / empty line | Say **"new line"** or **"new paragraph"** on its own, between two pauses |
+| Take back the last phrase | Say **"scratch that"** (or "delete that") on its own |
+| Stop without the hotkey | Say **"stop listening"** on its own |
 | Recognition failed | Tray icon → *Retry last recording* (or *Discard last recording*). The audio is kept in memory only, never on disk |
 | Send it straight away | `[output] press_enter = true` presses Enter after the text is typed |
 | Change settings | Tray icon → *Settings…* (applied on the next dictation) |
@@ -39,6 +43,71 @@ clipboard instead and a notification says so; with typing while you talk, what w
 
 Ctrl+Q is taken over system-wide while the app runs, so other apps no longer receive it
 (for example "quit" in some apps, or XON in terminals).
+
+### Spoken commands
+
+A command only counts when the whole phrase (what you say between two pauses) is just the command, so
+"I added a new line to the file" is typed as said. Capitals and punctuation don't matter. Change, add or
+remove phrases in `[commands.phrases]` (what each does: `newline`, `paragraph`, `undo`, `stop`), or turn
+them off with `[commands] enabled = false`.
+
+- **"new line"** types a line break, **"new paragraph"** two. The space typed after the previous phrase is
+  taken back first so lines don't end in a space (only when typing, not pasting).
+- **"scratch that"** removes the phrase typed just before it, with Backspace. The app knows exactly what it
+  typed, so it presses Backspace exactly that many times, but only with `method = "type"` and only if the
+  window you started dictating into is still in front; when pasting, or in another window, nothing is
+  removed. Not yet typed (Ctrl still held, or typing everything at the end) means it is simply dropped.
+  **Limit:** editors that add characters by themselves while you type (auto-closing brackets or quotes,
+  auto-indent, auto-complete) change what is on screen, so the count can be off there.
+- **"stop listening"** ends the dictation like the hotkey; it isn't typed.
+
+### Learn from corrections
+
+Tray → *Correct last dictation…* opens a small window with the last dictated text. Fix the words the
+model got wrong and the window proposes dictionary entries, each with a checkbox: "key cloak" → **Keycloak**
+needs only the spelling (spacing and capitals are matched anyway); "mail sey" → **Mailzzy** is saved as
+"heard as". Punctuation, a capital at the start of a sentence, added or removed words, rewrites of more
+than four words and swaps of one ordinary word for another ("their" → "there") are not proposed.
+*Save* writes the ticked ones to `%APPDATA%\ParakeetDictate\learned.toml` (same layout as `[dictionary]`;
+your `config.toml` is never rewritten). They apply from the next dictation, after your own `[dictionary]`.
+The window runs as its own small process, so it can't disturb the tray app.
+
+### Context words
+
+`[context]` spells code names the way you write them, from the window you dictate into (its title, such as
+`McpAuthFilter.java - ss-core-service`, and its program name) and from your notes (`folders`, by default
+`D:\Obsidian\Knowledgebase`; add more, e.g. `folders = ["D:\\Obsidian\\Knowledgebase", "D:\\work"]`, only
+`.md` files are read). Notes are scanned in the background (about 1 s for 140 notes, then only changed notes
+are read again, at most every `refresh_minutes`), never while you dictate. The found names are kept in
+`%LOCALAPPDATA%\ParakeetDictate\context_terms.json`; no note text is copied.
+
+Only the spelling, spacing and capitals of words you actually said change ("mcp auth filter" →
+**McpAuthFilter**, "ss core service" → **ss-core-service**), and ordinary speech is protected:
+
+- Only names that take two or more spoken words are picked up (CamelCase, joined with `-` `_` `.`, letters
+  with digits like `V2`) and ALL-CAPS acronyms. Single plain words ("Docker") never are: put those in `[dictionary]`.
+- An acronym that reads as ordinary words is dropped: `IAM` would turn "I am going" into "IAM going".
+- A name made only of ordinary words (`userId`, `displayName`, lower-case compounds like `customer-facing`)
+  is used only in the programs listed in `[context] code_apps` (IntelliJ, VS Code, Windows Terminal, Orca,
+  DataGrip, PyCharm, Cursor), so "the user id field" stays as you said it in an email.
+- A name with an unusual part (`ss-core-service`, `McpAuthFilter`, `SHA-256`) is used everywhere.
+
+Your own `[dictionary]` comes first, then learned words, then window-title words, then note words.
+`[dictionary.apps]` terms for the program in front win over all of them. Models that support word
+boosting also get the note words that are safe everywhere (Parakeet doesn't support boosting).
+
+### Settings per program
+
+`[apps."<program>.exe"]` changes output settings for one program (the window in front when you start
+dictating): `method`, `add_trailing_space`, `type_while_speaking`, `press_enter` and `commands`. Program
+names match like `[dictionary.apps]` (capitals don't matter, ".exe" may be left out). For example:
+
+```toml
+[apps."windowsterminal.exe"]
+commands = false
+[apps."slack.exe"]
+press_enter = true
+```
 
 ## What it does for accuracy
 
@@ -86,6 +155,8 @@ A new dictation within the 30 s reuses the loaded model and starts instantly. Ch
 ## Files
 
 - Settings: `%APPDATA%\ParakeetDictate\config.toml` (created from `parakeet_dictate\config.default.toml`)
+- Learned words: `%APPDATA%\ParakeetDictate\learned.toml`; names found in your notes:
+  `%LOCALAPPDATA%\ParakeetDictate\context_terms.json` (names, file times and one-way word hashes; no note text)
 - Log, sounds, icon, the chosen model (`model_path.txt`): `%LOCALAPPDATA%\ParakeetDictate\`. Recognised text is **not**
   logged unless `[output] log_transcripts = true`.
 

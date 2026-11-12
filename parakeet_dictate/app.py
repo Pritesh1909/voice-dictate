@@ -13,7 +13,8 @@ import pystray
 
 from . import APP_NAME, __version__
 from . import config as cfgmod
-from . import models, output, winutil
+from . import commands, context, correct, learn, models, output, winutil
+from .appsettings import settings_for
 from .audio import SR, Recorder, preprocess, resample, silence_stop_due, silence_stop_message
 from .engine import GPU_MARKER, Engine, EngineError, EngineSpec
 from .hotkey import HotkeyError, HotkeyThread, key_down
@@ -60,9 +61,16 @@ class Session:
         self.segmenter = Segmenter(self.rate, self.pause)
         self.seg_rate = self.rate
         self.normalize = app.cfg.normalize_audio
+        self.out = settings_for(app.target_exe, app.cfg)    # [output] with that program's [apps] overrides
         self.cleaner = app.cleaner_for(app.target_exe)   # the program dictated into: its terms come first
-        self.typer = (output.PhraseTyper(self.cleaner.clean, app.cfg.output_method, app.cfg.add_trailing_space)
-                      if self.parallel and app.cfg.type_while_speaking else None)
+        if app.target_terms:                              # context words: lowest rank, this dictation only
+            self.cleaner = self.cleaner.with_extra(app.target_terms)
+        self.matcher = commands.CommandMatcher(app.cfg.commands, self.out.commands)
+        self.hwnd = app.target_hwnd                       # "scratch that" only backspaces in this window
+        self.typer = (output.PhraseTyper(self.cleaner.clean, self.out.method, self.out.add_trailing_space,
+                                         matcher=self.matcher, can_backspace=self._same_window,
+                                         on_stop=self._voice_stop)
+                      if self.parallel and self.out.type_while_speaking else None)
         self.total_samples = 0
         self.parts = 0
         self.decode_seconds = 0.0
@@ -76,6 +84,13 @@ class Session:
         self._worker.start()
         self._pump_thread = threading.Thread(target=self._pump, daemon=True, name=f"pump-{sid}")
         self._pump_thread.start()
+
+    def _same_window(self) -> bool:
+        """Backspace is only safe when typing (never when pasting) into the window the dictation began in."""
+        return self.out.method == "type" and bool(self.hwnd) and winutil.foreground_window() == self.hwnd
+
+    def _voice_stop(self) -> None:
+        self.app.stop_from_voice(self.id)
 
     @property
     def writing(self) -> bool:
@@ -156,8 +171,11 @@ class Session:
                 self.decode_seconds += secs
                 self._results[idx] = raw.strip()
                 if self.typer and raw.strip() and not self._cancelled:
-                    self.typer.add(raw.strip())
+                    self.typer.add(raw.strip())       # a spoken "stop listening" calls _voice_stop
                     self.typer.pump()
+                elif (self.parallel and self.matcher.enabled and raw.strip()
+                      and self.matcher.match(self.cleaner.clean(raw)) == commands.STOP):
+                    self._voice_stop()
             except Exception as e:  # reported by finish()
                 self._error = self._error or e
                 if self.typer:
@@ -180,6 +198,18 @@ class Session:
             self.typer.pump(wait=True)
         return " ".join(t for _, t in sorted(self._results.items()) if t)
 
+    def phrases(self) -> list[str]:
+        """The raw text of each phrase, in order (after finish())."""
+        return [t for _, t in sorted(self._results.items()) if t]
+
+    def text(self, raw: str) -> str:
+        """Whole-dictation output: cleaned, with any spoken commands carried out (nothing typed yet)."""
+        if self.matcher.enabled:
+            cleaned = [self.cleaner.clean(p) for p in self.phrases()]
+            if any(self.matcher.match(c) for c in cleaned):
+                return commands.compose(cleaned, self.matcher)[0]
+        return self.cleaner.clean(raw)
+
     def recording(self) -> np.ndarray:
         """Everything recorded so far, at the microphone's rate."""
         return np.concatenate(self._buffer) if self._buffer else np.zeros(0, np.float32)
@@ -197,9 +227,16 @@ class App:
         self.cfg = cfgmod.load(paths)
         self.sounds = winutil.Sounds(paths.data_dir)
         self.ico = write_ico(paths.data_dir / "icon.ico")
+        self.learned: list[tuple[str, str]] = []   # learned.toml ("Correct last dictation…")
+        self._learned_stamp: int | None = None
         self.cleaner = self._make_cleaner(self.cfg)
+        self._check_learned()
+        self.context = context.ContextScanner(paths.context_cache, *self._context_settings(self.cfg))
+        self._vocab = self._vocabulary(self.cfg)      # notes' terms boosted in models that support it
         self.recorder = Recorder(self.cfg.input_device)
         self.target_exe = ""         # the program in front when the current dictation started
+        self.target_hwnd = 0         # ... and its window, for "scratch that"
+        self.target_terms: list[tuple[str, str]] = []   # context words for the current dictation
         self.icon: pystray.Icon | None = None
         self.problem: str | None = None
         self.model: models.Model | None = None
@@ -346,7 +383,7 @@ class App:
 
     def _make_cleaner(self, c: cfgmod.Config) -> Cleaner:
         self._cleaners: dict[tuple, Cleaner] = {}   # (program, languages) -> Cleaner, for these settings
-        return Cleaner.from_config(c)
+        return Cleaner.from_config(c, learned=self.learned)
 
     def cleaner_for(self, exe: str) -> Cleaner:
         """The clean-up for dictating into `exe` ("Code.exe"; "" = unknown): that program's
@@ -358,8 +395,57 @@ class App:
             terms = [t for name, entry in self.cfg.app_dictionaries if name == key[0] for t in entry]
             log.info("clean-up for %s: %d program term(s), fillers for %s", exe or "an unknown program",
                      len(terms), "/".join(langs) or "an unknown language")
-            cleaner = self._cleaners[key] = Cleaner.from_config(self.cfg, languages=langs, app_terms=terms)
+            cleaner = self._cleaners[key] = Cleaner.from_config(self.cfg, languages=langs, app_terms=terms,
+                                                                learned=self.learned)
         return cleaner
+
+    def _check_learned(self) -> None:
+        """Pick up learned.toml when the correction window has saved to it (checked at each dictation)."""
+        try:
+            stamp = self.paths.learned_file.stat().st_mtime_ns
+        except OSError:
+            stamp = None
+        if stamp == self._learned_stamp:
+            return
+        self._learned_stamp = stamp
+        self.learned = learn.load(self.paths.learned_file)
+        self.cleaner = self._make_cleaner(self.cfg)
+        log.info("learned words: %d entr%s", len(self.learned), "y" if len(self.learned) == 1 else "ies")
+
+    @staticmethod
+    def _context_settings(c: cfgmod.Config) -> tuple:
+        return (c.context_folders if c.context_enabled else ()), c.context_max_terms, c.context_refresh_minutes
+
+    def _vocabulary(self, c: cfgmod.Config) -> tuple[str, ...]:
+        """Notes' terms safe in every program, for models that support boosting (Parakeet doesn't)."""
+        return tuple(self.context.everywhere) if c.context_enabled else ()
+
+    def _sync_vocabulary(self) -> None:
+        """A changed term list goes into the model spec only while the model isn't loaded: a spec change
+        unloads it, and new terms aren't worth a reload in the middle of the user's work."""
+        vocab = self._vocabulary(self.cfg)
+        if vocab != self._vocab and self.engine.state == "unloaded":
+            self._vocab = vocab
+            self.engine.set_spec(self._engine_spec(self.cfg), self.cfg.unload_after_seconds)
+
+    def _context_entries(self, exe: str, hwnd: int) -> list[tuple[str, str]]:
+        """Context words for one dictation: the window title's, then the notes' (code-only ones only in
+        [context] code_apps). Never logged beyond counts: a window title can be private."""
+        c = self.cfg
+        if not c.context_enabled:
+            return []
+        code = bool(exe) and cfgmod.app_key(exe) in c.context_code_apps
+        window: list[str] = []
+        if c.context_window_title and hwnd:
+            try:
+                title = winutil.window_title(hwnd)
+            except OSError:
+                title = ""
+            window = context.title_terms(title, exe, self.context.is_ordinary, code_app=code)
+        notes = self.context.terms_for(code)
+        log.info("context words: %d from the window, %d from notes%s", len(window), len(notes),
+                 " (code app)" if code else "")
+        return context.dictionary_entries(window, notes)
 
     @staticmethod
     def _find_vad(c: cfgmod.Config):
@@ -374,7 +460,8 @@ class App:
         m = self.model
         if m is None:
             return None
-        return EngineSpec.for_model(m, c.threads, device=c.device, vocabulary=c.hotwords,
+        vocab = tuple(c.hotwords) + tuple(t for t in self._vocab if t not in c.hotwords)
+        return EngineSpec.for_model(m, c.threads, device=c.device, vocabulary=vocab,
                                     vad=str(self.vad_path or ""), language=c.language,
                                     gpu_marker=str(self.paths.data_dir / GPU_MARKER))
 
@@ -385,6 +472,8 @@ class App:
             self.vad_path = self._find_vad(c)
         self.cfg = c
         self.cleaner = self._make_cleaner(c)
+        self.context.configure(*self._context_settings(c))
+        self._vocab = self._vocabulary(c)
         self.recorder.device_hint = c.input_device
         self.sounds.enabled = c.sounds
         if c.overlay and self.overlay is None:
@@ -429,6 +518,7 @@ class App:
             problem = self.reload_if_changed()
             if problem:
                 self._notify(problem)
+            self._check_learned()
             if self.problem:
                 self._notify(self.problem)
                 self.sounds.play("error")
@@ -446,7 +536,10 @@ class App:
             log.info("recording started at %d Hz", self.recorder.rate)
             self._session += 1
             session = self._session
-            self.target_exe = winutil.foreground_exe()   # for its [dictionary.apps] terms
+            self.target_exe = winutil.foreground_exe()   # for its [dictionary.apps] terms and [apps] settings
+            self.target_hwnd = winutil.foreground_window()
+            self.target_terms = self._context_entries(self.target_exe, self.target_hwnd)
+            self._sync_vocabulary()
             self.current = Session(self, session, use_vad=self.vad_path is not None)
             self.sounds.play("start")
             if self.cfg.esc_cancels:
@@ -455,6 +548,7 @@ class App:
                 rec, cur = self.recorder, self.current
                 self.overlay.listening(lambda: rec.level, rec.started_at, lambda: cur.writing, lambda: rec.clipping)
         self.engine.warm()  # load the model while the user is talking
+        self.context.refresh()   # notes changed since the last look are read again, in the background
         self._refresh()
         threading.Thread(target=self._watch_release, args=(session,), daemon=True).start()
 
@@ -500,6 +594,16 @@ class App:
                 log.info("auto stop: %s", reason)
                 self._notify(reason)
                 self._finish_locked()
+
+    def stop_from_voice(self, sid: int) -> None:
+        """A spoken "stop listening": end the recording like the hotkey. Called from the transcription
+        worker, which finishing waits for, so the stop runs on its own thread."""
+        def run():
+            with self._lock:
+                if self._session == sid and self.state == "recording":
+                    log.info("recording stopped by voice command")
+                    self._finish_locked()
+        threading.Thread(target=run, daemon=True, name="voice-stop").start()
 
     def _on_cancel(self) -> None:  # hotkey thread (Esc)
         with self._lock:
@@ -552,7 +656,7 @@ class App:
             typer = session.typer
             # Live: the phrases are already typed, apart from any that couldn't be (they go to the clipboard).
             text = (" ".join(t for t in (typer.text, typer.untyped) if t) if typer
-                    else session.cleaner.clean(raw))
+                    else session.text(raw))
             self.last_stats = (f"{spoken:.1f}s speech in {session.parts} part(s), "
                                f"{'voice detector' if session.vad_mode else 'loudness'} cuts; "
                                f"text done {waited:.1f}s after you stopped")
@@ -565,14 +669,14 @@ class App:
                 return
             self.last_text = text
             if typer is None:
-                typed = self._land(text)
+                typed = self._land(text, session.out)
             elif typer.failed is not None:
                 self._notify(output.copy_instead(typer.untyped, typer.failed))
                 typed = False
             else:
                 typed = True
             if typed:
-                self._press_enter()
+                self._press_enter(session.out)
             if self.overlay:
                 self.overlay.flash("Typed" if typed else "Copied to clipboard", GREEN, 700)
         except Exception as e:
@@ -588,19 +692,20 @@ class App:
             self._refresh()
             winutil.trim_working_set()
 
-    def _land(self, text: str) -> bool:
+    def _land(self, text: str, out=None) -> bool:
         """Type the text where the cursor is. If it can't be typed, put it on the clipboard and say so.
-        True when it was typed."""
+        True when it was typed. `out`: the program's output settings (None = [output] as set)."""
+        out = out or settings_for("", self.cfg)
         try:
-            output.deliver(text + (" " if self.cfg.add_trailing_space else ""), self.cfg.output_method)
+            output.deliver(text + (" " if out.add_trailing_space else ""), out.method)
             return True
         except output.DeliveryError as e:
             log.warning("could not type: %s", e)
             self._notify(output.copy_instead(text, e))
             return False
 
-    def _press_enter(self) -> None:
-        if self.cfg.press_enter:
+    def _press_enter(self, out=None) -> None:
+        if (out or settings_for("", self.cfg)).press_enter:
             try:
                 output.press_enter()
             except OSError as e:
@@ -645,6 +750,7 @@ class App:
                 return
             if self.failed is kept:
                 self.failed = None
+            self._check_learned()
             text = self.cleaner.clean(raw)
             if self.cfg.log_transcripts:
                 log.info("retry raw: %r | clean: %r", raw, text)
@@ -757,6 +863,14 @@ class App:
             if self.last_text:
                 output.copy_to_clipboard(self.last_text)
 
+        def correct_last(icon, item):
+            if self.last_text:
+                try:
+                    correct.launch(self.last_text, self.paths.data_dir)
+                except Exception as e:
+                    log.exception("correction window")
+                    self._notify(f"Couldn't open the correction window: {e}")
+
         def open_settings(icon, item):
             os.startfile(self.paths.config_file)
 
@@ -798,6 +912,7 @@ class App:
               None, enabled=False),
             S,
             I("Copy last dictation", copy_last, enabled=lambda _: bool(self.last_text)),
+            I("Correct last dictation…", correct_last, enabled=lambda _: bool(self.last_text)),
             I("Retry last recording", lambda i, it: self.retry_failed(), enabled=lambda _: self._can_retry()),
             I("Discard last recording", lambda i, it: self.discard_failed(), enabled=lambda _: self._can_retry()),
             I("Find models again (Windows + WSL)", lambda i, it: self.search_model(),
@@ -824,6 +939,7 @@ class App:
             self._refresh()
             first = hotkey_error or self.problem
             self._notify(first or f"Ready. Press {self.cfg.hotkey} to dictate.")
+            self.context.refresh()   # first look at the [context] folders, in the background
             winutil.trim_working_set()
 
         self.icon.run(setup=setup)

@@ -10,6 +10,8 @@ import os
 import threading
 import time
 
+from . import commands
+
 log = logging.getLogger(__name__)
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -18,7 +20,7 @@ kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP, KEYEVENTF_UNICODE = 0x2, 0x4
 VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN, VK_V = 0x11, 0x12, 0x10, 0x5B, 0x5C, 0x56
-VK_RETURN = 0x0D
+VK_RETURN, VK_BACK = 0x0D, 0x08
 CF_UNICODETEXT, GMEM_MOVEABLE = 13, 0x2
 
 
@@ -215,6 +217,19 @@ def press_enter() -> None:
     _send([_key(VK_RETURN), _key(VK_RETURN, flags=KEYEVENTF_KEYUP)])
 
 
+def backspace(count: int) -> None:
+    """Press Backspace `count` times ("scratch that"). Only called in type mode, into the same window."""
+    if count <= 0:
+        return
+    wait_modifiers_released()
+    if not has_typing_target():
+        raise DeliveryError("no window to type into", no_target=True)
+    try:
+        _send([_key(VK_BACK), _key(VK_BACK, flags=KEYEVENTF_KEYUP)] * count)
+    except OSError as e:
+        raise DeliveryError(str(e)) from e
+
+
 def copy_to_clipboard(text: str) -> None:
     _set_clipboard_text(text)
 
@@ -226,63 +241,101 @@ class PhraseTyper:
     would become shortcuts); those phrases wait and go out together once the keys are released.
     Phrases are joined with one space, and each delivery ends with a space when trailing_space is on.
 
+    With a command matcher, a phrase that is just a spoken command is carried out instead of typed:
+    line breaks are typed as newline characters, "scratch that" takes back the previous phrase with
+    Backspace (only when can_backspace() says the same window is in front and the method is "type";
+    otherwise a phrase already typed is left alone), and "stop listening" calls on_stop. What each phrase
+    put on screen is kept in a commands.Transcript, so the Backspace count is exact.
+
     If typing fails (no window to type into, or Windows blocks it), what was typed stays typed and this
     phrase and every later one are collected in `untyped` instead, for the app to put on the clipboard.
     """
 
-    def __init__(self, clean, method: str = "type", trailing_space: bool = True, send=None, mods=None):
+    def __init__(self, clean, method: str = "type", trailing_space: bool = True, send=None, mods=None,
+                 matcher=None, backspace_keys=None, can_backspace=None, on_stop=None):
         self._clean = clean
         self.method = method
         self.trailing_space = trailing_space
         self._send = send or deliver
         self._mods = mods or modifiers_down
+        self._matcher = matcher
+        self._backspace = backspace_keys or backspace
+        self._can_backspace = can_backspace or (lambda: False)
+        self._on_stop = on_stop or (lambda: None)
         self._lock = threading.Lock()
-        self._pending: list[str] = []
-        self._typed: list[str] = []
-        self._untyped: list[str] = []
+        self._typed = commands.Transcript(trailing_space)
+        self._rest = commands.Transcript(trailing_space)   # what couldn't be typed, for the clipboard
+        self._backspaces = 0                                # owed by "scratch that", sent before more text
         self.failed: OSError | None = None
         self.cancelled = False
+        self.stopped = False
+
+    def _backspace_ok(self) -> bool:
+        return self.method == "type" and self.failed is None and bool(self._can_backspace())
 
     def add(self, raw: str) -> None:
         text = self._clean(raw)
-        if text and not self.cancelled:
-            with self._lock:
-                self._pending.append(text)
+        if not text or self.cancelled or self.stopped:
+            return
+        action = self._matcher.match(text) if self._matcher else None
+        if action == commands.STOP:
+            self.stopped = True
+            self._on_stop()
+            return
+        with self._lock:
+            target = self._typed if self.failed is None else self._rest
+            if action is None:
+                target.add_text(text)
+            elif action == commands.NEWLINE:
+                target.add_break(1)
+            elif action == commands.PARAGRAPH:
+                target.add_break(2)
+            elif action == commands.UNDO:
+                self._backspaces += target.undo(target is self._typed and self._backspace_ok())
 
     @property
     def pending(self) -> bool:
-        return bool(self._pending) and not self.cancelled
+        return not self.cancelled and (self._typed.pending or self._backspaces > 0)
 
     @property
     def text(self) -> str:
         """Everything typed so far."""
-        return " ".join(self._typed)
+        return self._typed.render(sent_only=True)
 
     @property
     def untyped(self) -> str:
         """Phrases that couldn't be typed (empty unless typing failed)."""
-        return " ".join(self._untyped)
+        return self._rest.text
+
+    def _fail(self, e: OSError) -> None:
+        log.warning("typing failed, the rest of this dictation goes to the clipboard: %s", e)
+        self.failed = e
+        self._backspaces = 0
+        for kind, text in self._typed.take_unsent():
+            if kind == "text":
+                self._rest.add_text(text)
+            else:
+                self._rest.add_break(len(text))
 
     def pump(self, wait: bool = False) -> None:
         """Type what is waiting. wait=False skips it while a modifier is held; wait=True (end of the
         dictation) gives the keys up to 2 s to come up, as a whole-dictation delivery does."""
         with self._lock:
-            if self.cancelled or not self._pending:
+            if self.cancelled or self.failed is not None or not self.pending:
                 return
-            if self.failed is None:
-                if not wait and self._mods():
-                    return
-                chunk = " ".join(self._pending)
-                lead = " " if self._typed and not self.trailing_space else ""
-                try:
-                    self._send(lead + chunk + (" " if self.trailing_space else ""), self.method)
-                    self._typed += self._pending
-                except OSError as e:
-                    log.warning("typing failed, the rest of this dictation goes to the clipboard: %s", e)
-                    self.failed = e
-            if self.failed is not None:
-                self._untyped += self._pending
-            self._pending = []
+            if not wait and self._mods():
+                return
+            bs, chunk, shares = self._typed.plan(self._backspace_ok())
+            try:
+                if self._backspaces + bs:
+                    self._backspace(self._backspaces + bs)
+                self._backspaces = 0
+                if chunk:
+                    self._send(chunk, self.method)
+            except OSError as e:
+                self._fail(e)
+                return
+            self._typed.commit(bs, shares)
 
     def cancel(self) -> None:
         """Stop typing. Phrases already typed stay where they are."""

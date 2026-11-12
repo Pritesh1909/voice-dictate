@@ -17,6 +17,14 @@ never harvested, and neither is anything whose key is itself an ordinary word ("
 in the notes' prose. Compounds made only of ordinary words ("read-only", "follow-up") are kept only
 when the notes write them as code (in `backticks`) at least as often as in prose.
 
+Then each term's key is split into ordinary words where possible (splits_into_words), because the
+dictionary also matches a run of words that joins to the key ("i am" keys like "IAM"):
+- an ALL-CAPS acronym that splits ("IAM" = "I am", "OUTLOOK") is dropped;
+- any other term that splits ("userId", "displayName") is code-only: used only while dictating into
+  a program in [context] code_apps, so "the user id field" stays prose in an email;
+- a term with a part that isn't an ordinary word ("ss-core-service", "McpAuthFilter", "SHA-256") is
+  used everywhere.
+
 Privacy: notes are only read. The cache (%LOCALAPPDATA%\\ParakeetDictate\\context_terms.json) holds the
 extracted terms, file times and sizes, and short one-way hashes of the lower-case words seen in prose
 (to tell ordinary words apart on the next, incremental, scan); never note text. Nothing about notes is
@@ -40,7 +48,7 @@ from .dictionary import word_key
 
 log = logging.getLogger(__name__)
 
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 MAX_NOTE_BYTES = 2_000_000      # a giant pasted log is not worth scanning past this
 MAX_TOKEN = 40
 MAX_CODE_TOKEN = 32             # fenced code blocks: long tokens there are data, not names
@@ -52,7 +60,8 @@ W_PROSE, W_CODE_SPAN, W_HEADING, W_CODE_BLOCK = 1.0, 2.0, 3.0, 0.5
 # Common English words (and a few chat words) that ALL-CAPS or CamelCase spellings could collide with.
 # The notes' own lower-case prose words are added to this at scan time.
 COMMON = frozenset("""
-a i ad am an as at aw ax be by co do ex go ha re un mid non pre sub anti semi multi he hi if in is it me my no of oh ok on or so to up us we ya yes
+a i ad am an as at aw ax be by co do ex go id ha re un mid non pre sub anti semi multi he hi if in is it me my no of oh ok on or so to up us we ya yes
+add age app auto jar max min per spa bad box car cat dog eat far fee fix fun hot job key law log low man map mix net oil opt ram raw red row sad sea sun tag tax tip war web wet
 all and any are ask big bit but can day did end few for get got had has her him his how its let lot
 may new nor not now off old one our out own pay put ran run saw say see set she sit six ten the too
 top try two use via was way who why win yet you
@@ -220,8 +229,17 @@ def _prose_words(text: str) -> Iterable[str]:
             yield w
 
 
+def _common(word: str) -> bool:
+    """In the built-in list, or its plural ("ids", "roles")."""
+    return word in COMMON or (len(word) > 2 and word.endswith("s") and word[:-1] in COMMON)
+
+
+MIN_NOTE_WORD = 4   # shorter lower-case words in notes are mostly lazy abbreviations ("ss", "crm")
+
+
 def _ordinary(word: str, word_hashes: set[str]) -> bool:
-    return word in COMMON or _hash(word) in word_hashes
+    """A common word: in the built-in list, or (4+ letters) written as a plain lower-case word in the notes."""
+    return _common(word) or (len(word) >= MIN_NOTE_WORD and _hash(word) in word_hashes)
 
 
 def _ordinary_compound(token: str, words: set[str]) -> bool:
@@ -242,8 +260,55 @@ def _ordinary_compound(token: str, words: set[str]) -> bool:
     return True
 
 
+EVERYWHERE, CODE_ONLY, DROP = "everywhere", "code", "drop"
+MAX_WORD = 24      # longest ordinary word tried when splitting a key
+
+
+def splits_into_words(key: str, is_ordinary: Callable[[str], bool]) -> bool:
+    """True when the key reads as two or more ordinary words run together: "iam" = "i am",
+    "userid" = "user id", "displayname" = "display name". Digits never count as a word, so "useast1"
+    and "sha256" don't. The dictionary respells a spoken run of words whose joined key equals a
+    term's key, so such a term would rewrite those ordinary words."""
+    n = len(key)
+    if n < 2 or not key.isalpha():
+        return False
+    # best[i]: the fewest words key[:i] splits into (0 for the empty start), None when it can't.
+    best: list[int | None] = [0] + [None] * n
+    for i in range(1, n + 1):
+        for j in range(max(0, i - MAX_WORD), i):
+            if best[j] is not None and is_ordinary(key[j:i]):
+                cand = best[j] + 1
+                # one word that is the whole key doesn't count: that is a plain word, handled elsewhere
+                if i == n and j == 0:
+                    continue
+                if best[i] is None or cand < best[i]:
+                    best[i] = cand
+    return best[n] is not None and best[n] >= 2
+
+
+def classify(term: str, is_ordinary: Callable[[str], bool]) -> str:
+    """Where a harvested term may be used.
+
+    DROP: an ALL-CAPS acronym whose key reads as ordinary words ("IAM" = "I am"); the model writes
+    acronyms in capitals anyway, so it gains little and would turn "I am going" into "IAM going".
+    CODE_ONLY: a name made only of ordinary words ("userId", "displayName"): only in [context]
+    code_apps, so "the user id field" stays prose in an email.
+    Lower-case hyphenated words ("load-bearing", "customer-facing") are code-only too when every part is
+    an ordinary or a long (5+ letter) word: that is how English writes compound adjectives, while code
+    names spelled that way carry an abbreviation ("ss-core-service", "erp-uat").
+    EVERYWHERE: at least one part isn't an ordinary word ("ss-core-service", "McpAuthFilter", "SHA-256")."""
+    key = word_key(term)
+    if splits_into_words(key, is_ordinary):
+        return DROP if _ACRONYM.match(term) else CODE_ONLY
+    parts = term.split("-")
+    if len(parts) >= 2 and all(p.isalpha() and p.islower() and (len(p) >= 5 or is_ordinary(p)) for p in parts):
+        return CODE_ONLY
+    return EVERYWHERE
+
+
 def rank(notes: Iterable[NoteTerms], max_terms: int) -> list[str]:
-    """The best terms across notes: frequency (weighted by where they appear) times spread across notes."""
+    """The best terms across notes: frequency (weighted by where they appear) times spread across notes.
+    Acronyms that read as ordinary words are left out (see classify)."""
     notes = list(notes)
     words: set[str] = set().union(*(n.words for n in notes)) if notes else set()
     by_key: dict[str, dict] = {}
@@ -268,19 +333,30 @@ def rank(notes: Iterable[NoteTerms], max_terms: int) -> list[str]:
             continue                                     # "read-only", "follow-up": English, not code
         scored.append((math.log2(1 + g["weight"]) * g["notes"], best))
     scored.sort(key=lambda s: (-s[0], s[1].lower()))
-    return [t for _, t in scored[:max_terms]]
+    out = []
+    for _, t in scored:
+        if len(out) >= max_terms:
+            break
+        if classify(t, lambda w: _ordinary(w, words)) != DROP:
+            out.append(t)
+    return out
 
 
-def title_terms(title: str, exe: str = "", is_ordinary: Callable[[str], bool] | None = None) -> list[str]:
+def title_terms(title: str, exe: str = "", is_ordinary: Callable[[str], bool] | None = None,
+                code_app: bool = True) -> list[str]:
     """Terms from the foreground window's title and exe name, e.g.
     "McpAuthFilter.java - ss-core-service - IntelliJ IDEA" -> McpAuthFilter.java, McpAuthFilter,
-    ss-core-service, IntelliJ ("IDEA" is dropped: its key is the ordinary word "idea")."""
-    ordinary = is_ordinary or (lambda w: w in COMMON)
+    ss-core-service, IntelliJ ("IDEA" is dropped: its key is the ordinary word "idea").
+    The same classify() rule as for notes applies; code-only terms only when code_app is True."""
+    ordinary = is_ordinary or _common
     stem = exe[:-4] if exe.lower().endswith(".exe") else exe
     out, seen = [], set()
     for tok in list(tokens(title or "")) + list(tokens(stem or "")):
         k = word_key(tok)
-        if k and k not in seen and not ordinary(k):
+        if not k or k in seen or ordinary(k):
+            continue
+        cls = classify(tok, ordinary)
+        if cls == EVERYWHERE or (cls == CODE_ONLY and code_app):
             seen.add(k)
             out.append(tok)
     return out
@@ -333,6 +409,7 @@ class ContextScanner:
         self._files: dict[str, dict] = {}
         self._words: set[str] = set()
         self.terms: list[str] = []
+        self.code_only: frozenset[str] = frozenset()   # of terms: only used in [context] code_apps
         self.last_stats: ScanStats | None = None
         self._load_cache()
 
@@ -346,6 +423,15 @@ class ContextScanner:
     def is_ordinary(self, word: str) -> bool:
         return _ordinary(word, self._words)
 
+    def terms_for(self, code_app: bool) -> list[str]:
+        """The terms to use while dictating into a code app (all of them) or anywhere else."""
+        return list(self.terms) if code_app else [t for t in self.terms if t not in self.code_only]
+
+    @property
+    def everywhere(self) -> list[str]:
+        """Terms safe in every program: also the boosted vocabulary for models that support it."""
+        return self.terms_for(False)
+
     def _load_cache(self) -> None:
         try:
             d = json.loads(self.cache_file.read_text("utf-8"))
@@ -357,10 +443,11 @@ class ContextScanner:
         self._words = {h for rec in self._files.values() for h in rec.get("words", [])}
         if tuple(d.get("folders", ())) == self.folders and d.get("max_terms") == self.max_terms:
             self.terms = [t for t in d.get("terms", []) if isinstance(t, str)]
+            self.code_only = frozenset(t for t in d.get("code_only", []) if isinstance(t, str))
 
     def _save_cache(self) -> None:
         d = {"version": CACHE_VERSION, "folders": list(self.folders), "max_terms": self.max_terms,
-             "terms": self.terms, "files": self._files}
+             "terms": self.terms, "code_only": sorted(self.code_only), "files": self._files}
         try:
             self.cache_file.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.cache_file.with_name(self.cache_file.name + ".tmp")
@@ -422,6 +509,7 @@ class ContextScanner:
                  for rec in files.values()]
         terms = rank(notes, self.max_terms)
         self._files, self._words = files, set().union(*(n.words for n in notes)) if notes else set()
+        self.code_only = frozenset(t for t in terms if classify(t, self.is_ordinary) == CODE_ONLY)
         self.terms = terms
         self._last_scan = self._clock()
         self._save_cache()

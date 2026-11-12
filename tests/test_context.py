@@ -22,7 +22,7 @@ def test_tokens_skip_urls_paths_and_emails_and_split_file_names():
 def test_title_terms():
     assert title_terms("McpAuthFilter.java - ss-core-service - IntelliJ IDEA", "idea64.exe") == \
         ["McpAuthFilter.java", "McpAuthFilter", "ss-core-service", "IntelliJ", "idea64"]
-    assert title_terms("Inbox - Outlook", "OUTLOOK.EXE") == ["OUTLOOK"]   # an acronym-shaped exe name
+    assert title_terms("Inbox - Outlook", "OUTLOOK.EXE") == []   # "OUTLOOK" reads as "out look"
     assert title_terms("Notes - Notepad", "notepad.exe") == []
     assert title_terms("", "") == []
 

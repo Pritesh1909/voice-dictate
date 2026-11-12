@@ -41,35 +41,34 @@ class CommandMatcher:
 
 @dataclass
 class _Piece:
-    kind: str        # "text" or "break"
-    sent: str        # exactly what goes (or went) to the window for it, leading space included
+    kind: str            # "text" or "break"
+    text: str            # the phrase, or one or two line breaks
+    sent: str = ""       # exactly what went to the window for it (leading and trailing space included)
     flushed: bool = False
 
 
 class Transcript:
-    """The pieces one dictation types, in order: phrases of text and line breaks.
+    """The pieces one dictation types, in order: phrases of text and line breaks, and exactly which
+    characters each one put on screen, so "scratch that" can take the last one back with the right
+    number of Backspaces and never more.
 
-    The space between phrases is sent in front of the next phrase rather than after the last one, so the
-    cursor always sits right after the last word: a line break then starts cleanly at the end of the
-    line, and undoing a phrase removes its leading space with it. The trailing space of the whole
-    dictation ([output] add_trailing_space) is only added by finish().
+    Spacing is the same as typing without commands: each delivery (one or more pieces sent together;
+    several wait while a modifier key is held) is followed by a space when trailing_space is on, or
+    preceded by one when it is off. A line break arriving after that trailing space takes it back first
+    (one Backspace, only when that is safe) so dictated lines don't end in a space.
 
-    flush() returns what hasn't been sent yet (it may wait while a modifier key is held, so several
-    pieces can go out together). undo() removes the last piece: one not sent yet is just dropped; one
-    already sent costs Backspaces, which the caller sends only when that is safe.
+    Sending is two-step so a failed send loses nothing: plan() says what to send, commit() records it as
+    sent, take_unsent() hands the pieces over when the window can't be typed into.
     """
 
     def __init__(self, trailing_space: bool = True):
         self.trailing_space = trailing_space
         self._pieces: list[_Piece] = []
-        self.finished = False
 
     def add_text(self, text: str) -> None:
         text = text.strip()
-        if not text:
-            return
-        lead = " " if self._pieces and self._pieces[-1].kind == "text" else ""
-        self._pieces.append(_Piece("text", lead + text))
+        if text:
+            self._pieces.append(_Piece("text", text))
 
     def add_break(self, lines: int = 1) -> None:
         self._pieces.append(_Piece("break", "\n" * max(1, lines)))
@@ -78,20 +77,48 @@ class Transcript:
     def pending(self) -> bool:
         return any(not p.flushed for p in self._pieces)
 
-    def flush(self) -> str:
-        """Characters not sent yet; they count as sent from now on."""
-        out = "".join(p.sent for p in self._pieces if not p.flushed)
-        for p in self._pieces:
-            p.flushed = True
-        return out
+    def _split(self) -> tuple[_Piece | None, list[_Piece]]:
+        unsent = [p for p in self._pieces if not p.flushed]
+        sent = [p for p in self._pieces if p.flushed]
+        return (sent[-1] if sent else None), unsent
 
-    def finish(self) -> str:
-        """Whatever is still unsent, plus the dictation's trailing space when it ends with text."""
-        out = self.flush()
-        if self.trailing_space and self._pieces and self._pieces[-1].kind == "text" and not self.finished:
-            out += " "
-        self.finished = True
-        return out
+    def plan(self, can_backspace: bool) -> tuple[int, str, list[str]]:
+        """(Backspaces, characters, each unsent piece's share of them) for what isn't sent yet."""
+        prev, unsent = self._split()
+        if not unsent:
+            return 0, "", []
+        bs, shares = 0, []
+        for i, p in enumerate(unsent):
+            before = unsent[i - 1] if i else prev
+            lead = ""
+            if p.kind == "text" and before is not None and before.kind == "text":
+                ends_with_space = i == 0 and before.sent.endswith(" ")
+                lead = "" if ends_with_space else " "
+            elif p.kind == "break" and i == 0 and prev is not None and prev.sent.endswith(" ") and can_backspace:
+                bs = 1      # the trailing space typed after the last phrase
+            shares.append(lead + p.text)
+        if self.trailing_space and unsent[-1].kind == "text":
+            shares[-1] += " "
+        return bs, "".join(shares), shares
+
+    def commit(self, bs: int, shares: list[str]) -> None:
+        prev, unsent = self._split()
+        if bs and prev is not None:
+            prev.sent = prev.sent[:-bs]
+        for p, share in zip(unsent, shares):
+            p.sent, p.flushed = share, True
+
+    def flush(self, can_backspace: bool = False) -> tuple[int, str]:
+        """Plan and commit in one go: (Backspaces, characters) to send."""
+        bs, out, shares = self.plan(can_backspace)
+        self.commit(bs, shares)
+        return bs, out
+
+    def take_unsent(self) -> list[tuple[str, str]]:
+        """Remove the pieces not sent yet and return them as (kind, text)."""
+        _, unsent = self._split()
+        self._pieces = [p for p in self._pieces if p.flushed]
+        return [(p.kind, p.text) for p in unsent]
 
     def undo(self, can_backspace: bool) -> int:
         """Take back the last piece. Returns how many Backspaces the caller must send (0 = none needed).
@@ -111,10 +138,21 @@ class Transcript:
         # One Backspace per character as the user sees it (a code point); a line break is one.
         return len(last.sent)
 
+    def render(self, sent_only: bool = False) -> str:
+        """The text as it reads: phrases joined by single spaces, line breaks without spaces around them."""
+        out = ""
+        prev = None
+        for p in self._pieces:
+            if sent_only and not p.flushed:
+                break
+            out += (" " if p.kind == "text" and prev == "text" else "") + p.text
+            prev = p.kind
+        return out
+
     @property
     def text(self) -> str:
-        """The dictation as it reads (for "Copy last dictation"), without the trailing space."""
-        return "".join(p.sent for p in self._pieces)
+        """Everything in the record (sent or not), as it reads, without the trailing space."""
+        return self.render()
 
 
 def compose(phrases: Iterable[str], matcher: CommandMatcher) -> tuple[str, bool]:

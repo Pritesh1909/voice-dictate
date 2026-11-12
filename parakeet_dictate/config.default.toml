@@ -169,11 +169,17 @@ window_title = true
 # Folders of notes (.md files, e.g. an Obsidian vault) to take names from. Read only, in the background,
 # never while you dictate; the found words are kept in %LOCALAPPDATA%\ParakeetDictate\context_terms.json
 # (the notes themselves are not copied). Hidden folders such as .obsidian and .trash are skipped.
+# Add more folders the same way, e.g. ["D:\\Obsidian\\Knowledgebase", "D:\\work"] (only .md files are read).
 folders = ["D:\\Obsidian\\Knowledgebase"]
 # Keep at most this many names from the notes, the most used ones first (0..500).
 max_terms = 300
 # Look for changed notes at most this often (minutes). Only changed notes are read again.
 refresh_minutes = 10
+# Programs where you dictate code. Names made only of ordinary words, like "userId" or "displayName",
+# are used only here, so "the user id field" in an email stays as you said it. Names with an unusual
+# part ("ss-core-service", "McpAuthFilter") are used everywhere. Find a program's name: Task Manager -> Details.
+code_apps = ["idea64.exe", "code.exe", "windowsterminal.exe", "orca.exe", "datagrip64.exe", "pycharm64.exe",
+             "cursor.exe"]
 
 # Settings for one program, by its .exe name (capitals don't matter). Each may change any of:
 #   method, add_trailing_space, type_while_speaking, press_enter (see [output]) and commands (true/false).

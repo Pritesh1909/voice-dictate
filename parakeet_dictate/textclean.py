@@ -7,6 +7,7 @@ thinking sounds, and the user's [cleanup] fillers are added on top.
 """
 from __future__ import annotations
 
+import copy
 import re
 import unicodedata
 from dataclasses import dataclass, field
@@ -248,12 +249,25 @@ class Cleaner:
 
     @classmethod
     def from_config(cls, c, languages: Iterable[str] = (),
-                    app_terms: Iterable[tuple[str, str]] = ()) -> "Cleaner":
-        """`app_terms` (one program's [dictionary.apps] entry) come first, so they win over your own."""
+                    app_terms: Iterable[tuple[str, str]] = (),
+                    learned: Iterable[tuple[str, str]] = ()) -> "Cleaner":
+        """`app_terms` (one program's [dictionary.apps] entry) come first, so they win over your own.
+        `learned` (from "Correct last dictation…") come right after your own [dictionary]."""
         return cls(fillers=list(c.fillers), remove_repeated_words=c.remove_repeated_words,
                    repeated_words_allowed=list(c.repeated_words_allowed), replacements=list(c.replacements),
-                   dictionary=list(c.dictionary), app_dictionary=list(app_terms), languages=tuple(languages),
-                   language_fillers=c.language_fillers)
+                   dictionary=list(c.dictionary) + list(learned), app_dictionary=list(app_terms),
+                   languages=tuple(languages), language_fillers=c.language_fillers)
+
+    def with_extra(self, entries: Iterable[tuple[str, str]]) -> "Cleaner":
+        """This clean-up plus lower-ranked terms for one dictation (context words: the window title, your
+        notes). Only the respelling step is rebuilt (a few hundred terms: well under a millisecond), and
+        this Cleaner is left as it is, so a cached per-program Cleaner stays valid."""
+        entries = list(entries)
+        if not entries:
+            return self
+        c = copy.copy(self)
+        c._spell = dictionary.build(list(self.dictionary) + entries, ahead=self.app_dictionary)
+        return c
 
     def clean(self, raw: str) -> str:
         text = remove_fillers(raw.replace("\n", " "), self._fillers)
