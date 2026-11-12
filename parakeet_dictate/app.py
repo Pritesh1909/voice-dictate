@@ -7,13 +7,14 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime
 
 import numpy as np
 import pystray
 
 from . import APP_NAME, __version__
 from . import config as cfgmod
-from . import commands, context, correct, learn, models, output, winutil
+from . import commands, context, correct, learn, models, output, recordings, winutil
 from . import history as hist
 from .appsettings import settings_for
 from .audio import SR, Recorder, preprocess, resample, silence_stop_due, silence_stop_message
@@ -289,6 +290,7 @@ class Session:
 
 class App:
     history: "hist.History | None" = None   # recent dictations ([history]); set in __init__
+    PRUNE_EVERY_SECONDS = 24 * 3600         # how often old kept recordings are cleared out (tests shorten it)
 
     def __init__(self, paths: cfgmod.Paths):
         self.paths = paths
@@ -323,6 +325,7 @@ class App:
         self.last_stats = ""
         self.failed: FailedRecording | None = None   # the last dictation that couldn't be transcribed
         self._lock = threading.Lock()
+        self._quitting = threading.Event()   # set when the user quits: ends the daily clear-out of recordings
         self._session = 0
         self.current: Session | None = None
         self._adding_model = False   # the "Add a model file…" dialog is open
@@ -1041,6 +1044,7 @@ class App:
                 typed = True
             if typed:
                 self._press_enter(session.out)
+            self._save_recording(session, raw, text)   # last, and off this thread: the text is already there
             if self.overlay:
                 self.overlay.flash("Typed" if typed else "Copied to clipboard", GREEN, 700)
         except Exception as e:
@@ -1074,6 +1078,60 @@ class App:
                 output.press_enter()
             except OSError as e:
                 log.warning("could not press Enter: %s", e)
+
+    # --- kept recordings: the background learner listens to these again later -----------------------------
+    # Never a pop-up: a problem here is logged, and dictation carries on.
+
+    @property
+    def _keeps_recordings(self) -> bool:
+        return self.cfg.learning_enabled and self.cfg.keep_recordings
+
+    def _save_recording(self, session: "Session", raw: str, text: str) -> None:
+        """A dictation has landed (typed, or copied to the clipboard): keep its audio and a record of it.
+        Returns at once, the writing runs in its own daemon thread; never raises."""
+        if self._keeps_recordings:
+            self._start_save(session.recording(), session.rate, raw, session.phrases(), text, self.target_exe)
+
+    def _start_save(self, audio: np.ndarray, rate: int, raw: str, phrases: list[str], text: str, exe: str) -> None:
+        """Note what is known now (the program, the model and language can change later), then write in a thread."""
+        try:
+            now = datetime.now()   # local time, like the recording id
+            rec = recordings.Record(recordings.new_id(now), now.isoformat(timespec="seconds"), exe, raw, phrases,
+                                    text, self.model.path.name if self.model else "", self.cfg.language)
+            threading.Thread(target=self._write_recording, args=(audio, rate, rec), daemon=True,
+                             name="save-recording").start()
+        except Exception:
+            log.exception("could not save the recording")
+
+    def _write_recording(self, audio: np.ndarray, rate: int, rec: recordings.Record) -> None:
+        """Thread body: write the 16 kHz recording and its record."""
+        try:
+            recordings.save(self.paths.recordings_dir, resample(audio, rate), rec)
+        except Exception:
+            log.exception("could not save the recording")
+
+    def _start_prune(self) -> None:
+        """Clear out old recordings now, then every PRUNE_EVERY_SECONDS, in a daemon thread until the app quits.
+        It does not depend on saving: with keeping (or learning) turned off, recordings kept earlier still age
+        out, and an app left running for days still clears out as they age."""
+        threading.Thread(target=self._prune_loop, daemon=True, name="prune-recordings").start()
+
+    def _prune_loop(self) -> None:
+        while True:
+            self._prune_recordings()
+            if self._quitting.wait(self.PRUNE_EVERY_SECONDS):
+                return
+
+    def _prune_recordings(self) -> None:
+        """Delete recordings older than [learning] keep_days, then the oldest beyond max_recordings_mb.
+        Never raises."""
+        try:
+            deleted = recordings.prune(self.paths.recordings_dir, self.cfg.keep_days, self.cfg.max_recordings_mb,
+                                       datetime.now())
+            if deleted:
+                log.info("cleared out %d old recording(s)", deleted)
+        except Exception:
+            log.exception("could not clear out old recordings")
 
     def _recognition_failed(self, e: Exception, audio: np.ndarray, rate: int, partly_typed: bool) -> None:
         """Keep the recording (replacing an older failed one) so tray → Retry can transcribe it again."""
@@ -1137,6 +1195,8 @@ class App:
                 self._notify(DOUBLED_NOTE)
             elif typed:
                 self._press_enter()
+            if self._keeps_recordings:   # a retried dictation is a finished one: one piece of audio, one phrase
+                self._start_save(kept.audio, kept.rate, raw, [raw], text, winutil.foreground_exe())
             if self.overlay:
                 self.overlay.flash("Typed" if typed else "Copied to clipboard", GREEN, 700)
         except Exception as e:
@@ -1291,6 +1351,7 @@ class App:
         I, S = pystray.MenuItem, pystray.Menu.SEPARATOR
 
         def quit_app(icon, item):
+            self._quitting.set()
             self.engine.unload()
             self.hotkeys.stop()
             if self.overlay:
@@ -1340,6 +1401,7 @@ class App:
             else:
                 self._note(f"Ready. Press {self.cfg.hotkey} to dictate.")   # no pop-up at every start
             self.context.refresh()   # first look at the [context] folders, in the background
+            self._start_prune()      # old kept recordings: now and then every day, in the background
             winutil.trim_working_set()
 
         self.icon.run(setup=setup)
