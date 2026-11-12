@@ -13,7 +13,10 @@ Files:
                              every change; the [meta."<entry key>"] tables are ignored by learn.load
 
 Damaged files never raise: state.json (or a damaged part of it) starts from empty with a warning, and
-the next write replaces it. A lock that stays taken for LOCK_WAIT_S seconds raises TimeoutError.
+the next write replaces it. A file that cannot be read at all (an I/O error such as PermissionError) is
+not damage: the read-only methods show it as empty, but a write raises OSError and leaves the files
+alone, so a hiccup can never wipe the never-learn list. A lock that stays taken for LOCK_WAIT_S seconds
+raises TimeoutError.
 """
 from __future__ import annotations
 
@@ -178,14 +181,24 @@ class Store:
                 msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
 
     def _load(self) -> dict:
+        """state.json as it is on disk, for a read-modify-write. A missing file or damaged content is an
+        empty state; an I/O error propagates, so a write never replaces a state it could not read."""
         try:
             raw = json.loads(_retry(lambda: self._state_file.read_text("utf-8")))
         except FileNotFoundError:
             return _empty()
-        except (OSError, ValueError, RecursionError) as e:   # ValueError: bad JSON or bad UTF-8
+        except (ValueError, RecursionError) as e:   # ValueError: bad JSON or bad UTF-8
             log.warning("learning state not loaded (%s), starting empty: %s", self._state_file.name, e)
             return _empty()
         return _clean(raw)
+
+    def _peek(self) -> dict:
+        """_load for the read-only methods: a file that cannot be read shows as empty instead of raising."""
+        try:
+            return self._load()
+        except OSError as e:
+            log.warning("learning state not read (%s): %s", self._state_file.name, e)
+            return _empty()
 
     def _save_state(self, st: dict) -> None:
         _write(self._state_file, json.dumps(st, ensure_ascii=False, indent=1))
@@ -243,10 +256,10 @@ class Store:
 
     def active(self) -> list[AutoFix]:
         return [AutoFix(a["term"], a["heard_as"], a["first_learned"], a["seen"], a["example"])
-                for a in self._load()["active"].values()]
+                for a in self._peek()["active"].values()]
 
     def pending_count(self) -> int:
-        return len(self._load()["pending"])
+        return len(self._peek()["pending"])
 
     def undo(self, e: Entry) -> None:
         """Remove a fix and never learn it again (also when it was not active or pending any more)."""
@@ -275,7 +288,7 @@ class Store:
     # --- Claude calls and status -------------------------------------------------------------------
 
     def claude_calls_today(self, today: str) -> int:
-        claude = self._load()["claude"]
+        claude = self._peek()["claude"]
         return claude["count"] if claude["day"] == today else 0
 
     def count_claude_call(self, today: str) -> None:
@@ -293,37 +306,38 @@ class Store:
                 self._save_state(st)
 
     def status(self) -> str:
-        return self._load()["status"]
+        return self._peek()["status"]
 
     # --- checked.jsonl -------------------------------------------------------------------------------
 
     def _checked_raw(self) -> str:
+        """checked.jsonl as text; a missing file is empty, an I/O error propagates."""
         try:
             return _retry(self._checked_file.read_bytes).decode("utf-8", "replace")
         except FileNotFoundError:
             return ""
-        except OSError as e:
-            log.warning("checked results not read (%s): %s", self._checked_file.name, e)
-            return ""
 
     def append_checked(self, row: dict) -> None:
-        """Add one row (it needs an "id": the recording's) and keep the last CHECKED_KEEP lines.
+        """Add one row and keep the last CHECKED_KEEP lines. The row needs the recording's "id" (str),
+        or checked_ids() would never see it and the recording would be checked again for ever.
 
-        Below the limit the row is simply appended (a torn last line is skipped by the readers and
-        ended by the next append); at the limit the file is rewritten without its oldest lines."""
+        Always .tmp + replace, so a reader sees the old file or the new one, never half a line. If the
+        old file cannot be read this raises and leaves it alone."""
+        if not isinstance(row.get("id"), str):
+            raise ValueError('a checked row needs an "id" (the recording id, a str)')
         line = json.dumps(row, ensure_ascii=False)   # one line: json escapes newlines inside strings
         with self.lock():
-            old = self._checked_raw()
-            lines = [s for s in (ln.strip() for ln in old.split("\n")) if s]
-            if len(lines) < CHECKED_KEEP:
-                with open(self._checked_file, "a", encoding="utf-8", newline="\n") as fh:
-                    fh.write(("\n" if old and not old.endswith("\n") else "") + line + "\n")
-            else:
-                _write(self._checked_file, "\n".join([*lines, line][-CHECKED_KEEP:]) + "\n")
+            lines = [s for s in (ln.strip() for ln in self._checked_raw().split("\n")) if s]
+            _write(self._checked_file, "\n".join([*lines, line][-CHECKED_KEEP:]) + "\n")
 
     def checked_ids(self) -> set[str]:
         ids: set[str] = set()
-        for line in self._checked_raw().split("\n"):
+        try:
+            lines = self._checked_raw().split("\n")
+        except OSError as e:
+            log.warning("checked results not read (%s): %s", self._checked_file.name, e)
+            return ids
+        for line in lines:
             try:
                 row = json.loads(line)
             except (ValueError, RecursionError):

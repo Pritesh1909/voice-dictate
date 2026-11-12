@@ -1,5 +1,6 @@
 import json
 import os
+import pathlib
 import tomllib
 
 import pytest
@@ -310,31 +311,130 @@ def test_write_retries_while_another_process_reads_the_file(store, monkeypatch):
     assert store.status() == "two"
 
 
+@pytest.fixture
+def block_reads(monkeypatch):
+    """Reading the file names added to the returned set fails, like a file the other process holds open."""
+    blocked = set()
+    real_text, real_bytes = pathlib.Path.read_text, pathlib.Path.read_bytes
+
+    def read_text(self, *args, **kwargs):
+        if self.name in blocked:
+            raise PermissionError(13, "blocked", str(self))
+        return real_text(self, *args, **kwargs)
+
+    def read_bytes(self):
+        if self.name in blocked:
+            raise PermissionError(13, "blocked", str(self))
+        return real_bytes(self)
+
+    monkeypatch.setattr(pathlib.Path, "read_text", read_text)
+    monkeypatch.setattr(pathlib.Path, "read_bytes", read_bytes)
+    monkeypatch.setattr(autolearn.time, "sleep", lambda seconds: None)     # no waiting between retries
+    return blocked
+
+
+WRITE_PATHS = {
+    "note": lambda s: s.note("rec-9", [prop(KEYCLOAK)], [], "x", "2026-11-14 09:00"),
+    "undo": lambda s: s.undo(KEYCLOAK),
+    "reset_all": lambda s: s.reset_all(),
+    "count_claude_call": lambda s: s.count_claude_call("2026-11-14"),
+    "set_status": lambda s: s.set_status("changed"),
+}
+
+
+@pytest.mark.parametrize("op", WRITE_PATHS)
+def test_write_that_cannot_read_state_raises_and_changes_nothing(store, block_reads, op):
+    two_sightings(store)                                                      # Mailzzy: active
+    store.note("rec-5", [prop(KEYCLOAK)], [], "k", "2026-11-12 11:00")        # Keycloak: pending
+    store.undo(("Postgres", ""))                                              # Postgres: never learn
+    state_file = store.learning_dir / "state.json"
+    before = (state_file.read_bytes(), store.learned_auto_file.read_bytes())
+    block_reads.add("state.json")
+    with pytest.raises(PermissionError):
+        WRITE_PATHS[op](store)
+    block_reads.clear()
+    assert (state_file.read_bytes(), store.learned_auto_file.read_bytes()) == before
+    # The lock was released, the fixes are intact and the never-learn list still works.
+    assert [(f.term, f.heard_as) for f in store.active()] == [MAILZZY]
+    assert store.pending_count() == 1
+    two_sightings(store, ("Postgres", ""))
+    assert [f.term for f in store.active()] == ["Mailzzy"]
+
+
+def test_read_only_methods_show_empty_when_state_cannot_be_read(store, block_reads):
+    two_sightings(store)
+    store.set_status("hi")
+    store.count_claude_call("2026-11-12")
+    block_reads.add("state.json")
+    assert store.active() == []
+    assert store.pending_count() == 0
+    assert store.status() == ""
+    assert store.claude_calls_today("2026-11-12") == 0
+    block_reads.clear()
+    assert len(store.active()) == 1 and store.status() == "hi"                # nothing was lost
+
+
+def test_append_checked_that_cannot_read_raises_and_changes_nothing(store, block_reads):
+    store.append_checked({"id": "a"})
+    store.append_checked({"id": "b"})
+    path = store.learning_dir / "checked.jsonl"
+    before = path.read_bytes()
+    block_reads.add("checked.jsonl")
+    with pytest.raises(PermissionError):
+        store.append_checked({"id": "c"})
+    assert store.checked_ids() == set()                                       # read-only: empty, no error
+    block_reads.clear()
+    assert path.read_bytes() == before
+    assert store.checked_ids() == {"a", "b"}
+
 def test_checked_jsonl_capped(store, monkeypatch):
     assert autolearn.CHECKED_KEEP == 5000
-    monkeypatch.setattr(autolearn, "CHECKED_KEEP", 50)     # 5000 real appends take minutes on a busy disk
-    for n in range(60):
+    monkeypatch.setattr(autolearn, "CHECKED_KEEP", 5)      # 5000 real rewrites take minutes on a busy disk
+    for n in range(8):
         store.append_checked({"id": f"rec-{n}", "matched": n % 2 == 0})
     raw = (store.learning_dir / "checked.jsonl").read_bytes()
     assert b"\r" not in raw
     lines = raw.decode("utf-8").split("\n")
     assert lines.pop() == ""                                # ends with a newline, no blank lines in between
-    assert len(lines) == 50
-    assert json.loads(lines[0])["id"] == "rec-10"
-    assert json.loads(lines[-1])["id"] == "rec-59"
-    ids = store.checked_ids()
-    assert len(ids) == 50 and "rec-10" in ids and "rec-9" not in ids
+    assert len(lines) == 5
+    assert json.loads(lines[0])["id"] == "rec-3"
+    assert json.loads(lines[-1])["id"] == "rec-7"
+    assert store.checked_ids() == {f"rec-{n}" for n in range(3, 8)}
 
 
-def test_checked_jsonl_appends_below_the_cap_and_rewrites_at_it(store, monkeypatch):
-    monkeypatch.setattr(autolearn, "CHECKED_KEEP", 3)
+def test_append_checked_goes_through_tmp_and_replace(store, monkeypatch):
+    store.append_checked({"id": "a"})
+    real, calls = os.replace, []
+
+    def spy(src, dst):
+        calls.append((pathlib.Path(src).name, pathlib.Path(dst).name))
+        real(src, dst)
+
+    monkeypatch.setattr(autolearn.os, "replace", spy)
+    store.append_checked({"id": "b"})
+    assert calls == [("checked.jsonl.tmp", "checked.jsonl")]
+    assert store.checked_ids() == {"a", "b"}
+
+
+def test_append_checked_failing_before_the_replace_keeps_the_old_file(store, monkeypatch):
+    store.append_checked({"id": "a"})
     path = store.learning_dir / "checked.jsonl"
-    for n in range(1, 4):
-        store.append_checked({"id": f"rec-{n}"})
-    assert path.read_text("utf-8").splitlines() == ['{"id": "rec-1"}', '{"id": "rec-2"}', '{"id": "rec-3"}']
-    store.append_checked({"id": "rec-4"})
-    assert path.read_text("utf-8").splitlines() == ['{"id": "rec-2"}', '{"id": "rec-3"}', '{"id": "rec-4"}']
+    before = path.read_bytes()
 
+    def disk_full(src, dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(autolearn.os, "replace", disk_full)
+    with pytest.raises(OSError):
+        store.append_checked({"id": "b"})
+    assert path.read_bytes() == before                      # never a half-written line for checked_ids()
+
+
+@pytest.mark.parametrize("row", [{}, {"matched": True}, {"id": 7}, {"id": None}])
+def test_append_checked_needs_an_id(store, row):
+    with pytest.raises(ValueError):
+        store.append_checked(row)
+    assert not (store.learning_dir / "checked.jsonl").exists()
 
 def test_checked_jsonl_keeps_unicode_and_every_field(store):
     row = {"id": "rec-1", "parakeet": "naïve café\u2028x\u0085y\r\nz", "whisper": "naive cafe", "matched": False,
