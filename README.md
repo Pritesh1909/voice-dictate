@@ -32,7 +32,15 @@ meter and timer), then **Transcribing…**, then **✓ Typed** (or *Cancelled* /
 top of all windows, never takes focus and lets clicks pass through. Turn it off or move it to the top with
 `[overlay]` in the settings. When the microphone clips it turns red and reads **Too loud**.
 
-**Put the pill anywhere:** Settings → General → Pill → *Move the pill…* shows it with "Drag me · Enter to save · Esc to cancel".
+**Pill or button:** Settings → General → On-screen indicator → *Style*. *Pill* is the long one above.
+*Button* is a small round mic: dark and ready, a red halo that grows with your voice while listening,
+three dots while typing, a blue spinner while processing and a white tick when the text is in. Click it
+to start dictating and again to stop; it never takes the focus, so the text goes where your cursor is.
+*Show the button*: **Always** (it stays on screen, ready to click) or **Only while dictating**.
+*Position*: top or bottom centre, or any corner, plus a distance from the edge; *Move…* overrides it.
+The pill and the button each remember their own dragged spot.
+
+**Put it anywhere:** Settings → General → On-screen indicator → *Move…* shows it with "Drag me · Enter to save · Esc to cancel".
 Drag it with the left mouse button to any spot on any monitor, then press **Enter**, double-click it, or pick
 *Done moving the pill* in the tray menu (Esc cancels). Only while you move it does the pill take the mouse
 and keyboard; afterwards it is click-through and never-focused again, and the window you were in gets the
