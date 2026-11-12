@@ -26,16 +26,21 @@ def resample(x: np.ndarray, src: int, dst: int = SR) -> np.ndarray:
     return np.interp(pos, np.arange(x.size), x).astype(np.float32)
 
 
-def preprocess(x: np.ndarray, sr: int = SR, normalize: bool = True) -> np.ndarray:
+def preprocess(x: np.ndarray, sr: int = SR, normalize: bool = True, noise_reduction: str = "off") -> np.ndarray:
     """Return speech ready for the model, or an empty array when there is no speech.
 
-    DC offset removed, leading/trailing silence trimmed (with margin), quiet speech raised,
-    then padded with silence so the transducer flushes the last word.
+    DC offset removed, steady background noise turned down ([accuracy] noise_reduction: "off", "auto" =
+    only when this phrase is noisy, "on"), leading/trailing silence trimmed (with margin), quiet speech
+    raised, then padded with silence so the transducer flushes the last word.
     """
     x = np.asarray(x, dtype=np.float32).ravel()
     if x.size < sr // 10:
         return np.zeros(0, np.float32)
     x = x - float(x.mean())
+    if noise_reduction != "off":
+        from . import denoise
+        if denoise.needs_cleaning(x, sr, noise_reduction):
+            x = denoise.reduce_noise(x, sr)
     frame = sr // 50  # 20 ms
     n = x.size // frame
     rms = np.sqrt(np.mean(x[: n * frame].reshape(n, frame) ** 2, axis=1) + 1e-12)

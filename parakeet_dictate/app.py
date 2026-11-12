@@ -68,6 +68,7 @@ class Session:
         self.segmenter = Segmenter(self.rate, self.pause)
         self.seg_rate = self.rate
         self.normalize = app.cfg.normalize_audio
+        self.noise = app.cfg.noise_reduction
         self.out = settings_for(app.target_exe, app.cfg)    # [output] with that program's [apps] overrides
         self.cleaner = app.cleaner_for(app.target_exe)   # the program dictated into: its terms come first
         if app.target_terms:                              # context words: lowest rank, this dictation only
@@ -194,7 +195,7 @@ class Session:
         try:
             if part != self.parts or not self._q.empty() or self._cancelled or self._error:
                 return
-            audio = preprocess(samples, normalize=self.normalize)
+            audio = preprocess(samples, normalize=self.normalize, noise_reduction=self.noise)
             if audio.size == 0:
                 return
             raw, secs = self.app.engine.transcribe(audio)
@@ -225,7 +226,8 @@ class Session:
                 if self._cancelled or self._error:
                     continue
                 idx, samples, rate = item
-                audio = preprocess(resample(samples, rate, SR), normalize=self.normalize)
+                audio = preprocess(resample(samples, rate, SR), normalize=self.normalize,
+                                   noise_reduction=self.noise)
                 if audio.size == 0:
                     self._results[idx] = ""
                     if self.typer:
@@ -1077,7 +1079,8 @@ class App:
     def _retry(self, kept: FailedRecording) -> None:
         try:
             try:
-                audio = preprocess(resample(kept.audio, kept.rate, SR), normalize=self.cfg.normalize_audio)
+                audio = preprocess(resample(kept.audio, kept.rate, SR), normalize=self.cfg.normalize_audio,
+                                   noise_reduction=self.cfg.noise_reduction)
                 raw = self.engine.transcribe(audio)[0].strip() if audio.size else ""
             except Exception as e:
                 self._recognition_failed(e, kept.audio, kept.rate, kept.partly_typed)

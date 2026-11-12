@@ -93,6 +93,7 @@ class Config:
     language: str           # "auto" or an ISO-639-1 code ("de"); passed to models that take one
     hotwords: tuple[str, ...]
     normalize_audio: bool
+    noise_reduction: str    # off | auto | on: turn down steady background noise before transcribing
     fillers: tuple[str, ...]
     language_fillers: bool
     remove_repeated_words: bool
@@ -195,6 +196,7 @@ def parse(text: str, defaults_text: str | None = None) -> Config:
         language=_language(_get(d, "model", "language", str)),
         hotwords=_str_list(d, "accuracy", "hotwords"),
         normalize_audio=_get(d, "accuracy", "normalize_audio", bool),
+        noise_reduction=_get(d, "accuracy", "noise_reduction", str, lambda v: v in ("off", "auto", "on")),
         fillers=_str_list(d, "cleanup", "fillers"),
         language_fillers=_get(d, "cleanup", "language_fillers", bool),
         remove_repeated_words=_get(d, "cleanup", "remove_repeated_words", bool),
