@@ -734,6 +734,85 @@ def test_quitting_ends_the_download(learner, monkeypatch):
     assert app.statuses == ["Downloading Whisper 1%"] and app.teacher_path is None
 
 
+def test_turning_learning_off_stops_the_download(learner, monkeypatch):
+    """The progress callback ends the download (its .part stays, see test_teacher), the status says "Off",
+    and turning learning on again in the same app run starts the set-up again, so the download resumes."""
+    monkeypatch.setattr(teacher, "has_discrete_gpu", lambda cmd, timeout=30: True)
+    app = learner(teacher_ready=False)
+    calls = []
+
+    def ensure(teacher_dir, orca_dir, progress, **k):
+        calls.append(1)
+        progress(10, 1000)
+        app.cfg = dataclasses.replace(app.cfg, learning_enabled=False)   # Settings saved, the tray reloaded
+        progress(20, 1000)                                # the download ends here
+        raise AssertionError("not reached")
+
+    monkeypatch.setattr(teacher, "ensure", ensure)
+    app._teacher_tried = True                             # what the idle loop does before it starts the set-up
+    app._setup_teacher()
+    assert app.statuses == ["Downloading Whisper 1%", "Off"] and app.teacher_path is None
+    assert app.learning_store.status() == "Off" and app.notes == []
+    app._learning_tick()                                  # still off: nothing starts
+    assert calls == [1]
+    app.cfg = dataclasses.replace(app.cfg, learning_enabled=True)
+    monkeypatch.setattr(teacher, "ensure", lambda *a, **k: calls.append(2) or app.paths.teacher_dir / WHISPER)
+    app._learning_tick()
+    wait_for(lambda: app.teacher_path is not None)
+    assert calls == [1, 2]
+
+
+def test_gpu_marker_skips_download(learner, monkeypatch):
+    """Dictation already crashed the graphics card (gpu-failed.json): learning can never run, so the 886 MB
+    are not downloaded, and the card isn't even asked about."""
+    asked, ensured = [], []
+    monkeypatch.setattr(teacher, "has_discrete_gpu", lambda cmd, timeout=30: asked.append(cmd) or True)
+    monkeypatch.setattr(teacher, "ensure", lambda *a, **k: ensured.append(a))
+    app = learner(teacher_ready=False)
+    app.paths.data_dir.mkdir(parents=True, exist_ok=True)
+    (app.paths.data_dir / GPU_MARKER).write_text("{}", "utf-8")
+    app._setup_teacher()
+    assert asked == [] and ensured == [] and app.teacher_path is None
+    assert app.statuses == ["Paused: no graphics card"] and app.notes == []
+
+
+# --- no voice kept where learning can never run -------------------------------------------------------
+
+def test_no_discrete_gpu_keeps_no_recordings(learner, out, saves, monkeypatch, pruning):
+    monkeypatch.setattr(teacher, "has_discrete_gpu", lambda cmd, timeout=30: False)
+    app = learner(teacher_ready=False)
+    old, recent = old_recording(app.paths.recordings_dir, 30), old_recording(app.paths.recordings_dir, 1)
+    app._setup_teacher()
+    app.engine = FakeEngine("Hello world.")
+    dictate(app)
+    finish_saving()
+    assert out.typed == ["Hello world. "] and [s.rec.id for s in saves] == [old, recent]   # only the two above
+    pruning(app)                                          # recordings kept earlier still age out
+    wait_for(lambda: [r.id for r in recordings.list_records(app.paths.recordings_dir)] == [recent])
+
+
+def test_gpu_marker_keeps_no_recordings(learner, out, saves):
+    app = learner()
+    app.paths.data_dir.mkdir(parents=True, exist_ok=True)
+    (app.paths.data_dir / GPU_MARKER).write_text("{}", "utf-8")
+    app.engine = FakeEngine("Hello world.")
+    dictate(app)
+    finish_saving()
+    assert out.typed == ["Hello world. "] and saves == []
+
+
+def test_recordings_kept_when_the_pc_has_a_graphics_card(learner, out, saves, monkeypatch):
+    monkeypatch.setattr(teacher, "has_discrete_gpu", lambda cmd, timeout=30: True)
+    app = learner(teacher_ready=False)
+    monkeypatch.setattr(teacher, "ensure", lambda *a, **k: app.paths.teacher_dir / WHISPER)
+    app._setup_teacher()
+    app.engine = FakeEngine("Hello world.")
+    dictate(app)
+    finish_saving()
+    [s] = saves
+    assert s.rec.raw == "Hello world."
+
+
 # --- what the checker is given -----------------------------------------------------------------------
 
 @pytest.mark.parametrize("setting, model_languages, expected",

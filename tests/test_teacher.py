@@ -115,6 +115,25 @@ def test_download_resumes_from_part(tmp_path, body, known, serve):
     assert not part.exists()
 
 
+def test_download_stopped_by_its_progress_callback_keeps_the_part_for_a_resume(tmp_path, body, known, serve):
+    """The app stops Whisper's download from the progress callback (quitting, or learning turned off)."""
+    class Stop(Exception):
+        pass
+
+    def stop_after_1_mb(done, total):
+        if done >= 1 << 20:
+            raise Stop()
+
+    s = serve()
+    part = tmp_path / "dl" / teacher.KEY / (NAME + ".part")
+    with pytest.raises(Stop):
+        teacher.ensure(tmp_path / "dl", tmp_path / "orca", stop_after_1_mb, base_url=s.url)
+    have = part.stat().st_size
+    assert have >= 1 << 20 and part.read_bytes() == body[:have]
+    assert teacher.ensure(tmp_path / "dl", tmp_path / "orca", base_url=s.url).read_bytes() == body
+    assert s.ranges == [None, f"bytes={have}-"]
+
+
 def test_resume_falls_back_when_server_ignores_range(tmp_path, body, known, serve):
     s = serve(honour_range=False)
     part = tmp_path / "dl" / teacher.KEY / (NAME + ".part")
