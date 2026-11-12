@@ -74,6 +74,7 @@ class Config:
     hold_threshold: float
     esc_cancels: bool
     model_dir: str          # "auto", a .gguf file or a folder holding one (environment variables expanded)
+    model_folders: tuple[str, ...]   # extra .gguf files / folders searched besides "auto" (env vars expanded)
     device: str             # auto | gpu | igpu | cpu
     threads: int
     unload_after_seconds: int
@@ -161,6 +162,7 @@ def parse(text: str, defaults_text: str | None = None) -> Config:
         hold_threshold=_get(d, "hotkey", "hold_threshold", float, lambda v: 0 <= v <= 5),
         esc_cancels=_get(d, "hotkey", "esc_cancels", bool),
         model_dir=_model_dir(_get(d, "model", "dir", str)),
+        model_folders=tuple(os.path.expandvars(f) for f in _str_list(d, "model", "folders")),
         device=_get(d, "model", "device", str, lambda v: v in ("auto", "gpu", "igpu", "cpu")),
         threads=_get(d, "model", "threads", int, lambda v: 1 <= v <= 32),
         unload_after_seconds=_get(d, "model", "unload_after_seconds", int, lambda v: v >= -1),

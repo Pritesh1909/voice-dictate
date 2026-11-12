@@ -19,6 +19,10 @@ esc_cancels = true
 # Or put a .gguf file or folder here, e.g. "%APPDATA%\\orca\\speech-models\\parakeet-tdt-0.6b-v2-int8".
 # Models are only ever read, never changed.
 dir = "auto"
+# More places to find models in, on top of the ones "auto" searches: .gguf files or folders holding them,
+# e.g. ["D:\\models", "%USERPROFILE%\\Downloads\\whisper-small.gguf"]. Models found there show in the
+# tray menu under "Model".
+folders = []
 # Where the model runs. "auto" = graphics card if there is one (NVIDIA RTX 2050 here: 16 s of speech in
 # 0.3 s), else the CPU (~4.5 s). "gpu" = discrete card, "igpu" = built-in Intel graphics, "cpu" = CPU.
 # If the chosen device fails, the CPU is used instead.

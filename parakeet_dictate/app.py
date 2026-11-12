@@ -568,6 +568,38 @@ class App:
         log.info("settings reloaded")
         return err
 
+    _settings_proc = None   # the open Settings window's process
+
+    def open_settings_window(self) -> None:
+        """The Settings window, its own process and only one at a time; settings reload when it closes."""
+        from . import settings_ui
+        p = self._settings_proc
+        if p is not None and p.poll() is None:
+            return
+        try:
+            before = self.paths.config_file.stat().st_mtime
+        except OSError:
+            before = None
+        try:
+            p = self._settings_proc = settings_ui.launch()
+        except Exception as e:
+            log.exception("settings window")
+            self._notify(f"Couldn't open the Settings window: {e}")
+            return
+
+        def wait() -> None:
+            p.wait()
+            try:
+                changed = self.paths.config_file.stat().st_mtime != before
+            except OSError:
+                changed = False
+            if changed:
+                err = self.reload_if_changed(force=True)
+                self._notify(err or "Settings saved.")
+                self._refresh()
+
+        threading.Thread(target=wait, daemon=True, name="settings-window").start()
+
     # --- dictation flow -----------------------------------------------------------------------------
 
     def _on_hotkey(self) -> None:  # hotkey thread
@@ -937,6 +969,9 @@ class App:
                     self._notify(f"Couldn't open the correction window: {e}")
 
         def open_settings(icon, item):
+            self.open_settings_window()
+
+        def open_settings_file(icon, item):
             os.startfile(self.paths.config_file)
 
         def reload(icon, item):
@@ -985,6 +1020,7 @@ class App:
             I("Download Parakeet v2 model (about 730 MB)", lambda i, it: self.download_model(),
               enabled=lambda _: not self.model_job),
             I("Settings…", open_settings, default=True),
+            I("Open settings file", open_settings_file),
             I("Reload settings", reload),
             I("Free model memory now", unload, enabled=lambda _: self.engine.state != "unloaded"),
             I("Start with Windows", toggle_autostart, checked=lambda _: winutil.startup_shortcut().exists()),
