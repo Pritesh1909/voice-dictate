@@ -256,6 +256,7 @@ class Env:
     available: Callable[[str], bool] = hotkey.available
     model_in_use: str = ""
     folder_models: Callable = store_mod.folder_models
+    list_mics: Callable = store_mod.input_devices     # used when mics is None (read after the window shows)
 
     @classmethod
     def real(cls, paths: config.Paths) -> "Env":
@@ -266,11 +267,7 @@ class Env:
         except Exception:
             log.exception("settings: model search")
             found = []
-        try:
-            mics = store_mod.input_devices()
-        except Exception:
-            log.exception("settings: microphones")
-            mics = []
+        mics = None      # listed in the background once the window shows (starting PortAudio takes ~0.4 s)
         lnk = winutil.startup_shortcut()
 
         def set_startup(on: bool) -> None:
@@ -302,16 +299,50 @@ class SettingsWindow:
         self.pages: dict[str, Any] = {}
         self.current_hotkey = str(store.value(("hotkey", "keys"), store_mod.DEFAULT_HOTKEY))
         self.scale = max(1.0, root.winfo_fpixels("1i") / 96)
+        self._groups = dict(PAGES)
         self._styles()
         self._layout()
-        for name, groups in PAGES:
-            self._build_page(name, groups)
+        # Only the first page is built now: building every control of every page up front took over a
+        # second. The others are built the first time they are shown (or a field on them is needed).
         self.nav.selection_set(PAGES[0][0])
         self.show(PAGES[0][0])
         if store.config_error:
             self.message(f"The settings file has a problem: {store.config_error}", error=True)
         self.ready = True
         self.refresh_dirty()
+        if env.mics is None:            # listing microphones starts the audio system: do it in the background
+            self._load_mics()
+
+    def _ensure_page(self, name: str) -> None:
+        if name in self.pages:
+            return
+        was, self.ready = self.ready, False     # setting the shown values isn't an edit
+        try:
+            self._build_page(name, self._groups[name])
+        finally:
+            self.ready = was
+
+    def _load_mics(self) -> None:
+        import threading
+        box: list = []
+
+        def work():
+            try:
+                box.append(self.env.list_mics())
+            except Exception:
+                log.exception("settings: microphones")
+                box.append([])
+        threading.Thread(target=work, daemon=True, name="list-mics").start()
+
+        def check():
+            if not box:
+                self.root.after(100, check)
+                return
+            self.env.mics = box[0]
+            for f in self.fields:
+                if f.spec.kind == "mic":
+                    f.control.add_mics(box[0])
+        self.root.after(100, check)
 
     # layout ---------------------------------------------------------------------------------------
     def px(self, n: float) -> int:
@@ -364,20 +395,25 @@ class SettingsWindow:
 
         right = ttk.Frame(body)
         right.pack(side="left", fill="both", expand=True)
-        self.canvas = tk.Canvas(right, highlightthickness=0, borderwidth=0, background=self.bg)
+        self.canvas = tk.Canvas(right, highlightthickness=0, borderwidth=0, background=self.bg,
+                                yscrollincrement=self.px(48))     # one wheel notch = about one row
         sb = self.sb = ttk.Scrollbar(right, orient="vertical", command=self.canvas.yview)
         self.canvas.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y")
         self.canvas.pack(side="left", fill="both", expand=True)
-        self.holder = ttk.Frame(self.canvas, padding=(self.px(20), self.px(14), self.px(16), self.px(16)))
+        # The scrollbar lies over the page's right margin (place, not pack), so showing or hiding it
+        # never changes the page's width: that used to lay the whole page out again several times.
+        self.holder = ttk.Frame(self.canvas, padding=(self.px(20), self.px(14), self.px(22), self.px(16)))
         self._win = self.canvas.create_window(0, 0, window=self.holder, anchor="nw")
+        self._canvas_w = 0
 
         def holder_resized(_e=None):
             self.canvas.configure(scrollregion=self.canvas.bbox("all"))
             self._scrollbar_when_needed()
 
         def canvas_resized(e):
-            self.canvas.itemconfigure(self._win, width=e.width)
+            if e.width != self._canvas_w:        # only a real width change re-lays the page out
+                self._canvas_w = e.width
+                self.canvas.itemconfigure(self._win, width=e.width)
             self._scrollbar_when_needed()
         self.holder.bind("<Configure>", holder_resized)
         self.canvas.bind("<Configure>", canvas_resized)
@@ -388,9 +424,9 @@ class SettingsWindow:
         need = self.holder.winfo_reqheight() > self.canvas.winfo_height() > 1
         shown = bool(self.sb.winfo_ismapped())
         if need and not shown:
-            self.sb.pack(side="right", fill="y", before=self.canvas)
+            self.sb.place(relx=1.0, rely=0.0, relheight=1.0, anchor="ne")
         elif not need and shown:
-            self.sb.pack_forget()
+            self.sb.place_forget()
             self.canvas.yview_moveto(0)
 
     def _wheel(self, e) -> None:
@@ -399,10 +435,23 @@ class SettingsWindow:
                 return
         except (AttributeError, self.tk.TclError):
             return
-        if self.holder.winfo_height() > self.canvas.winfo_height():
-            self.canvas.yview_scroll(int(-e.delta / 120), "units")
+        if self.holder.winfo_height() <= self.canvas.winfo_height():
+            return
+        # A fast wheel sends many events per frame; scrolling for each one redraws the page each time.
+        # Add them up and scroll once per frame instead.
+        self._wheel_delta = getattr(self, "_wheel_delta", 0) + e.delta
+        if not getattr(self, "_wheel_job", None):
+            self._wheel_job = self.root.after(16, self._apply_wheel)
+
+    def _apply_wheel(self) -> None:
+        self._wheel_job = None
+        delta, self._wheel_delta = self._wheel_delta, 0
+        steps = round(-delta / 120) or (-1 if delta > 0 else 1 if delta < 0 else 0)
+        if steps:
+            self.canvas.yview_scroll(steps, "units")
 
     def show(self, name: str) -> None:
+        self._ensure_page(name)
         for n, f in self.pages.items():
             if n != name:
                 f.pack_forget()
@@ -504,7 +553,20 @@ class SettingsWindow:
 
     # state -----------------------------------------------------------------------------------------
     def field(self, key) -> "Field":
-        return next(f for f in self.fields if f.spec.key == key or (key == "startup" and f.spec.kind == "startup"))
+        def find():
+            return next((f for f in self.fields
+                         if f.spec.key == key or (key == "startup" and f.spec.kind == "startup")), None)
+        found = find()
+        if found is None:               # on a page not built yet: build it (it stays hidden)
+            for name, groups in PAGES:
+                if any(s.key == key or (key == "startup" and s.kind == "startup")
+                       for _, specs in groups for s in specs):
+                    self._ensure_page(name)
+                    found = find()
+                    break
+        if found is None:
+            raise StopIteration(key)
+        return found
 
     def changes(self) -> tuple[dict[Key, Any], list[str]]:
         """(changed config keys -> new values, problems with what was typed)."""
@@ -680,8 +742,14 @@ class Mic(Choice):
 
     def build(self):
         self.spec = Spec(self.spec.key, self.spec.kind, self.spec.label, self.spec.help,
-                         choices=(("", "Windows default"), *((n, n) for n in self.win.env.mics)))
+                         choices=(("", "Windows default"), *((n, n) for n in (self.win.env.mics or ()))))
         super().build()
+
+    def add_mics(self, names) -> None:
+        """The microphone list arrived (it is read in the background); keep what is selected."""
+        known = {v for v, _ in self.choices}
+        self.choices += [(n, n) for n in names if n not in known]
+        self._fill()
 
 
 class ModelChoice(Choice):

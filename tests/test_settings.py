@@ -346,7 +346,11 @@ def window(paths, hidden_root):
 def test_every_page_builds_and_shows_the_effective_values(window, paths):
     from parakeet_dictate import settings_ui
     assert window.root.state() == "withdrawn"
+    assert list(window.pages) == ["General"]            # the others are built when first shown
+    for name, _ in settings_ui.PAGES:
+        window.show(name)
     assert list(window.pages) == [name for name, _ in settings_ui.PAGES]
+    assert not window.dirty()                            # building a page is not an edit
     store = ss.Store(paths)
     keyed = [f for f in window.fields if f.spec.key]
     assert len(keyed) >= 40
@@ -455,6 +459,45 @@ def test_action_buttons_ask_the_tray(window, paths):
         (paths.data_dir / "settings_request.json").read_text("utf-8"))["actions"]
     window.do_action("open_log")
     assert "no log" in window.msg.cget("text").lower()
+
+
+def test_a_field_on_an_unbuilt_page_is_built_on_demand(window):
+    assert "Extras" not in window.pages
+    assert window.field(("model", "threads")).control.get() == 3
+    assert "Extras" in window.pages and not window.dirty()
+
+
+def test_microphones_arrive_in_the_background(paths, hidden_root):
+    from parakeet_dictate import settings_ui
+    paths.config_file.write_text(config.DEFAULT_FILE.read_text("utf-8"), "utf-8")
+    env = settings_ui.Env(mics=None, list_mics=lambda: ["Headset (Jabra)"], available=ALL_FREE,
+                          folder_models=lambda f: [])
+    win = settings_ui.SettingsWindow(hidden_root, ss.Store(paths), env, open_file=lambda p: None,
+                                     close=lambda: None)
+    try:
+        mic = win.field(("audio", "input_device")).control
+        assert [v for v, _ in mic.choices] == [""]                 # just "Windows default" at first
+        import time
+        end = time.monotonic() + 3
+        while time.monotonic() < end and len(mic.choices) < 2:
+            hidden_root.update()
+            time.sleep(0.05)
+        assert ("Headset (Jabra)", "Headset (Jabra)") in mic.choices and not win.dirty()
+    finally:
+        win.outer.destroy()
+
+
+def test_wheel_events_are_combined(window):
+    window.show("Improvements")
+    window.root.update_idletasks()
+    calls = []
+    window.canvas.yview_scroll = lambda n, what: calls.append(n)
+    window.holder.winfo_height = lambda: 5000                     # pretend the page is long
+    ev = type("E", (), {"widget": window.holder, "delta": -120})
+    for _ in range(5):
+        window._wheel(ev)
+    window._apply_wheel()
+    assert calls == [5]                                            # one scroll of 5 rows, not five
 
 
 def test_open_settings_file_button(window, paths):
