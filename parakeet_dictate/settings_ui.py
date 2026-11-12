@@ -128,6 +128,10 @@ PAGES: list[tuple[str, list[tuple[str, list[Spec]]]]] = [
               'Separated by commas. "uh" also removes "uhh".'),
             S(("cleanup", "remove_repeated_words"), "switch", "Remove repeated words",
               'Collapses stutters such as "the the".'),
+            S(("cleanup", "numbers"), "switch", "Numbers as digits",
+              '"port six zero four zero" → "port 6040", "twenty five percent" → "25%". Prose stays.'),
+            S(("cleanup", "id_prefixes"), "csv", "Ticket prefixes",
+              'Separated by commas. "SEC twelve" → "SEC-12".'),
         ]),
         ("Context words", [
             S(("context", "enabled"), "switch", "Use context words",

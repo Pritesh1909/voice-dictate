@@ -97,6 +97,8 @@ class Config:
     language_fillers: bool
     remove_repeated_words: bool
     repeated_words_allowed: tuple[str, ...]
+    numbers: bool                                  # spoken numbers as digits where clearly numeric
+    id_prefixes: tuple[str, ...]                   # ticket prefixes, upper case: "SEC twelve" -> "SEC-12"
     replacements: tuple[tuple[str, str], ...]
     dictionary: tuple[tuple[str, str], ...]   # (term, heard_as or "")
     app_dictionaries: tuple[tuple[str, tuple[tuple[str, str], ...]], ...]   # (exe in lower case, terms)
@@ -157,6 +159,13 @@ def _str_list(d: dict, section: str, key: str) -> tuple[str, ...]:
     return tuple(x for x in (s.strip() for s in v) if x)
 
 
+def _id_prefixes(v: tuple[str, ...]) -> tuple[str, ...]:
+    bad = [p for p in v if not re.fullmatch(r"[A-Za-z]{1,10}", p)]
+    if bad:
+        raise ConfigError(f"[cleanup] id_prefixes must be letters only (like \"SEC\"), got {bad[0]!r}")
+    return tuple(dict.fromkeys(p.upper() for p in v))
+
+
 def parse(text: str, defaults_text: str | None = None) -> Config:
     base = tomllib.loads(defaults_text if defaults_text is not None else DEFAULT_FILE.read_text("utf-8"))
     try:
@@ -190,6 +199,8 @@ def parse(text: str, defaults_text: str | None = None) -> Config:
         language_fillers=_get(d, "cleanup", "language_fillers", bool),
         remove_repeated_words=_get(d, "cleanup", "remove_repeated_words", bool),
         repeated_words_allowed=_str_list(d, "cleanup", "repeated_words_allowed"),
+        numbers=_get(d, "cleanup", "numbers", bool),
+        id_prefixes=_id_prefixes(_str_list(d, "cleanup", "id_prefixes")),
         replacements=tuple((k, v) for k, v in repl.items()),
         dictionary=_dictionary(d.get("dictionary", {}), "dictionary"),
         app_dictionaries=_app_dictionaries(d),

@@ -1,7 +1,8 @@
 """Turn raw Parakeet output into clean dictation text.
 
-Everything here is deterministic word-list logic: it only removes fillers, collapses stutters and applies
-the user's exact replacements and dictionary spellings. It never rewords anything else (no AI rewrite step).
+Everything here is deterministic word-list logic: it only removes fillers, writes clearly numeric number
+words as digits (numbers.py), collapses stutters and applies the user's exact replacements and dictionary
+spellings. It never rewords anything else (no AI rewrite step).
 Filler removal is ported from Orca 1.4.256 (shared/dictation-filler-words.js): each language has its own
 thinking sounds, and the user's [cleanup] fillers are added on top.
 """
@@ -13,7 +14,7 @@ import unicodedata
 from dataclasses import dataclass, field
 from typing import Iterable
 
-from . import dictionary
+from . import dictionary, numbers
 
 # token = leading openers + core word + trailing punctuation
 _SPLIT = re.compile(r"^([\"'(\[{“‘]*)(.*?)([.,!?;:…\"')\]}”’\-]*)$", re.S)
@@ -241,11 +242,16 @@ class Cleaner:
     app_dictionary: list[tuple[str, str]] = field(default_factory=list)  # one program's terms: win over yours
     languages: tuple[str, ...] = ()                                   # what is dictated; () = unknown
     language_fillers: bool = True                                     # remove that language's filler sounds
+    numbers: bool = True                                              # spoken numbers as digits (numbers.py)
+    id_prefixes: list[str] = field(default_factory=list)              # ticket prefixes: "SEC twelve" -> SEC-12
 
     def __post_init__(self) -> None:
         self._fillers = filler_rules(self.languages, self.fillers, self.language_fillers)
         self._repl = compile_replacements(self.replacements)
         self._spell = dictionary.build(self.dictionary, ahead=self.app_dictionary)
+        # The number words are English: off when only other languages are dictated.
+        self._numbers = self.numbers and (not self.languages or any(
+            code.lower().split("-")[0] == "en" for code in self.languages))
 
     @classmethod
     def from_config(cls, c, languages: Iterable[str] = (),
@@ -256,7 +262,8 @@ class Cleaner:
         return cls(fillers=list(c.fillers), remove_repeated_words=c.remove_repeated_words,
                    repeated_words_allowed=list(c.repeated_words_allowed), replacements=list(c.replacements),
                    dictionary=list(c.dictionary) + list(learned), app_dictionary=list(app_terms),
-                   languages=tuple(languages), language_fillers=c.language_fillers)
+                   languages=tuple(languages), language_fillers=c.language_fillers,
+                   numbers=c.numbers, id_prefixes=list(c.id_prefixes))
 
     def with_extra(self, entries: Iterable[tuple[str, str]]) -> "Cleaner":
         """This clean-up plus lower-ranked terms for one dictation (context words: the window title, your
@@ -281,6 +288,8 @@ class Cleaner:
         words = text.split()
         if not words or words[-1][-1:] in ",;:!?":
             return False          # a comma etc. ends any term
+        if self._numbers and numbers.may_continue(text, self.id_prefixes):
+            return True           # "twenty" before "five", "two" before "point", "SEC" before "twelve"
         for n in range(1, min(dictionary.MAX_WORDS_PER_TERM, len(words)) + 1):
             if dictionary.word_key(" ".join(words[-n:])) in self._prefixes:
                 return True
@@ -288,11 +297,16 @@ class Cleaner:
 
     def clean(self, raw: str) -> str:
         text = remove_fillers(raw.replace("\n", " "), self._fillers)
+        # Numbers right after the fillers ("twenty, uh, five" is "twenty five" by then) and before the
+        # repeats, which would take "five five five" or "twenty twenty" for a stutter. Before the
+        # replacements and terms too, so those see what the model would have written: digits.
+        if self._numbers:
+            text = numbers.convert(text, self.id_prefixes)
         if self.remove_repeated_words:
-            text = remove_repeats(text, self.repeated_words_allowed)
+            text = remove_repeats(text, [*self.repeated_words_allowed, *numbers.NUMBER_WORDS])
         text = apply_replacements(text, self._repl)
         text = tidy(text)
-        if raw[:1].isupper() and text:
+        if raw[:1].isupper() and text and not text[:1].isdigit() and not text.startswith("-"):  # not "25% Of"
             text = _cap_first(text)
         # Terms last, so a lower-case term at the start ("pnpm") keeps its spelling.
         return self._spell(text) if self._spell else text
