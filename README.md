@@ -162,8 +162,10 @@ the next dictation on. It is on by default, never shows a pop-up and never gets 
   that can go out is **text**: when two transcripts disagree, both are sent to Claude (`claude -p`, the Claude
   Code you are already signed in to, no API key) to say which one is right. That is a few cents a day at most:
   one call settles up to 30 dictations, and there are at most **20 calls a day** (`claude_calls_per_day`).
-  If Claude isn't installed, isn't signed in or the day's calls are used up, the app still learns fixes for
-  spellings you already have in your dictionary, and the rest wait for the next day.
+  If Claude isn't installed or isn't signed in (or *Ask Claude* is off), only fixes to names you already have
+  (your dictionary, your learned words and names from your notes) are learned, and the other disagreements
+  from that run are not looked at again. If the day's calls are used up, the dictations still waiting for
+  Claude are left for the next day.
 - **When it runs.** Only when all of these are true: learning is on and Whisper is ready; no dictation is going
   on; there has been no keyboard or mouse input for **3 minutes** (`idle_minutes`); the PC is on mains power
   (not on battery); and the PC has a discrete graphics card (Whisper runs on it, never on the CPU, so
@@ -199,7 +201,7 @@ All the settings are in `[learning]`:
 | `keep_days` | `14` | Delete kept recordings older than this (1 to 365) |
 | `max_recordings_mb` | `1500` | Keep at most this much, the oldest deleted first (100 to 20000) |
 | `idle_minutes` | `3` | Minutes without keyboard or mouse input before a check starts (1 to 120) |
-| `use_claude` | `true` | Let Claude judge disagreements (text only, never audio); `false` = only fixes to terms you already have are learned |
+| `use_claude` | `true` | Let Claude judge disagreements (text only, never audio); `false` = only fixes to names you already have (dictionary, learned words, names from your notes) are learned |
 | `claude_calls_per_day` | `20` | At most this many Claude calls a day (0 to 200, 0 = never) |
 
 ### Context words
