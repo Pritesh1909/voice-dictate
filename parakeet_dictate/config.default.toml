@@ -14,6 +14,8 @@ esc_cancels = true
 copy_last = ""
 # Open "Correct last dictation", to fix a word and teach it to the dictionary:
 correct_last = ""
+# Open the History window of recent dictations (see [history]):
+history = ""
 
 [model]
 # Speech model (a .gguf file, the format Orca uses). "auto" finds every one already on this PC: Orca's
@@ -204,6 +206,18 @@ refresh_minutes = 10
 # part ("ss-core-service", "McpAuthFilter") are used everywhere. Find a program's name: Task Manager -> Details.
 code_apps = ["idea64.exe", "code.exe", "windowsterminal.exe", "orca.exe", "datagrip64.exe", "pycharm64.exe",
              "cursor.exe"]
+
+[history]
+# Recent dictations, for tray menu -> "History…" (search, copy again, delete).
+# Dictation can contain sensitive text, so choose where it is kept:
+#   "off"     = nothing is kept.
+#   "session" = only in the app's memory, gone when it quits (the History window gets a copy in a
+#               temporary file that it deletes as soon as it has read it).
+#   "disk"    = also in %LOCALAPPDATA%\ParakeetDictate\history.jsonl, so it survives restarts.
+# Switching away from "disk" deletes history.jsonl.
+keep = "session"
+# Keep at most this many dictations, the oldest dropped first (10..5000).
+max_items = 200
 
 # Settings for one program, by its .exe name (capitals don't matter). Each may change any of:
 #   method, add_trailing_space, type_while_speaking, press_enter (see [output]) and commands (true/false).
