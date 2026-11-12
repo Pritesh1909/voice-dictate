@@ -20,13 +20,18 @@ SENTENCES = {
 }
 
 
-def _tts(text: str, path) -> np.ndarray:
+def _tts(text: str, path, voice: str | None = None, shell: str = "powershell") -> np.ndarray:
+    """Windows text-to-speech into `path`, read back as float32 at 16 kHz. `voice` names an installed voice
+    ("Microsoft Zira"); the Indian-English ones ("Microsoft Ravi", "Microsoft Heera") only show up in
+    PowerShell 7, so pass shell="pwsh" for them."""
     ps = ("Add-Type -AssemblyName System.Speech; $s=New-Object System.Speech.Synthesis.SpeechSynthesizer;"
+          "if ($env:PD_VOICE) { $s.SelectVoice($env:PD_VOICE) };"
           "$f=New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo(16000,"
           "[System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen,[System.Speech.AudioFormat.AudioChannel]::Mono);"
           f"$s.SetOutputToWaveFile('{path}',$f); $s.Speak($env:PD_TEXT); $s.Dispose()")
     import os
-    subprocess.run(["powershell", "-NoProfile", "-Command", ps], check=True, env=dict(os.environ, PD_TEXT=text))
+    subprocess.run([shell, "-NoProfile", "-Command", ps], check=True,
+                   env=dict(os.environ, PD_TEXT=text, PD_VOICE=voice or ""))
     with wave.open(str(path)) as w:
         return np.frombuffer(w.readframes(w.getnframes()), np.int16).astype(np.float32) / 32768
 
