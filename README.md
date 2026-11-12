@@ -126,6 +126,15 @@ press_enter = true
 - **Typed while you talk**: each phrase is typed as soon as it is transcribed; an amber dot on the pill means a
   phrase is still being written. Nothing is typed while Ctrl/Alt/Shift/Win is held (hold-to-talk), so letters
   never become shortcuts. `[output] type_while_speaking = false` types it all at the end instead.
+- **Words stream in while you speak** (`[model] stream_while_speaking = true`): Parakeet reads a whole phrase
+  at a time, so the phrase still being spoken is re-read about twice a second (≈0.1 s per read on the
+  graphics card; read less often on the CPU) and each word is typed once two reads agree on it — about half
+  a second to a second behind your voice. The newest words show in grey on the (wider) pill until they settle.
+  A word that might still become part of a dictionary term ("key" before "cloak") waits for the next one, and a
+  phrase that could be a spoken command ("scratch…") isn't streamed. At the pause the phrase is read once more
+  in full; if that differs, the end is corrected with Backspace (type mode, same window only — otherwise the
+  typed words stay and the rest is added). Measured on TTS speech: words landed every ~0.5 s and the final text
+  was identical to phrase-at-a-time typing, with no corrections needed.
 - **Audio clean-up** before recognition: DC offset removed, silence trimmed, quiet speech raised (max 8×),
   and padding at the end so the last word isn't cut.
 - **Deterministic text clean-up** with no AI rewriting: fillers removed as whole words (stretched spellings

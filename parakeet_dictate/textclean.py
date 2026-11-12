@@ -267,7 +267,24 @@ class Cleaner:
             return self
         c = copy.copy(self)
         c._spell = dictionary.build(list(self.dictionary) + entries, ahead=self.app_dictionary)
+        c._prefixes = None
         return c
+
+    def may_continue(self, text: str) -> bool:
+        """True when the last words of `text` could be the start of a longer term or replacement, so the
+        next word might still change how they are spelled ("key" before "cloak" -> "Keycloak"). Live
+        streaming holds such words back instead of typing them and having to take them back."""
+        if getattr(self, "_prefixes", None) is None:
+            keys = set(getattr(self._spell, "keys", ()))
+            keys.update(dictionary.word_key(src) for src, _ in self.replacements)
+            self._prefixes = dictionary.key_prefixes(k for k in keys if k)
+        words = text.split()
+        if not words or words[-1][-1:] in ",;:!?":
+            return False          # a comma etc. ends any term
+        for n in range(1, min(dictionary.MAX_WORDS_PER_TERM, len(words)) + 1):
+            if dictionary.word_key(" ".join(words[-n:])) in self._prefixes:
+                return True
+        return False
 
     def clean(self, raw: str) -> str:
         text = remove_fillers(raw.replace("\n", " "), self._fillers)

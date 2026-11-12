@@ -47,15 +47,32 @@ def vad_engine():
     e.unload()
 
 
-def run_session(engine, audio, monkeypatch, use_vad=True, **cfg_over):
+def run_session(engine, audio, monkeypatch, use_vad=True, screen=None, **cfg_over):
+    """screen: a list [text] that typed chunks are applied to, Backspace included (and the window is
+    treated as unchanged, so streaming may correct itself)."""
     sent = []
-    monkeypatch.setattr(output, "deliver", lambda text, method: sent.append((time.monotonic(), text)))
+
+    def deliver(text, method):
+        sent.append((time.monotonic(), text))
+        if screen is not None:
+            screen[0] += text
+
+    def backspace(n):
+        sent.append((time.monotonic(), f"<bs {n}>"))
+        screen[0] = screen[0][:-n] if n else screen[0]
+
+    monkeypatch.setattr(output, "deliver", deliver)
+    monkeypatch.setattr(output, "backspace", backspace)
     monkeypatch.setattr(output, "modifiers_down", lambda: False)
+    if screen is not None:
+        from parakeet_dictate import winutil
+        monkeypatch.setattr(winutil, "foreground_window", lambda: 1)
+    cfg_over.setdefault("stream_while_speaking", False)
     cfg = config.parse("")
     cfg = config.Config(**{**cfg.__dict__, **cfg_over})
     app = types.SimpleNamespace(cfg=cfg, recorder=FakeRecorder(audio), engine=engine,
                                 cleaner_for=lambda exe: Cleaner.from_config(cfg), target_exe="",
-                                target_hwnd=0, target_terms=[],
+                                target_hwnd=1 if screen is not None else 0, target_terms=[],
                                 _session=1, state="recording")
     s = Session(app, 1, use_vad=use_vad)
     while not app.recorder.done:
@@ -90,6 +107,36 @@ def test_same_text_as_typing_at_the_end(vad_engine, monkeypatch, tmp_path):
     s, raw_end, sent_end, _ = run_session(vad_engine, audio, monkeypatch, type_while_speaking=False)
     assert s.typer is None and sent_end == []                # the app types it once, after finish()
     assert Cleaner.from_config(config.parse("")).clean(raw_end) + " " == "".join(t for _, t in sent)
+
+
+EXPECTED = ("I think we should deploy the core service first. Then check the Keycloak token on CodeCommit. "
+            "And send a Mailzzy campaign. ")
+
+
+def test_streaming_types_words_before_the_pause_and_ends_with_the_same_text(vad_engine, monkeypatch, tmp_path):
+    audio = speech(tmp_path)
+    screen = [""]
+    s, raw, sent, stopped = run_session(vad_engine, audio, monkeypatch, screen=screen, stream_while_speaking=True)
+    t0 = stopped - audio.size / SR
+    print(f"\nscreen: {screen[0]!r}\npreview reads: {s.preview_seconds:.2f}s of model time")
+    for t, x in sent:
+        print(f"  {t - t0:6.2f}s  {x!r}")
+    assert s.stream
+    assert screen[0] == EXPECTED
+    # Streaming sent more pieces than the three phrases: words went out before each pause.
+    assert len([x for _, x in sent if not x.startswith("<bs")]) > 3
+    # The first words of the first sentence (about 0.5 s to 4 s into the audio) appeared before it ended.
+    first_end = 0.5 + 3.4
+    assert min(t - t0 for t, _ in sent) < first_end
+
+
+def test_streaming_without_backspace_still_reads_right(vad_engine, monkeypatch, tmp_path):
+    """Another window in front (no Backspace allowed): the typed words stay, the rest is added."""
+    s, raw, sent, _ = run_session(vad_engine, speech(tmp_path), monkeypatch, stream_while_speaking=True)
+    typed = "".join(x for _, x in sent)
+    assert not any(x.startswith("<bs") for _, x in sent)
+    for words in ("deploy the core service first.", "Keycloak token", "Mailzzy campaign."):
+        assert words in typed
 
 
 def test_falls_back_to_loudness_detector(vad_engine, monkeypatch, tmp_path):

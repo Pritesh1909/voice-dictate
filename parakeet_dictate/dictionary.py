@@ -74,7 +74,13 @@ def build(entries: Iterable[tuple[str, str]],
         for heard, term in unspaced:
             text = text.replace(heard, term)
         return _replace_runs(text, by_key, longest) if by_key else text
+    apply.keys = frozenset(by_key)   # for streaming: is a word possibly the start of a longer term?
     return apply
+
+
+def key_prefixes(keys: Iterable[str]) -> frozenset[str]:
+    """Every proper prefix of every key: "keycloak" gives "k", "ke", ... "keycloa"."""
+    return frozenset(k[:i] for k in keys for i in range(1, len(k)))
 
 
 def _replace_runs(text: str, by_key: dict, longest: int) -> str:

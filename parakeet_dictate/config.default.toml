@@ -36,6 +36,14 @@ unload_after_seconds = 30
 # Transcribe what you've said so far at each pause while you keep talking, so only the last part is
 # left when you stop (text appears almost immediately). false = transcribe everything after you stop.
 process_while_speaking = true
+# Type words while you are still talking, about a second behind your voice, instead of at each pause.
+# Parakeet reads a whole phrase at a time, so the phrase being spoken is re-read about twice a second
+# (on the graphics card each read takes a tenth of a second; on the CPU it is read less often). A word
+# is typed once two reads agree on it; the last word or two show on the pill until they settle. At the
+# pause the whole phrase is read once more and, if that differs, the end is corrected with Backspace
+# (only in the window you started in). Needs the voice detector, [output] type_while_speaking and
+# method = "type". false = type each phrase at the pause.
+stream_while_speaking = true
 # A pause at least this long (seconds) ends a phrase, which is then transcribed in the background.
 # Shorter = text sooner but more risk of splitting a sentence. 0.6 is what Orca uses with its voice detector.
 pause_seconds = 0.6

@@ -27,6 +27,11 @@ log = logging.getLogger(__name__)
 
 MIC_LOST = "Microphone disconnected. Dictation stopped."
 
+# Live streaming: re-read the phrase being spoken at most this often (slower on the CPU, see
+# Session._preview), once it holds this much audio.
+PREVIEW_EVERY = 0.5
+PREVIEW_MIN_SECONDS = 0.6
+
 FAILED_NOTE = "Couldn't transcribe. The recording was kept: tray menu → Retry last recording."
 DOUBLED_NOTE = ("Retry couldn't tell which words were already typed, so it inserted them all. "
                 "Some words may now be doubled.")
@@ -67,10 +72,20 @@ class Session:
             self.cleaner = self.cleaner.with_extra(app.target_terms)
         self.matcher = commands.CommandMatcher(app.cfg.commands, self.out.commands)
         self.hwnd = app.target_hwnd                       # "scratch that" only backspaces in this window
+        live = self.parallel and self.out.type_while_speaking
+        # Live streaming: re-read the phrase being spoken and type its words before the pause.
+        self.stream = (live and self.vad_mode and app.cfg.stream_while_speaking and self.out.method == "type")
         self.typer = (output.PhraseTyper(self.cleaner.clean, self.out.method, self.out.add_trailing_space,
                                          matcher=self.matcher, can_backspace=self._same_window,
-                                         on_stop=self._voice_stop)
-                      if self.parallel and self.out.type_while_speaking else None)
+                                         on_stop=self._voice_stop, stream=self.stream,
+                                         may_continue=self.cleaner.may_continue)
+                      if live else None)
+        self._preview_pending = False
+        self._preview_at = 0.0           # when the last provisional read was asked for
+        self._preview_gap = PREVIEW_EVERY
+        self._preview_part = -1          # which phrase it was for, and how much audio it had
+        self._preview_len = 0
+        self.preview_seconds = 0.0
         self.total_samples = 0
         self.parts = 0
         self.decode_seconds = 0.0
@@ -117,6 +132,8 @@ class Session:
                 parts = self.vad_seg.push(x16, probs) if not final else self.vad_seg.flush_with(x16, probs)
                 for part in parts:
                     self._enqueue(part, SR)
+                if self.stream and not final:
+                    self._maybe_preview()
                 return
             self._fall_back(x16)
         else:
@@ -154,11 +171,54 @@ class Session:
         self._q.put((self.parts, samples, rate))
         self.parts += 1
 
+    def _maybe_preview(self) -> None:
+        """Ask for a provisional read of the phrase being spoken, when the worker has nothing else to do,
+        at most every _preview_gap seconds, and only when the phrase grew by a quarter second or more."""
+        seg = self.vad_seg
+        if (seg is None or not seg.phrase_open or self._busy or self._preview_pending
+                or time.monotonic() - self._preview_at < self._preview_gap):
+            return
+        audio = seg.open_audio()
+        grown = audio.size - (self._preview_len if self._preview_part == self.parts else 0)
+        if audio.size < PREVIEW_MIN_SECONDS * SR or grown < 0.25 * SR:
+            return
+        self._preview_pending, self._preview_at = True, time.monotonic()
+        self._preview_part, self._preview_len = self.parts, audio.size
+        self._q.put(("preview", self.parts, audio))
+
+    def _preview(self, part: int, samples) -> None:
+        """Worker: read the open phrase provisionally, unless it has ended meanwhile (its final read is
+        queued, and that one counts) or other work is waiting."""
+        try:
+            if part != self.parts or not self._q.empty() or self._cancelled or self._error:
+                return
+            audio = preprocess(samples, normalize=self.normalize)
+            if audio.size == 0:
+                return
+            raw, secs = self.app.engine.transcribe(audio)
+            self.preview_seconds += secs
+            # Slower reads (on the CPU) are asked for less often, so final reads never queue up behind them.
+            self._preview_gap = max(PREVIEW_EVERY, 2.0 * secs)
+            if part == self.parts and raw.strip() and self.typer:
+                self.typer.preview(raw.strip())
+        except Exception as e:       # a failed provisional read is skipped; the final read still runs
+            log.warning("provisional read failed: %s", e)
+        finally:
+            self._preview_pending = False
+
+    @property
+    def tentative(self) -> str:
+        """Words heard in the phrase being spoken that aren't typed yet (for the overlay)."""
+        return self.typer.tentative if self.typer and self.stream else ""
+
     def _work(self) -> None:
         while True:
             item = self._q.get()
             if item is None:
                 return
+            if item[0] == "preview":
+                self._preview(item[1], item[2])
+                continue
             try:
                 if self._cancelled or self._error:
                     continue
@@ -166,11 +226,13 @@ class Session:
                 audio = preprocess(resample(samples, rate, SR), normalize=self.normalize)
                 if audio.size == 0:
                     self._results[idx] = ""
+                    if self.typer:
+                        self.typer.add("")            # ends any words streamed for this phrase
                     continue
                 raw, secs = self.app.engine.transcribe(audio)
                 self.decode_seconds += secs
                 self._results[idx] = raw.strip()
-                if self.typer and raw.strip() and not self._cancelled:
+                if self.typer and not self._cancelled and (raw.strip() or self.stream):
                     self.typer.add(raw.strip())       # a spoken "stop listening" calls _voice_stop
                     self.typer.pump()
                 elif (self.parallel and self.matcher.enabled and raw.strip()
@@ -255,7 +317,7 @@ class App:
         self._lock = threading.Lock()
         self._session = 0
         self.current: Session | None = None
-        self.overlay: Overlay | None = Overlay(self.cfg.overlay_position) if self.cfg.overlay else None
+        self.overlay: Overlay | None = Overlay(self.cfg.overlay_position, wide=self.cfg.stream_while_speaking) if self.cfg.overlay else None
 
     # --- model ------------------------------------------------------------------------------------
 
@@ -477,10 +539,10 @@ class App:
         self.recorder.device_hint = c.input_device
         self.sounds.enabled = c.sounds
         if c.overlay and self.overlay is None:
-            self.overlay = Overlay(c.overlay_position)
-        elif not c.overlay and self.overlay is not None:
+            self.overlay = Overlay(c.overlay_position, wide=c.stream_while_speaking)
+        elif self.overlay is not None and (not c.overlay or self.overlay.wide != c.stream_while_speaking):
             self.overlay.close()
-            self.overlay = None
+            self.overlay = Overlay(c.overlay_position, wide=c.stream_while_speaking) if c.overlay else None
         if self.overlay:
             self.overlay.position = c.overlay_position
         if c.model_dir != self.cfg_model_dir:
@@ -546,7 +608,8 @@ class App:
                 self.hotkeys.escape_on()
             if self.overlay:
                 rec, cur = self.recorder, self.current
-                self.overlay.listening(lambda: rec.level, rec.started_at, lambda: cur.writing, lambda: rec.clipping)
+                self.overlay.listening(lambda: rec.level, rec.started_at, lambda: cur.writing, lambda: rec.clipping,
+                                       lambda: cur.tentative)
         self.engine.warm()  # load the model while the user is talking
         self.context.refresh()   # notes changed since the last look are read again, in the background
         self._refresh()

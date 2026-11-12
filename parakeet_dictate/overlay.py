@@ -51,6 +51,14 @@ def _dpi_scale() -> float:
         return 1.0
 
 
+def fit_tail(text: str, max_chars: int) -> str:
+    """The end of `text` in at most max_chars characters: the newest words matter most."""
+    text = " ".join(text.split())
+    if len(text) <= max_chars:
+        return text
+    return "…" + text[-(max_chars - 1):].lstrip()
+
+
 def listening_look(level: float, clipping: bool) -> tuple[str, str, str, float]:
     """(label, label colour, bar colour, bar fill 0..1) for the Listening pill.
 
@@ -64,8 +72,10 @@ def listening_look(level: float, clipping: bool) -> tuple[str, str, str, float]:
 
 
 class Overlay:
-    def __init__(self, position: str = "bottom"):
+    def __init__(self, position: str = "bottom", wide: bool = False):
         self.position = position
+        self.wide = wide            # live streaming: room for the words heard but not typed yet
+        self._preview_fn = lambda: ""
         self._ready = threading.Event()
         self._root: tk.Tk | None = None
         self._mode = "hidden"
@@ -81,11 +91,13 @@ class Overlay:
 
     # --- public, callable from any thread -------------------------------------------------------
 
-    def listening(self, level_fn, started_at: float, writing_fn=None, clipping_fn=None) -> None:
+    def listening(self, level_fn, started_at: float, writing_fn=None, clipping_fn=None, preview_fn=None) -> None:
         """level_fn() -> mic meter level 0..1; writing_fn() -> True while heard speech is still being
-        turned into text (amber dot); clipping_fn() -> True while the input is too loud (red bars)."""
+        turned into text (amber dot); clipping_fn() -> True while the input is too loud (red bars);
+        preview_fn() -> words heard but not typed yet (live streaming; shown on a wide pill)."""
         self._call(self._show, "listening", level_fn=level_fn, started=started_at,
-                   writing_fn=writing_fn or (lambda: False), clipping_fn=clipping_fn or (lambda: False))
+                   writing_fn=writing_fn or (lambda: False), clipping_fn=clipping_fn or (lambda: False),
+                   preview_fn=preview_fn or (lambda: ""))
 
     def working(self, text: str = "Transcribing…") -> None:
         self._call(self._show, "working", text=text)
@@ -111,7 +123,7 @@ class Overlay:
     def _run(self) -> None:
         s = _dpi_scale()
         self.s = s
-        self.w, self.h = int(236 * s), int(44 * s)
+        self.w, self.h = int((440 if self.wide else 236) * s), int(44 * s)
         root = tk.Tk()
         root.withdraw()
         root.overrideredirect(True)
@@ -152,7 +164,7 @@ class Overlay:
         self._kw = kw
         if mode == "listening":
             self._level_fn, self._started, self._writing_fn = kw["level_fn"], kw["started"], kw["writing_fn"]
-            self._clipping_fn = kw["clipping_fn"]
+            self._clipping_fn, self._preview_fn = kw["clipping_fn"], kw["preview_fn"]
         self._root.attributes("-alpha", 0.96)
         self._draw()
         if mode == "flash":
@@ -215,6 +227,15 @@ class Overlay:
             if writing:  # a phrase is being transcribed / waiting to be typed
                 rr = (2.6 + 0.9 * abs(math.sin(self._tick / 2.0))) * s
                 c.create_oval(178 * s - rr, cy - rr, 178 * s + rr, cy + rr, fill=AMBER, outline=AMBER)
+            if self.wide:
+                try:
+                    preview = str(self._preview_fn() or "")
+                except Exception:
+                    preview = ""
+                room = self.w - (192 + 58) * s           # between the amber dot and the timer
+                text = fit_tail(preview, max(4, int(room / (6.6 * s))))
+                if text:
+                    c.create_text(192 * s, cy, text=text, fill=MUTED, font=small, anchor="w")
             secs = int(time.monotonic() - self._started)
             c.create_text(self.w - 18 * s, cy, text=f"{secs // 60}:{secs % 60:02d}", fill=MUTED, font=small, anchor="e")
         elif self._mode == "working":

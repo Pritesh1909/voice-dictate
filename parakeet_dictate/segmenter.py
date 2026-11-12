@@ -98,8 +98,14 @@ class PhraseChunker:
         self._parts, self.held = [], 0
         return buf
 
+    def peek(self) -> np.ndarray:
+        """The phrase so far, without ending it (for a provisional read while it is still spoken)."""
+        return self._combined() if self.held else np.zeros(0, np.float32)
+
     def _combined(self) -> np.ndarray:
-        return self._parts[0] if len(self._parts) == 1 else np.concatenate(self._parts)
+        if len(self._parts) > 1:      # join once, so repeated peeks of a long phrase stay cheap
+            self._parts = [np.concatenate(self._parts)]
+        return self._parts[0]
 
     def _quiet_split(self, x: np.ndarray) -> int:
         end = min(self.limit, x.size)
@@ -154,6 +160,10 @@ class VadSegmenter:
         last = self.phrase.flush() if self.in_speech else None
         self.in_speech, self._preroll, self._preroll_len = False, [], 0
         return out + ([last] if last is not None else [])
+
+    def open_audio(self) -> np.ndarray:
+        """The phrase being spoken right now (empty when none is open). The phrase stays open."""
+        return self.phrase.peek() if self.in_speech else np.zeros(0, np.float32)
 
     def flush_with(self, x: np.ndarray, probs) -> list[np.ndarray]:
         """The last audio and the scores for it (including the zero-padded partial frame), then flush."""

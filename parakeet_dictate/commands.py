@@ -9,6 +9,7 @@ back with the right number of Backspaces and never more.
 """
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from typing import Iterable, Mapping
@@ -38,6 +39,14 @@ class CommandMatcher:
             return None
         return self._map.get(normalize_phrase(phrase))
 
+    def could_start(self, phrase: str) -> bool:
+        """True when `phrase` is a command or the first words of one ("scratch" of "scratch that").
+        Live streaming types nothing of such a phrase until it is known not to be a command."""
+        if not self.enabled:
+            return False
+        words = normalize_phrase(phrase).split()
+        return bool(words) and any(c.split()[:len(words)] == words for c in self._map)
+
 
 @dataclass
 class _Piece:
@@ -45,6 +54,7 @@ class _Piece:
     text: str            # the phrase, or one or two line breaks
     sent: str = ""       # exactly what went to the window for it (leading and trailing space included)
     flushed: bool = False
+    live: str = ""       # streamed ahead while it was spoken: already on screen, not yet final
 
 
 class Transcript:
@@ -65,10 +75,20 @@ class Transcript:
         self.trailing_space = trailing_space
         self._pieces: list[_Piece] = []
 
-    def add_text(self, text: str) -> None:
+    def add_text(self, text: str, live: str = "") -> None:
+        """`live`: characters of this phrase already typed while it was spoken (live streaming). The
+        final text is then typed as a correction of them: only what is missing, or (when Backspace is
+        safe) the differing end taken back and retyped."""
         text = text.strip()
         if text:
-            self._pieces.append(_Piece("text", text))
+            self._pieces.append(_Piece("text", text, live=live))
+
+    def lead_for_text(self) -> str:
+        """The space a new phrase would start with, typed now (nothing may be waiting to be sent)."""
+        prev, unsent = self._split()
+        if unsent or prev is None or prev.kind != "text":
+            return ""
+        return "" if prev.sent.endswith(" ") else " "
 
     def add_break(self, lines: int = 1) -> None:
         self._pieces.append(_Piece("break", "\n" * max(1, lines)))
@@ -99,11 +119,17 @@ class Transcript:
             shares.append(lead + p.text)
         if self.trailing_space and unsent[-1].kind == "text":
             shares[-1] += " "
-        return bs, "".join(shares), shares
+        parts = list(shares)
+        first = unsent[0]
+        if first.kind == "text" and first.live:
+            shares[0], parts[0], bs = reconcile(first.live, shares[0], can_backspace)
+        return bs, "".join(parts), shares
 
     def commit(self, bs: int, shares: list[str]) -> None:
         prev, unsent = self._split()
-        if bs and prev is not None:
+        if unsent and unsent[0].live:
+            unsent[0].live = ""     # the Backspaces corrected the streamed text, not the phrase before
+        elif bs and prev is not None:
             prev.sent = prev.sent[:-bs]
         for p, share in zip(unsent, shares):
             p.sent, p.flushed = share, True
@@ -131,7 +157,7 @@ class Transcript:
         last = self._pieces[-1]
         if not last.flushed:
             self._pieces.pop()
-            return 0
+            return len(last.live) if last.live and can_backspace else 0
         if not can_backspace:
             return 0
         self._pieces.pop()
@@ -153,6 +179,23 @@ class Transcript:
     def text(self) -> str:
         """Everything in the record (sent or not), as it reads, without the trailing space."""
         return self.render()
+
+
+def reconcile(live: str, final: str, can_backspace: bool) -> tuple[str, str, int]:
+    """Turn the streamed text of a phrase into its final text.
+
+    Returns (what the phrase shows on screen afterwards, characters to type now, Backspaces to send first).
+    Usually the final text just continues the streamed words. When it differs, the differing end is
+    taken back and retyped, but only when Backspace is safe; otherwise what is on screen stays and only
+    the final words after it are added."""
+    if final.startswith(live):
+        return final, final[len(live):], 0
+    common = len(os.path.commonprefix([live, final]))
+    if can_backspace:
+        return final, final[common:], len(live) - common
+    tail = final.split()[len(live.split()):]
+    add = (" " + " ".join(tail) if tail else "") + (" " if final.endswith(" ") else "")
+    return live + add, add, 0
 
 
 def compose(phrases: Iterable[str], matcher: CommandMatcher) -> tuple[str, bool]:

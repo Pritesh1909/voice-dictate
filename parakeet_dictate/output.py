@@ -234,6 +234,11 @@ def copy_to_clipboard(text: str) -> None:
     _set_clipboard_text(text)
 
 
+def _bare(word: str) -> str:
+    """A word without the punctuation the model puts after it, for comparing two provisional reads."""
+    return word.rstrip(".,;:!?…")
+
+
 class PhraseTyper:
     """Types finished phrases in order while the user keeps talking.
 
@@ -252,8 +257,17 @@ class PhraseTyper:
     """
 
     def __init__(self, clean, method: str = "type", trailing_space: bool = True, send=None, mods=None,
-                 matcher=None, backspace_keys=None, can_backspace=None, on_stop=None):
+                 matcher=None, backspace_keys=None, can_backspace=None, on_stop=None,
+                 stream: bool = False, may_continue=None):
         self._clean = clean
+        # Live streaming: words of the phrase still being spoken are typed once two provisional reads
+        # agree on them (see preview()). Only when typing keystrokes, never when pasting.
+        self.stream = stream and method == "type"
+        self._may_continue = may_continue or (lambda text: False)
+        self._live = ""                 # characters of the open phrase already on screen
+        self._live_words: list[str] = []
+        self._prev_words: list[str] = []
+        self.tentative = ""             # the open phrase's words not typed yet (for the overlay)
         self.method = method
         self.trailing_space = trailing_space
         self._send = send or deliver
@@ -273,8 +287,61 @@ class PhraseTyper:
     def _backspace_ok(self) -> bool:
         return self.method == "type" and self.failed is None and bool(self._can_backspace())
 
+    def preview(self, raw: str) -> None:
+        """A provisional read of the phrase still being spoken (live streaming).
+
+        Parakeet reads a whole phrase at a time, so the app re-reads the open phrase about twice a
+        second. A word is typed once two reads in a row agree on it and it isn't the last word (the
+        last one is still being said). Words that could still become part of a dictionary term, and a
+        phrase that could be a spoken command, wait. Words typed are never taken back here: when the
+        phrase ends, add() corrects them against the final read."""
+        if not self.stream or self.cancelled or self.stopped or self.failed is not None:
+            return
+        words = self._clean(raw).split()
+        with self._lock:
+            agree = 0
+            for a, b in zip(self._prev_words, words):
+                if _bare(a) != _bare(b):   # "admin." at the end of one read is "admin" in the next
+                    break
+                agree += 1
+            self._prev_words = words
+            n = min(agree, len(words) - 1)
+            if self._matcher and self._matcher.could_start(" ".join(words)):
+                n = 0
+            while n > len(self._live_words) and self._may_continue(" ".join(words[:n])):
+                n -= 1
+            done = len(self._live_words)
+            if [_bare(w) for w in words[:done]] != [_bare(w) for w in self._live_words]:
+                n = done            # a typed word changed: the final read will fix it
+            self.tentative = " ".join(words[done:])
+            if n <= done or self._typed.pending or self._backspaces or self._mods():
+                return
+            new = words[done:n]
+            chunk = (" " if done else self._typed.lead_for_text()) + " ".join(new)
+            try:
+                self._send(chunk, self.method)
+            except OSError as e:
+                self._fail(e)
+                return
+            self._live += chunk
+            self._live_words += new
+            self.tentative = " ".join(words[n:])
+
+    def _end_live(self) -> str:
+        live = self._live
+        self._live, self._live_words, self._prev_words, self.tentative = "", [], [], ""
+        return live
+
     def add(self, raw: str) -> None:
         text = self._clean(raw)
+        with self._lock:
+            live = self._end_live()
+            if live and (not text or self.cancelled or self.failed is not None
+                         or (self._matcher and self._matcher.match(text))):
+                # Streamed words that turned out to be nothing (or a command): take them back if safe.
+                if self._backspace_ok() and not self.cancelled:
+                    self._backspaces += len(live)
+                live = ""
         if not text or self.cancelled or self.stopped:
             return
         action = self._matcher.match(text) if self._matcher else None
@@ -285,7 +352,7 @@ class PhraseTyper:
         with self._lock:
             target = self._typed if self.failed is None else self._rest
             if action is None:
-                target.add_text(text)
+                target.add_text(text, live=live if target is self._typed else "")
             elif action == commands.NEWLINE:
                 target.add_break(1)
             elif action == commands.PARAGRAPH:

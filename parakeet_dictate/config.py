@@ -78,6 +78,7 @@ class Config:
     threads: int
     unload_after_seconds: int
     process_while_speaking: bool
+    stream_while_speaking: bool   # type words before the pause (re-reads the open phrase)
     pause_seconds: float
     vad: str                # "auto", "off", or a .gguf path (environment variables expanded)
     language: str           # "auto" or an ISO-639-1 code ("de"); passed to models that take one
@@ -163,6 +164,7 @@ def parse(text: str, defaults_text: str | None = None) -> Config:
         threads=_get(d, "model", "threads", int, lambda v: 1 <= v <= 32),
         unload_after_seconds=_get(d, "model", "unload_after_seconds", int, lambda v: v >= -1),
         process_while_speaking=_get(d, "model", "process_while_speaking", bool),
+        stream_while_speaking=_get(d, "model", "stream_while_speaking", bool),
         pause_seconds=_get(d, "model", "pause_seconds", float, lambda v: 0.3 <= v <= 5),
         vad=_vad(_get(d, "model", "vad", str)),
         language=_language(_get(d, "model", "language", str)),
