@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import APP_ID
+from .commands import ACTIONS, normalize_phrase
 
 DEFAULT_FILE = Path(__file__).with_name("config.default.toml")
 
@@ -29,6 +30,16 @@ class Paths:
     def log_file(self) -> Path:
         return self.data_dir / "dictate.log"
 
+    @property
+    def learned_file(self) -> Path:
+        """Dictionary words learned from "Correct last dictation…" (kept out of the user's config.toml)."""
+        return self.config_dir / "learned.toml"
+
+    @property
+    def context_cache(self) -> Path:
+        """Terms harvested from the [context] folders, with the file times they came from."""
+        return self.data_dir / "context_terms.json"
+
     @classmethod
     def default(cls) -> "Paths":
         roaming = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
@@ -40,6 +51,20 @@ class Paths:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         if not self.config_file.exists():
             shutil.copyfile(DEFAULT_FILE, self.config_file)
+
+
+@dataclass(frozen=True)
+class AppOverride:
+    """[apps."<exe>"]: output settings for one program. None = use the global setting."""
+    method: str | None = None
+    add_trailing_space: bool | None = None
+    type_while_speaking: bool | None = None
+    press_enter: bool | None = None
+    commands: bool | None = None
+
+
+APP_OVERRIDE_KEYS = {"method": str, "add_trailing_space": bool, "type_while_speaking": bool,
+                     "press_enter": bool, "commands": bool}
 
 
 @dataclass(frozen=True)
@@ -71,13 +96,21 @@ class Config:
     overlay_position: str
     input_device: str
     silence_stop_seconds: int  # 0 = off
+    commands_enabled: bool
+    commands: tuple[tuple[str, str], ...]          # (normalized phrase, action)
+    context_enabled: bool
+    context_window_title: bool
+    context_folders: tuple[str, ...]               # environment variables expanded
+    context_max_terms: int
+    context_refresh_minutes: int
+    apps: tuple[tuple[str, AppOverride], ...]      # (exe name, lower case, without ".exe"; overrides)
     source_mtime: float = field(default=0.0, compare=False)
 
 
 def _merge(base: dict, over: dict) -> dict:
     out = dict(base)
     for k, v in over.items():
-        if isinstance(v, dict) and isinstance(out.get(k), dict) and k not in ("replacements", "heard_as"):
+        if isinstance(v, dict) and isinstance(out.get(k), dict) and k not in ("replacements", "heard_as", "phrases"):
             out[k] = _merge(out[k], v)
         else:
             out[k] = v
@@ -143,6 +176,14 @@ def parse(text: str, defaults_text: str | None = None) -> Config:
         overlay_position=_get(d, "overlay", "position", str, lambda v: v in ("top", "bottom")),
         input_device=_get(d, "audio", "input_device", str),
         silence_stop_seconds=_get(d, "audio", "silence_stop_seconds", int, lambda v: v == 0 or 5 <= v <= 3600),
+        commands_enabled=_get(d, "commands", "enabled", bool),
+        commands=_commands(d),
+        context_enabled=_get(d, "context", "enabled", bool),
+        context_window_title=_get(d, "context", "window_title", bool),
+        context_folders=tuple(os.path.expandvars(f) for f in _str_list(d, "context", "folders")),
+        context_max_terms=_get(d, "context", "max_terms", int, lambda v: 0 <= v <= 500),
+        context_refresh_minutes=_get(d, "context", "refresh_minutes", int, lambda v: 1 <= v <= 1440),
+        apps=_apps(d),
     )
 
 
@@ -158,6 +199,48 @@ def _dictionary(d: dict) -> tuple[tuple[str, str], ...]:
             raise ConfigError(f"[dictionary.heard_as] {term!r} must be text or a list of text values")
         out.append((term, ""))
         out += [(term, x.strip()) for x in spellings if x.strip()]
+    return tuple(out)
+
+
+def _commands(d: dict) -> tuple[tuple[str, str], ...]:
+    phrases = d.get("commands", {}).get("phrases", {})
+    if not isinstance(phrases, dict):
+        raise ConfigError('[commands.phrases] entries must look like  "new line" = "newline"')
+    out = []
+    for phrase, action in phrases.items():
+        if action not in ACTIONS:
+            raise ConfigError(f"[commands.phrases] {phrase!r} must be one of {', '.join(ACTIONS)}, got {action!r}")
+        if not normalize_phrase(phrase):
+            raise ConfigError(f"[commands.phrases] {phrase!r} has no words")
+        out.append((normalize_phrase(phrase), action))
+    return tuple(out)
+
+
+def app_key(exe: str) -> str:
+    """How [apps] names are matched: case-insensitive, with or without ".exe"."""
+    exe = exe.strip().lower()
+    return exe[:-4] if exe.endswith(".exe") else exe
+
+
+def _apps(d: dict) -> tuple[tuple[str, AppOverride], ...]:
+    apps = d.get("apps", {})
+    if not isinstance(apps, dict):
+        raise ConfigError('[apps] must hold tables like  [apps."idea64.exe"]')
+    out = []
+    for exe, table in apps.items():
+        where = f'[apps."{exe}"]'
+        if not isinstance(table, dict) or not app_key(exe):
+            raise ConfigError(f"{where} must be a table of settings")
+        for k, v in table.items():
+            typ = APP_OVERRIDE_KEYS.get(k)
+            if typ is None:
+                raise ConfigError(f"{where} {k} is not a setting that can be changed per app "
+                                  f"(these can: {', '.join(APP_OVERRIDE_KEYS)})")
+            if not isinstance(v, typ):
+                raise ConfigError(f"{where} {k} must be {typ.__name__}, got {v!r}")
+        if table.get("method", "type") not in ("type", "paste"):
+            raise ConfigError(f'{where} method must be "type" or "paste"')
+        out.append((app_key(exe), AppOverride(**table)))
     return tuple(out)
 
 

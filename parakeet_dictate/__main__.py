@@ -21,6 +21,15 @@ def main() -> int:
 
     paths = Paths.default()
     paths.ensure()
+    if len(sys.argv) >= 3 and sys.argv[1] == "--correct":
+        # The "Correct last dictation…" window, its own process while the tray app keeps running (see
+        # correct.py for why). It appends to the log without rotating it, which the tray app owns.
+        logging.basicConfig(level=logging.INFO, handlers=[logging.FileHandler(paths.log_file, encoding="utf-8")],
+                            format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+        from pathlib import Path
+
+        from .correct import run
+        return run(paths, Path(sys.argv[2]))
     handler = logging.handlers.RotatingFileHandler(paths.log_file, maxBytes=1_000_000, backupCount=2, encoding="utf-8")
     logging.basicConfig(level=logging.INFO, handlers=[handler],
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")

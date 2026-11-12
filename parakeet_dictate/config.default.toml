@@ -108,3 +108,48 @@ input_device = ""
 # forgotten tap doesn't keep the microphone open. Only in tap mode, never while you hold the keys.
 # 0 = never stop for silence (max_seconds still applies).
 silence_stop_seconds = 60
+
+[commands]
+# Say a command on its own, between two pauses, and it is carried out instead of typed. Capitals and
+# punctuation don't matter, but the whole phrase must be just the command: "I added a new line to the
+# file" is typed as you said it. false = never treat anything as a command.
+enabled = true
+
+# Phrase = what it does. Add, change or delete lines; what it does must be one of:
+#   "newline"   = start a new line            "paragraph" = leave an empty line, start a new one
+#   "undo"      = remove the phrase typed just before (with Backspace; only when typing, not pasting,
+#                 and only if the same window is still in front, otherwise nothing is removed)
+#   "stop"      = end the dictation, like pressing the hotkey
+[commands.phrases]
+"new line" = "newline"
+"new paragraph" = "paragraph"
+"scratch that" = "undo"
+"delete that" = "undo"
+"stop listening" = "stop"
+
+[context]
+# Spell code names and acronyms the way you write them, using words from where you are working: the
+# window you are dictating into and your notes. Only words you actually say are changed, and only their
+# spelling, spacing and capitals ("mcp auth filter" -> "McpAuthFilter", "tx ramp" -> "TX-RAMP").
+# Ordinary words are never changed: single plain words like "Docker" are not picked up (put those in
+# [dictionary]), nor anything spelled like a normal word ("IDEA" stays "idea").
+enabled = true
+# Take names from the title of the window you are dictating into (e.g. "McpAuthFilter.java - ss-core-service").
+window_title = true
+# Folders of notes (.md files, e.g. an Obsidian vault) to take names from. Read only, in the background,
+# never while you dictate; the found words are kept in %LOCALAPPDATA%\ParakeetDictate\context_terms.json
+# (the notes themselves are not copied). Hidden folders such as .obsidian and .trash are skipped.
+folders = ["D:\\Obsidian\\Knowledgebase"]
+# Keep at most this many names from the notes, the most used ones first (0..500).
+max_terms = 300
+# Look for changed notes at most this often (minutes). Only changed notes are read again.
+refresh_minutes = 10
+
+# Settings for one program, by its .exe name (capitals don't matter). Each may change any of:
+#   method, add_trailing_space, type_while_speaking, press_enter (see [output]) and commands (true/false).
+# Settings you leave out follow [output] and [commands]. To find a program's name: Task Manager ->
+# Details. Remove the # in front of the lines to use them, for example:
+# [apps."windowsterminal.exe"]
+# commands = false
+# [apps."idea64.exe"]
+# add_trailing_space = false

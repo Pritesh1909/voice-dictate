@@ -118,3 +118,29 @@ def trim_working_set() -> None:
         ctypes.windll.psapi.EmptyWorkingSet(ctypes.c_void_p(-1))
     except OSError:
         pass
+
+
+# --- foreground window ----------------------------------------------------------------------------
+
+_user32 = ctypes.WinDLL("user32", use_last_error=True)
+_user32.GetForegroundWindow.restype = wt.HWND
+_user32.GetWindowTextLengthW.argtypes = [wt.HWND]
+_user32.GetWindowTextW.argtypes = [wt.HWND, wt.LPWSTR, ctypes.c_int]
+
+
+def foreground_window() -> int:
+    """The window the user is typing into (0 = none). Kept at dictation start so "scratch that" only
+    sends Backspace if that same window is still in front."""
+    return _user32.GetForegroundWindow() or 0
+
+
+def window_title(hwnd: int) -> str:
+    """A window's title bar text ("McpAuthFilter.java - ss-core-service - IntelliJ IDEA"), "" if none."""
+    if not hwnd:
+        return ""
+    n = _user32.GetWindowTextLengthW(hwnd)
+    if n <= 0:
+        return ""
+    buf = ctypes.create_unicode_buffer(n + 1)
+    _user32.GetWindowTextW(hwnd, buf, n + 1)
+    return buf.value
