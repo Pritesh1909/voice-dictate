@@ -42,6 +42,7 @@ class EngineSpec:
     vad: str = ""                       # path of the voice-activity detector .gguf ("" = none)
     language: str = "auto"              # [model] language: "auto" or an ISO-639-1 code
     gpu_marker: str = ""                # path of gpu-failed.json ("" = don't remember GPU crashes)
+    prompt: str = ""                    # initial prompt (Whisper: the user's terms); "" = none (Parakeet takes none)
 
     @classmethod
     def for_model(cls, m, threads: int, **kw) -> "EngineSpec":
@@ -186,7 +187,8 @@ def _worker(conn, spec: EngineSpec) -> None:  # runs in the child process
         if msg[0] == "decode":
             t = time.perf_counter()
             try:
-                r = session.run(msg[1], vocabulary=vocab, language=language)
+                extra = {"prompt": spec.prompt} if spec.prompt else {}
+                r = session.run(msg[1], vocabulary=vocab, language=language, **extra)
                 conn.send(("text", r.text, time.perf_counter() - t))
             except Exception as e:
                 conn.send(("error", f"{type(e).__name__}: {e}"))
@@ -346,6 +348,11 @@ class Engine:
         if msg[0] != "text":
             raise EngineError(msg[1])
         return msg[1], msg[2]
+
+    @property
+    def device_type(self) -> str | None:
+        """"gpu", "igpu" or "cpu": the kind of device the model loaded on, once wait_ready() is True."""
+        return self.device[0] if self.device else None
 
     def wait_ready(self, timeout: float = LOAD_TIMEOUT) -> bool:
         """Wait for the model (started by warm()). False if it failed, timed out or was unloaded."""
