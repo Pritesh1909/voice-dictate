@@ -662,7 +662,10 @@ class App:
             self.overlay.close()
             self.overlay = self._new_overlay(c) if c.overlay else None
         if self.overlay:
+            moved = (self.overlay.position, self.overlay.margin) != (c.overlay_position, c.overlay_margin)
             self.overlay.position, self.overlay.margin = c.overlay_position, c.overlay_margin
+            if moved and self.state == "idle" and c.overlay_style == "button" and c.overlay_always:
+                self.overlay.hide()     # an always-on button re-places itself (shows Ready at the new spot)
         if c.model_dir != self.cfg_model_dir or c.model_folders != self.cfg_model_folders:
             keep = self.model if c.model_dir == self.cfg_model_dir else None   # only the folders changed
             self.cfg_model_dir, self.cfg_model_folders = c.model_dir, c.model_folders
@@ -1194,7 +1197,10 @@ class App:
             return
         if self.overlay is not None:
             self.overlay.forget_position()
-        self._notify("The pill is back at its usual place.")
+            if (self.state == "idle" and getattr(self.cfg, "overlay_style", "pill") == "button"
+                    and getattr(self.cfg, "overlay_always", False)):
+                self.overlay.hide()     # the always-on button moves back at once (shows Ready there)
+        self._notify("Back at its usual place.")
         self._refresh()
 
     # --- tray -------------------------------------------------------------------------------------

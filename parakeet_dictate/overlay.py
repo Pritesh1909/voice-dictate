@@ -15,6 +15,13 @@ Move mode (tray → "Move the pill…") is the one exception: for as long as it 
 mouse and the keyboard (WS_EX_TRANSPARENT and WS_EX_NOACTIVATE cleared) so it can be dragged, and
 Enter / a double-click saves, Esc cancels. Afterwards the exact original styles are put back and the
 window that was in front gets the focus again. The app never starts a dictation while it lasts.
+
+style="button" shows a round 56 px mic button instead ("Button states" design, ButtonPainter): Ready
+(idle), Listening (red halo and pulse ring that follow the voice), Typing (blue halo, hopping dots),
+Processing (blue arc turning round it), Done (light circle with a check). It takes clicks whenever the
+mouse is on the circle (the same hover-only trick as the pill's stop button, never the focus) and calls
+on_click(); with always_visible it shows Ready instead of hiding. Ready and the results are still
+pictures: only the cursor is polled (cheaply) for the hover look, nothing is redrawn until it changes.
 """
 from __future__ import annotations
 
@@ -48,6 +55,8 @@ user32.GetParent.argtypes = [wt.HWND]
 user32.GetForegroundWindow.restype = wt.HWND
 user32.SetForegroundWindow.argtypes = [wt.HWND]
 user32.IsWindow.argtypes = [wt.HWND]
+user32.LockSetForegroundWindow.argtypes = [wt.UINT]
+LSFW_LOCK, LSFW_UNLOCK = 1, 2
 user32.GetDC.restype = wt.HANDLE
 user32.GetDC.argtypes = [wt.HWND]
 user32.ReleaseDC.argtypes = [wt.HWND, wt.HANDLE]
@@ -107,6 +116,21 @@ INTER_RANGES = ((0x0000, 0x00FF), (0x0131, 0x0131), (0x0152, 0x0153), (0x02BB, 0
                 (0x2000, 0x206F), (0x20AC, 0x20AC), (0x2122, 0x2122), (0x2191, 0x2191), (0x2193, 0x2193),
                 (0x2212, 0x2212), (0x2215, 0x2215), (0xFEFF, 0xFEFF), (0xFFFD, 0xFFFD))
 
+POSITIONS = ("top", "bottom", "top-left", "top-right", "bottom-left", "bottom-right")
+CORNER_MARGIN = 24                          # default distance from both edges in a corner
+
+# --- the round button ("Button states" design; CSS px at 100 %) ---------------------------------------
+BTN_D = 56                                  # the circle
+BTN_PAD = 52                                # room around it for the halo, the pulse ring and the shadow
+BTN_CORE = "#17181c"
+BTN_HOVER = .07                             # white over the dark core while the mouse is on it
+WORK = "#7aa2ff"                            # Typing halo, Processing spinner, Done pulse
+INK = "#16171b"                             # the glyph on a filled (Done / Cancelled / error) core
+BTN_SHADOWS = ((10, 24, .28), (2, 6, .20))  # box-shadow: y offset, blur, opacity
+SPIN_PERIOD, SPIN_ARC = 1.1, 48 / (2 * math.pi * 27) * 360     # 1.1 s a turn; dasharray 48 of r 27
+HOP_PERIOD, HOP_DELAY, DOT_D, DOT_STEP = 1.0, .15, 5, 9         # Typing dots: 5 px, gap 4
+TYPING_LVL = .22                            # the Typing halo's least size (the design's value)
+
 
 class MONITORINFO(ctypes.Structure):
     _fields_ = [("cbSize", wt.DWORD), ("rcMonitor", wt.RECT), ("rcWork", wt.RECT), ("dwFlags", wt.DWORD)]
@@ -147,6 +171,23 @@ def pill_y(top: int, bottom: int, height: int, position: str, margin: int, scale
     if position == "top":
         return top + int((24 if margin < 0 else margin) * scale)
     return bottom - height - int((56 if margin < 0 else margin) * scale)
+
+
+def preset_xy(work: tuple[int, int, int, int], w: int, h: int, position: str, margin: int,
+              scale: float) -> tuple[int, int]:
+    """Screen position of a w×h pill or button in the work area (left, top, right, bottom) for an
+    [overlay] position: "top" / "bottom" are centred, `margin` px (at 100 %) from that edge (defaults
+    24 / 56, see pill_y); the corners ("top-left", "bottom-right", ...) are `margin` px from both edges
+    (default 24). Unknown positions mean "bottom". Always fully inside the work area."""
+    left, top, right, bottom = work
+    vert, _, horiz = (position if position in POSITIONS else "bottom").partition("-")
+    if horiz:
+        m = int((CORNER_MARGIN if margin < 0 else margin) * scale)
+        x = left + m if horiz == "left" else right - w - m
+        y = top + m if vert == "top" else bottom - h - m
+    else:
+        x, y = (left + right - w) // 2, pill_y(top, bottom, h, vert, margin, scale)
+    return pillpos.clamp(x, y, w, h, work)
 
 
 def fit_tail(text: str, max_chars: int) -> str:
@@ -227,6 +268,89 @@ def clock(secs: float) -> str:
     return f"{s // 60}:{s % 60:02d}"
 
 
+# --- the round button's look (pure, tested) ------------------------------------------------------------
+
+def button_state(mode: str, writing: bool = False, color: str = GREEN) -> str:
+    """Which of the button's looks an overlay mode shows: ready, listening, typing, processing, done,
+    muted (Cancelled, nothing heard), error, alert (other flash colours) or move."""
+    if mode == "listening":
+        return "typing" if writing else "listening"
+    if mode == "working":
+        return "processing"
+    if mode == "flash":
+        return {GREEN: "done", MUTED: "muted", RED: "error"}.get(str(color).lower(), "alert")
+    return mode if mode in ("ready", "move") else "ready"
+
+
+def flash_core(state: str) -> tuple[str, str]:
+    """(core fill, glyph) of a flash state: the design's Done is a light core with a dark check; the
+    other results follow it with the pill's flash colours (grey dash, red cross, amber "!")."""
+    return {"done": (FG, "check"), "muted": (MUTED, "dash"), "error": (RED, "cross")}.get(state, (AMBER, "bang"))
+
+
+def halo_look(level: float) -> tuple[float, float, float]:
+    """(scale, opacity, blur px) of the soft halo behind the button at mic level 0..1 (the design's
+    1 + lvl·.75, .12 + lvl·.4, 2 + lvl·6 px)."""
+    v = min(1.0, max(0.0, level))
+    return 1 + .75 * v, .12 + .4 * v, 2 + 6 * v
+
+
+def pulse_period(level: float) -> float:
+    """Seconds per pulse ring: 1.8 when quiet, down to .9 at full level."""
+    return 1.8 - .9 * min(1.0, max(0.0, level))
+
+
+def pulse_look(phase: float, level: float) -> tuple[float, float]:
+    """(scale, opacity) of the pulse ring at `phase` (0..1 through one ring): it grows from the
+    button's edge to 1.5 + lvl·.6 and fades from .7 to 0, ease-out."""
+    p = min(1.0, max(0.0, phase))
+    e = 1 - (1 - p) ** 2
+    return 1 + (.5 + .6 * min(1.0, max(0.0, level))) * e, .7 * (1 - e)
+
+
+def core_scale(level: float) -> float:
+    """The button grows a little with the voice: 1 + lvl·.06."""
+    return 1 + .06 * min(1.0, max(0.0, level))
+
+
+def smooth_level(prev: float, level: float) -> float:
+    """The halo's level: follows the meter up quickly and down slowly, so it breathes instead of flickering."""
+    v = min(1.0, max(0.0, level))
+    return prev + (v - prev) * (.6 if v > prev else .2)
+
+
+def _ease_in_out(x: float) -> float:
+    return x * x * (3 - 2 * x)
+
+
+def hop(t: float, i: int) -> tuple[float, float]:
+    """(lift px, opacity) of Typing dot i (0..2) at time t: each hops 4 px and brightens .5 → 1 at
+    40 % of a 1 s cycle, the next one .15 s later."""
+    p = ((t - i * HOP_DELAY) % HOP_PERIOD) / HOP_PERIOD
+    f = _ease_in_out(p / .4) if p < .4 else 1 - _ease_in_out((p - .4) / .6)
+    return 4 * f, .5 + .5 * f
+
+
+def spinner_angle(t: float) -> float:
+    """Where the Processing arc starts (degrees clockwise from 3 o'clock): a turn every 1.1 s."""
+    return (t % SPIN_PERIOD) / SPIN_PERIOD * 360
+
+
+def button_animates(state: str, since: float) -> bool:
+    """Does the button need a frame every 70 ms? Ready / the flash results are still pictures (redrawn
+    only when the hover look changes), except Done's one pulse ring while it runs."""
+    return state in ("listening", "typing", "processing") or (state == "done" and since < pulse_period(0))
+
+
+def button_hit(x: float, y: float, win_left: float, win_top: float, pad: tuple, d: float,
+               slack: float = 2) -> bool:
+    """Is screen point (x, y) on the round button? The window starts at (win_left, win_top), the
+    button (d screen px across) sits `pad` px inside it."""
+    cx, cy = win_left + pad[0] + d / 2, win_top + pad[1] + d / 2
+    r = d / 2 + slack
+    return (x - cx) ** 2 + (y - cy) ** 2 <= r * r
+
+
 @dataclass(frozen=True)
 class Layout:
     """Where things go on the Listening pill, in px at 100 % from the pill's left edge (x centres for
@@ -288,42 +412,16 @@ def _over(color: str, white: float) -> tuple[int, int, int]:
     return tuple(round(v + (255 - v) * white) for v in _rgb(color))
 
 
-class Painter:
-    """Draws the pill as RGBA images at display scale `s`. Needs no window, so tests can draw with it.
-
-    The window is the pill plus room for its shadow (`size`). The frame methods (listening, working,
-    flash, move) return only the band of rows the pill covers (window width x pill height, `band`),
-    on top of `shell`: the window-sized picture of the current pill shape with its shadow, which
-    changes only when the shape does. full() puts a band on its shell. Everything that doesn't move
-    is drawn once and kept (shells, text, bars at each height, ring steps), so a frame is a copy of
-    the band and a few small pastes."""
+class _Sprites:
+    """Cached anti-aliased pieces (text, circles, shapes) drawn with Pillow at display scale `s`; shared by
+    the pill's and the round button's painters."""
 
     SS = 4                  # supersampling for anti-aliased shapes
 
-    def __init__(self, s: float, wide: bool):
-        self.s, self.wide = s, wide
+    def __init__(self, s: float):
+        self.s = s
         self._fonts: dict = {}
         self._cache: dict = {}
-        self._shells: dict = {}
-        label_w = max(self._font(600, 14).getlength(t) for t in LABELS) / s
-        self.layout = listening_layout(math.ceil(label_w), wide)
-        self.w, self.h = round(self.layout.width * s), round(PILL_H * s)
-        self.pad = tuple(round(p * s) for p in SHADOW_PAD)
-        self.size = (self.w + self.pad[0] + self.pad[2], self.h + self.pad[1] + self.pad[3])
-        self.band = (self.pad[1], self.pad[1] + self.h)    # the rows the pill covers in the window
-        self.cy = self.h / 2                                # its middle, in the band
-        self.shell: Image.Image | None = None               # the last frame's pill shape and shadow
-
-    def full(self, band):
-        """The whole window's picture: `band` (from the last frame method) on its shell."""
-        img = self.shell.copy()
-        img.paste(band, (0, self.band[0]))
-        return img
-
-    def _start(self, bw: int, stop: bool):
-        """A new frame's band for a pill `bw` px wide (stop button or not)."""
-        self.shell = self._shell(bw, stop)
-        return self.shell.crop((0, self.band[0], self.size[0], self.band[1]))
 
     # --- pieces ---
 
@@ -418,6 +516,58 @@ class Painter:
         img, dx, dy = self._text(text, weight, css_px, color, anchor)
         frame.alpha_composite(img, (max(0, round(x + dx)), max(0, round(y + dy))))
         return img.width
+
+    def _move_mark(self):
+        s, d = self.s, ICON_D * self.s
+        rgba = _rgb(AMBER) + (255,)
+
+        def draw(dr, k, W, H):
+            c, u, lw = W * k / 2, s * k, max(1, round(1.6 * s * k))
+            a = 7.5 * u
+            dr.line([(c - a + u, c), (c + a - u, c)], fill=rgba, width=lw)
+            dr.line([(c, c - a + u), (c, c + a - u)], fill=rgba, width=lw)
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                tip = (c + dx * a, c + dy * a)
+                px, py = -dy, dx
+                back = (c + dx * (a - 3.2 * u), c + dy * (a - 3.2 * u))
+                dr.polygon([tip, (back[0] + px * 2.8 * u, back[1] + py * 2.8 * u),
+                            (back[0] - px * 2.8 * u, back[1] - py * 2.8 * u)], fill=rgba)
+        return self._shape(("move",), d + 2, d + 2, draw)
+
+
+class Painter(_Sprites):
+    """Draws the pill as RGBA images at display scale `s`. Needs no window, so tests can draw with it.
+
+    The window is the pill plus room for its shadow (`size`). The frame methods (listening, working,
+    flash, move) return only the band of rows the pill covers (window width x pill height, `band`),
+    on top of `shell`: the window-sized picture of the current pill shape with its shadow, which
+    changes only when the shape does. full() puts a band on its shell. Everything that doesn't move
+    is drawn once and kept (shells, text, bars at each height, ring steps), so a frame is a copy of
+    the band and a few small pastes."""
+
+    def __init__(self, s: float, wide: bool):
+        super().__init__(s)
+        self.wide = wide
+        self._shells: dict = {}
+        label_w = max(self._font(600, 14).getlength(t) for t in LABELS) / s
+        self.layout = listening_layout(math.ceil(label_w), wide)
+        self.w, self.h = round(self.layout.width * s), round(PILL_H * s)
+        self.pad = tuple(round(p * s) for p in SHADOW_PAD)
+        self.size = (self.w + self.pad[0] + self.pad[2], self.h + self.pad[1] + self.pad[3])
+        self.band = (self.pad[1], self.pad[1] + self.h)    # the rows the pill covers in the window
+        self.cy = self.h / 2                                # its middle, in the band
+        self.shell: Image.Image | None = None               # the last frame's pill shape and shadow
+
+    def full(self, band):
+        """The whole window's picture: `band` (from the last frame method) on its shell."""
+        img = self.shell.copy()
+        img.paste(band, (0, self.band[0]))
+        return img
+
+    def _start(self, bw: int, stop: bool):
+        """A new frame's band for a pill `bw` px wide (stop button or not)."""
+        self.shell = self._shell(bw, stop)
+        return self.shell.crop((0, self.band[0], self.size[0], self.band[1]))
 
     def _shell(self, bw: int, stop: bool):
         """The pill body `bw` px wide (centred), border, top highlight and drop shadow, on a clear
@@ -589,22 +739,249 @@ class Painter:
         self._put_text(frame, hint, 500, 13, FG, x0 + text_x * s, cy)
         return frame
 
-    def _move_mark(self):
-        s, d = self.s, ICON_D * self.s
-        rgba = _rgb(AMBER) + (255,)
 
-        def draw(dr, k, W, H):
-            c, u, lw = W * k / 2, s * k, max(1, round(1.6 * s * k))
-            a = 7.5 * u
-            dr.line([(c - a + u, c), (c + a - u, c)], fill=rgba, width=lw)
-            dr.line([(c, c - a + u), (c, c + a - u)], fill=rgba, width=lw)
-            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-                tip = (c + dx * a, c + dy * a)
-                px, py = -dy, dx
-                back = (c + dx * (a - 3.2 * u), c + dy * (a - 3.2 * u))
-                dr.polygon([tip, (back[0] + px * 2.8 * u, back[1] + py * 2.8 * u),
-                            (back[0] - px * 2.8 * u, back[1] - py * 2.8 * u)], fill=rgba)
-        return self._shape(("move",), d + 2, d + 2, draw)
+class ButtonPainter(_Sprites):
+    """Draws the round button ("Button states" design) as window-sized RGBA images at display scale `s`;
+    needs no window, so tests can draw with it.
+
+    It has the Painter's interface for the Overlay: `w` x `h` is the button itself (what is placed and
+    saved), `size` the window (the button plus BTN_PAD on every side for the halo, the pulse ring and
+    the drop shadow), `pad`, and `band` / `shell` / full(), here simply the whole window. The layers
+    are cached per quantised level (halo, ring, core with its shadow, glyphs, spinner steps), so a
+    frame is a few alpha composites."""
+
+    def __init__(self, s: float):
+        super().__init__(s)
+        self.w = self.h = round(BTN_D * s)
+        p = round(BTN_PAD * s)
+        self.pad = (p, p, p, p)
+        self.size = (self.w + 2 * p, self.h + 2 * p)
+        self.band = (0, self.size[1])
+        self.shell = self.size              # never changes: every frame is the whole window
+        self.c = p + self.w / 2             # the button's centre in the window (both ways)
+        self._phase, self._last_t = 0.0, None
+
+    def full(self, band):
+        return band
+
+    # --- layers ---
+
+    def _blank(self):
+        return Image.new("RGBA", self.size, (0, 0, 0, 0))
+
+    def _region(self, key, half: float, draw):
+        """(sprite, offset): the square of half-size `half` px around the centre, drawn supersampled by
+        draw(dr, k, X), X(v) being window coordinate v in the supersampled sprite (same both ways)."""
+        def make():
+            k = self.SS
+            o = math.floor(self.c - half)
+            n = math.ceil(self.c + half) - o
+            big = Image.new("RGBA", (n * k, n * k), (0, 0, 0, 0))
+            draw(ImageDraw.Draw(big), k, lambda v: (v - o) * k)
+            return big.reduce(k), o
+        return self._cached(("btn",) + key, make)
+
+    @staticmethod
+    def _put(frame, sprite) -> None:
+        img, o = sprite
+        frame.alpha_composite(img, (o, o))
+
+    def _core(self, scale: float, fill: str, hover: bool):
+        """The circle (1 px light border) with its drop shadow, window-sized; CSS transform: scale()
+        grows the shadow with it."""
+        q = round(scale * 200) / 200
+
+        def make():
+            s, W = self.s, self.size
+            base = _over(fill, BTN_HOVER) if hover else _rgb(fill)
+            edge = tuple(round(v + (255 - v) * .1) for v in base)
+            r = BTN_D * s * q / 2
+            b = max(1.0, s) * q
+
+            def draw(dr, k, X):
+                c, R = X(self.c), r * k
+                dr.ellipse((c - R, c - R, c + R - 1, c + R - 1), fill=edge + (255,))
+                R -= b * k
+                dr.ellipse((c - R, c - R, c + R - 1, c + R - 1), fill=base + (255,))
+            body, o = self._region(("body", q, base), r + 2, draw)
+            mask = Image.new("L", W, 0)
+            mask.paste(body.getchannel("A"), (o, o))
+            alphas = []
+            for dy, blur, a in BTN_SHADOWS:
+                m = Image.new("L", W, 0)
+                m.paste(mask, (0, round(dy * s * q)))
+                m = m.filter(ImageFilter.GaussianBlur(blur * s * q / 2))
+                alphas.append(m.point(lambda v, a=a: round(v * a)))
+            img = Image.new("RGBA", W, SHADOW + (0,))
+            img.putalpha(ImageChops.multiply(ImageChops.screen(*alphas), ImageChops.invert(mask)))
+            img.alpha_composite(body, (o, o))
+            return img
+        return self._cached(("btn-core", q, fill, hover), make)
+
+    def _halo(self, color: str, level: float):
+        """The soft glow behind the button (window-sized)."""
+        lq = round(min(1.0, max(0.0, level)) * 24) / 24
+
+        def make():
+            sc, op, blur = halo_look(lq)
+            r = BTN_D * self.s * sc / 2
+            m = Image.new("L", self.size, 0)
+            ImageDraw.Draw(m).ellipse((self.c - r, self.c - r, self.c + r - 1, self.c + r - 1), fill=round(255 * op))
+            img = Image.new("RGBA", self.size, _rgb(color) + (0,))
+            img.putalpha(m.filter(ImageFilter.GaussianBlur(blur * self.s)))
+            return img
+        return self._cached(("btn-halo", color, lq), make)
+
+    def _ring(self, color: str, scale: float, opacity: float):
+        """The pulse ring: a 1.5 px circle line the size of the button, scaled (line and all)."""
+        sq, oq = round(scale * 40) / 40, round(opacity * 32) / 32
+        r, bw = BTN_D * self.s * sq / 2, 1.5 * self.s * sq
+        rgba = _rgb(color) + (round(255 * oq),)
+
+        def draw(dr, k, X):
+            c, R = X(self.c), r * k
+            dr.ellipse((c - R, c - R, c + R - 1, c + R - 1), outline=rgba, width=max(1, round(bw * k)))
+        return self._region(("ring", color, sq, oq), r + 2, draw)
+
+    def _spinner(self, angle: float):
+        """Processing: a 48-unit arc of the r 27 circle (stroke 2, round ends) starting at `angle`."""
+        aq = round(angle / 5) * 5 % 360
+        s = self.s
+        rc, sw = 27 * s, 2 * s
+        rgba = _rgb(WORK) + (255,)
+
+        def draw(dr, k, X):
+            c, R = X(self.c), (rc + sw / 2) * k
+            dr.arc((c - R, c - R, c + R - 1, c + R - 1), aq, aq + SPIN_ARC, fill=rgba, width=max(1, round(sw * k)))
+            cr = sw * k / 2
+            for a in (aq, aq + SPIN_ARC):
+                x, y = c + rc * k * math.cos(math.radians(a)), c + rc * k * math.sin(math.radians(a))
+                dr.ellipse((x - cr, y - cr, x + cr, y + cr), fill=rgba)
+        return self._region(("spin", aq), rc + sw + 2, draw)
+
+    def _glyph(self, kind: str, color: str, opacity: float = 1.0, scale: float = 1.0):
+        """The design's 22 px icons (24-unit box, round caps): mic (stroke 1.8), check (2.4); and in
+        the check's style the dash, cross and "!" of the other results."""
+        sq = round(scale * 50) / 50
+        u = 22 / 24 * self.s * sq
+        rgba = _rgb(color) + (round(255 * opacity),)
+
+        def draw(dr, k, X):
+            c = X(self.c)
+            P = lambda x, y: (c + (x - 12) * u * k, c + (y - 12) * u * k)       # noqa: E731
+
+            def dot(x, y, d):
+                cr = d * u * k / 2
+                dr.ellipse((x - cr, y - cr, x + cr, y + cr), fill=rgba)
+
+            def line(pts, sw):
+                pts = [P(*p) for p in pts]
+                dr.line(pts, fill=rgba, width=max(1, round(sw * u * k)), joint="curve")
+                for x, y in (pts[0], pts[-1]):
+                    dot(x, y, sw)
+
+            if kind == "mic":
+                sw, h = 1.8, .9
+                lw = max(1, round(sw * u * k))
+                dr.rounded_rectangle(P(9 - h, 3 - h) + P(15 + h, 14 + h), radius=(3 + h) * u * k, outline=rgba, width=lw)
+                dr.arc(P(5 - h, 4 - h) + P(19 + h, 18 + h), 0, 180, fill=rgba, width=lw)     # centre 12,11 r 7
+                for x in (5, 19):
+                    dot(*P(x, 11), sw)
+                line([(12, 18), (12, 21)], sw)
+            elif kind == "check":
+                line([(5, 12.5), (9.5, 17), (19, 7.5)], 2.4)
+            elif kind == "cross":
+                line([(7.5, 7.5), (16.5, 16.5)], 2.4)
+                line([(16.5, 7.5), (7.5, 16.5)], 2.4)
+            elif kind == "dash":
+                line([(7, 12), (17, 12)], 2.4)
+            else:
+                line([(12, 6.5), (12, 13)], 2.4)
+                dot(*P(12, 17.5), 3)
+        return self._region(("glyph", kind, color, round(opacity * 32), sq), 14 * self.s * sq, draw)
+
+    def _dots(self, frame, t: float, scale: float) -> None:
+        s = self.s
+        for i in range(3):
+            lift, op = hop(t, i)
+            self._paste(frame, self._circle(DOT_D * s * scale, FG, round(op * 16) / 16),
+                        self.c + (i - 1) * DOT_STEP * s * scale, self.c - lift * s)
+
+    def _advance(self, t: float, level: float) -> float:
+        """The pulse ring's phase: moved on by the time since the last frame at the current level's
+        speed (so a changing level never makes the ring jump)."""
+        last, self._last_t = self._last_t, t
+        if last is not None:
+            self._phase = (self._phase + min(.25, max(0.0, t - last)) / pulse_period(level)) % 1.0
+        return self._phase
+
+    # --- frames ---
+
+    def ready(self, hover: bool = False):
+        """Idle: the dark circle with the mic (a lighter circle while the mouse is on it)."""
+        frame = self._blank()
+        frame.alpha_composite(self._core(1.0, BTN_CORE, hover))
+        self._put(frame, self._glyph("mic", FG))
+        return frame
+
+    def listening(self, t: float, level: float, clipping: bool = False, writing: bool = False,
+                  hover: bool = False):
+        """Listening: a red halo and pulse ring that grow and speed up with the voice (amber while the
+        input clips); Typing (writing): a blue halo and three hopping dots instead of the mic."""
+        color = WORK if writing else (AMBER if clipping else RED)
+        lvl = max(level, TYPING_LVL) if writing else min(1.0, max(0.0, level))
+        frame = self._blank()
+        frame.alpha_composite(self._halo(color, lvl))
+        phase = self._advance(t, lvl)
+        if not writing:
+            sc, op = pulse_look(phase, lvl)
+            if op > .01:
+                self._put(frame, self._ring(color, sc, op))
+        cs = core_scale(lvl)
+        frame.alpha_composite(self._core(cs, BTN_CORE, hover))
+        if writing:
+            self._dots(frame, t, cs)
+        else:
+            self._put(frame, self._glyph("mic", FG, 1.0, cs))
+        return frame
+
+    def working(self, t: float, hover: bool = False):
+        """Processing: the mic dimmed to .45 and a blue arc turning round the edge."""
+        frame = self._blank()
+        frame.alpha_composite(self._core(1.0, BTN_CORE, hover))
+        self._put(frame, self._glyph("mic", FG, .45))
+        self._put(frame, self._spinner(spinner_angle(t)))
+        return frame
+
+    def flash(self, color: str, since: float = 1e9, hover: bool = False):
+        """A result, `since` seconds after it showed: Done (light circle, dark check, one blue pulse
+        ring), or the other flash colours' circle and glyph."""
+        state = button_state("flash", color=color)
+        fill, glyph = flash_core(state)
+        frame = self._blank()
+        if state == "done" and since < pulse_period(0):
+            sc, op = pulse_look(since / pulse_period(0), 0)
+            if op > .01:
+                self._put(frame, self._ring(WORK, sc, op))
+        frame.alpha_composite(self._core(1.0, fill, False))
+        self._put(frame, self._glyph(glyph, INK))
+        return frame
+
+    def move(self):
+        """Move mode: the button with the amber move mark and a small hint label under it."""
+        s = self.s
+        frame = self._blank()
+        frame.alpha_composite(self._core(1.0, BTN_CORE, False))
+        self._paste(frame, self._move_mark(), self.c, self.c)
+        hint = fit_text(MOVE_HINTS, lambda t: self.measure(t, 500, 12), self.size[0] - 24 * s)
+        lw, lh = self.measure(hint, 500, 12) + 20 * s, 22 * s
+        cy = self.pad[1] + self.h + 8 * s + lh / 2
+        label = self._shape(("hint", round(lw), round(lh)), lw, lh, lambda dr, k, W, H: dr.rounded_rectangle(
+            (0, 0, lw * k - 1, lh * k - 1), radius=lh * k / 2, fill=_rgb(BODY) + (235,),
+            outline=_over(BODY, .1) + (255,), width=max(1, round(s * k))))
+        self._paste(frame, label, self.c, cy)
+        self._put_text(frame, hint, 500, 12, FG, self.c, cy, anchor="mm")
+        return frame
 
 
 class _Surface:
@@ -650,24 +1027,38 @@ class _Surface:
 
 class Overlay:
     on_stop = None              # the stop button's callback (see __init__)
-    _clickable = False          # the mouse is over the stop button, so the pill takes clicks
+    on_click = None             # the round button's callback (see __init__)
+    style = "pill"
+    always_visible = False
+    _clickable = False          # the mouse is over the stop button (the round button), so it takes clicks
+    _near = False               # button: the mouse is close, so the hover check runs more often
     _pad = (0, 0, 0, 0)         # shadow room around the pill in the window: left, top, right, bottom
     _surface: _Surface | None = None
-    _painter: Painter | None = None
+    _painter: Painter | ButtonPainter | None = None
     _alpha = 0
     _shown_shell = None         # the Painter shell the window's picture was last fully drawn with
+    _placed_for = None          # button: (position, margin, saved position) it was last placed for
+    _shown_at = 0.0
+    _lvl = 0.0                  # button: the smoothed mic level the halo follows
 
     def __init__(self, position: str = "bottom", wide: bool = False, pos_file: Path | None = None,
-                 on_stop=None):
+                 on_stop=None, *, style: str = "pill", always_visible: bool = False, on_click=None):
         # on_stop(): the stop button was clicked while listening (called in a thread of its own).
         # The pill is click-through everywhere except over the stop button, and only while the mouse
         # is on it (checked every frame); it never takes focus, so the text cursor stays where it was.
+        # style "button": the round button instead of the pill (wide and the live words are ignored).
+        # on_click(): the button was clicked, in any state (in a thread of its own; the app decides what
+        # it means). always_visible: the button shows Ready wherever it would otherwise hide.
         self.on_stop = on_stop
+        self.style = "button" if style == "button" else "pill"
+        self.always_visible = bool(always_visible)
+        self.on_click = on_click
         self._clickable = False
         self.position = position
         self.wide = wide            # live streaming: room for the words heard but not typed yet
-        self.margin = -1            # pixels from the screen edge (at 100% scaling); -1 = 24 at the top, 56 at the bottom
-        self.pos_file = pos_file    # pill_position.json (None = never moved by the user)
+        self.margin = -1            # pixels from the screen edge(s) (at 100% scaling); -1 = 24 at the top, 56 at the
+        #                             bottom, 24 from both edges in a corner (see preset_xy)
+        self.pos_file = pos_file    # pill_position.json / button_position.json (None = never moved by the user)
         self._saved: pillpos.SavedPosition | None = None
         self._saved_loaded = False
         self._on_move_end = None    # move mode: called (in its own thread) with True when saved
@@ -706,6 +1097,8 @@ class Overlay:
         self._call(self._show, "flash", text=text, color=color, ms=ms)
 
     def hide(self) -> None:
+        """Hide the pill; an always-visible button shows Ready instead (and moves to its place again when
+        position, margin or the saved spot changed: call this after changing them while idle)."""
         self._call(self._hide)
 
     def close(self) -> None:
@@ -747,7 +1140,7 @@ class Overlay:
     def _run(self) -> None:
         s = _dpi_scale()
         self.s = s
-        painter = Painter(s, self.wide)
+        painter = ButtonPainter(s) if self.style == "button" else Painter(s, self.wide)
         self.w, self.h = painter.w, painter.h       # the pill itself: what is placed and saved
         self._pad = painter.pad
         W, H = painter.size                         # the window: the pill plus room for its shadow
@@ -762,7 +1155,7 @@ class Overlay:
         self.canvas.bind("<ButtonPress-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
-        self.canvas.bind("<Double-Button-1>", lambda e: self._end_move(True))
+        self.canvas.bind("<Double-Button-1>", self._on_double)
         for key in ("<Return>", "<KP_Enter>"):
             root.bind(key, lambda e: self._end_move(True))
         root.bind("<Escape>", lambda e: self._end_move(False))
@@ -778,8 +1171,25 @@ class Overlay:
         except Exception:
             log.exception("pill window picture")
             self._surface = None
-        root.deiconify()                     # shown once, invisible and off-screen; never re-activated
+        # Tk's deiconify also activates the window ("raised and given the focus") when this process may
+        # take the foreground (just after start), WS_EX_NOACTIVATE or not. Lock foreground changes for
+        # that moment (only works while this process is in front, the one case it matters) and hand the
+        # focus back if it got through anyway.
+        prev_fg = user32.GetForegroundWindow()
+        locked = user32.LockSetForegroundWindow(LSFW_LOCK)
+        try:
+            root.deiconify()                 # shown once, invisible and off-screen; never re-activated
+            root.update()
+        except tk.TclError:
+            pass
+        finally:
+            if locked:
+                user32.LockSetForegroundWindow(LSFW_UNLOCK)
+        if user32.GetForegroundWindow() == self.hwnd and prev_fg and prev_fg != self.hwnd and user32.IsWindow(prev_fg):
+            user32.SetForegroundWindow(prev_fg)
         self._root = root
+        if self._keep_shown():
+            root.after(0, self._hide)        # an always-visible button: Ready from the start
         self._ready.set()
         try:
             root.mainloop()
@@ -799,7 +1209,15 @@ class Overlay:
         user32.SetWindowPos(self.hwnd, HWND_TOPMOST, x - self._pad[0], y - self._pad[1], 0, 0,
                             flags | SWP_NOSIZE | SWP_NOACTIVATE)
 
+    def _place_key(self):
+        try:
+            saved = self._saved_position()
+        except Exception:
+            saved = None
+        return self.position, self.margin, saved
+
     def _place(self) -> None:
+        self._placed_for = self._place_key()
         try:
             saved = self._saved_position()
             xy = pillpos.placement(saved, pillpos.monitors(), self.w, self.h) if saved else None
@@ -814,9 +1232,12 @@ class Overlay:
         mi.cbSize = ctypes.sizeof(mi)
         user32.GetMonitorInfoW(mon, ctypes.byref(mi))
         wa = mi.rcWork
-        x = (wa.left + wa.right - self.w) // 2
-        y = pill_y(wa.top, wa.bottom, self.h, self.position, self.margin, self.s)
+        x, y = preset_xy((wa.left, wa.top, wa.right, wa.bottom), self.w, self.h, self.position, self.margin, self.s)
         self._put_window(x, y, SWP_SHOWWINDOW)
+
+    def _keep_shown(self) -> bool:
+        """An always-visible button: Ready instead of hidden."""
+        return self.style == "button" and self.always_visible
 
     def _set_alpha(self, alpha: int) -> None:
         self._alpha = alpha
@@ -829,12 +1250,16 @@ class Overlay:
         if self._hide_job:
             self._root.after_cancel(self._hide_job)
             self._hide_job = None
-        if self._mode == "hidden":
+        if self._mode == "hidden" or (mode == "ready" and self._place_key() != self._placed_for):
             self._place()
-        if mode != "listening":
+        button = self.style == "button"
+        if mode != "listening" and not button:
             self._set_clickable(False)       # click-through everywhere again once listening ends
+        if mode == "listening" and self._mode != "listening":
+            self._lvl = 0.0
         self._mode = mode
         self._kw = kw
+        self._shown_at = time.monotonic()
         if mode == "listening":
             self._level_fn, self._started, self._writing_fn = kw["level_fn"], kw["started"], kw["writing_fn"]
             self._clipping_fn, self._preview_fn = kw["clipping_fn"], kw["preview_fn"]
@@ -842,11 +1267,18 @@ class Overlay:
         self._draw()                         # the new picture and the opacity in one step
         if mode == "flash":
             self._hide_job = self._root.after(kw["ms"], self._hide)
-        elif self._anim_job is None:
+        if button:                           # every state: the hover check (and the animation, if any)
+            if self._anim_job is not None:
+                self._root.after_cancel(self._anim_job)
+            self._anim_job = self._root.after(0, self._animate)
+        elif mode != "flash" and self._anim_job is None:
             self._animate()
 
     def _hide(self, force: bool = False) -> None:
         if self._mode == "move" and not force:
+            return
+        if self._keep_shown() and self._mode not in ("move", "hidden"):
+            self._show("ready")              # never hidden: straight to Ready, where it is
             return
         self._set_clickable(False)
         self._mode = "hidden"
@@ -856,6 +1288,8 @@ class Overlay:
             self._anim_job = None
         self._set_alpha(0)
         user32.SetWindowPos(self.hwnd, HWND_TOPMOST, -4000, -4000, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE)
+        if self._keep_shown():               # after move mode (or at start): Ready at its (new) place
+            self._show("ready")
 
     # --- move mode (Tk thread) ------------------------------------------------------------------
 
@@ -950,7 +1384,40 @@ class Overlay:
         if on_stop is not None:
             threading.Thread(target=on_stop, daemon=True, name="pill-stop").start()
 
+    # --- the round button (Tk thread) -------------------------------------------------------------
+
+    def _over_button(self) -> bool:
+        """Is the mouse on the round button (while it shows and has a callback)? Also notes whether it
+        is near (then the hover check runs every 50 ms, else every 200 ms)."""
+        self._near = False
+        if self._mode in ("hidden", "move") or self.on_click is None:
+            return False
+        try:
+            cx, cy = pillpos.cursor_pos()
+            left, top, _, _ = pillpos.window_rect(self.hwnd)
+        except Exception:
+            return False
+        self._near = button_hit(cx, cy, left, top, self._pad, self.w, slack=3 * self.w)
+        return button_hit(cx, cy, left, top, self._pad, self.w, slack=2 * self.s)
+
+    def _button_clicked(self) -> None:
+        on_click = self.on_click
+        if on_click is not None:
+            threading.Thread(target=on_click, daemon=True, name="button-click").start()
+
+    def _on_double(self, _event=None) -> None:
+        # Tk sends a quick second click as <Double-Button-1> instead of <ButtonPress-1>: in move mode it
+        # saves; on the round button it is just another click (start, then stop right away).
+        if self._mode == "move":
+            self._end_move(True)
+        elif self.style == "button":
+            self._on_press()
+
     def _on_press(self, _event=None) -> None:
+        if self.style == "button" and self._mode not in ("move", "hidden"):
+            if self._clickable and self._over_button():
+                self._button_clicked()
+            return
         if self._mode == "listening":
             if self._clickable and self._over_stop():
                 self._stop_clicked()
@@ -976,6 +1443,9 @@ class Overlay:
         self._grab = None
 
     def _animate(self) -> None:
+        if self.style == "button":
+            self._animate_button()
+            return
         if self._mode not in ("listening", "working"):
             self._anim_job = None
             return
@@ -984,10 +1454,51 @@ class Overlay:
         self._draw()
         self._anim_job = self._root.after(70, self._animate)
 
+    def _animate_button(self) -> None:
+        """The button's loop while it shows: the hover check every time (it takes clicks only while the
+        mouse is on it); a new frame every 70 ms only while something moves, else only when the hover
+        look changes."""
+        if self._mode in ("hidden", "move"):
+            self._anim_job = None
+            return
+        hover = self._over_button()
+        changed = hover != self._clickable
+        self._set_clickable(hover)
+        moving = button_animates(button_state(self._mode, False, self._kw.get("color", GREEN)),
+                                 time.monotonic() - self._shown_at)
+        if moving or changed:
+            self._draw()
+        self._anim_job = self._root.after(70 if moving else 50 if self._near else 200, self._animate)
+
     # --- drawing ----------------------------------------------------------------------------------
+
+    def _button_frame(self, now: float):
+        p, kw, hover = self._painter, self._kw, self._clickable
+        if self._mode == "listening":
+            try:
+                level, clipping = float(self._level_fn()), bool(self._clipping_fn())
+            except Exception:
+                level, clipping = 0.0, False
+            try:
+                writing = bool(self._writing_fn())
+            except Exception:
+                writing = False
+            self._lvl = smooth_level(self._lvl, level)
+            return p.listening(now, self._lvl, clipping, writing, hover)
+        if self._mode == "working":
+            return p.working(now, hover)
+        if self._mode == "flash":
+            return p.flash(kw.get("color", GREEN), now - self._shown_at, hover)
+        if self._mode == "ready":
+            return p.ready(hover)
+        if self._mode == "move":
+            return p.move()
+        return None
 
     def _frame(self, now: float):
         """This moment's picture of the pill (None when hidden)."""
+        if self.style == "button":
+            return self._button_frame(now)
         p, kw = self._painter, self._kw
         if self._mode == "listening":
             try:
