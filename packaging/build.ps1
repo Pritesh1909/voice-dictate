@@ -34,6 +34,7 @@ VSVersionInfo(
     --icon (Join-Path $build 'icon.ico') --version-file (Join-Path $build 'version.txt') `
     --add-data "$root\parakeet_dictate\config.default.toml;parakeet_dictate" `
     --collect-all transcribe_cpp --collect-all transcribe_cpp_native --collect-all _sounddevice_data `
+    --collect-all sv_ttk --collect-submodules tomlkit --hidden-import parakeet_dictate.settings_ui `
     --exclude-module pytest --exclude-module PyInstaller `
     --paths $root --distpath (Join-Path $build 'dist') --workpath (Join-Path $build 'work') --specpath $build `
     (Join-Path $root 'packaging\launcher.py')

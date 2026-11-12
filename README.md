@@ -54,6 +54,27 @@ clipboard instead and a notification says so; with typing while you talk, what w
 Ctrl+Q is taken over system-wide while the app runs, so other apps no longer receive it
 (for example "quit" in some apps, or XON in terminals).
 
+### Settings window
+
+Tray menu → **Settings…** (or double-click the tray icon) opens a Windows 11 style window (light or dark,
+following Windows) with a page per area: General (dictation shortcut, hold time, Esc, start with Windows,
+sounds), Microphone, Speech model (including **Custom model folders**: extra .gguf files or folders to find
+models in), Typing, Clean-up (fillers, dictionary, "heard as"), Pill, Commands and Context words.
+
+- **Change…** next to the shortcut listens for the next key combination: Ctrl/Alt/Shift/Win plus one key
+  (F-keys may be used alone). Esc cancels, Backspace goes back to Ctrl+Q. Combinations Windows keeps for
+  itself (Alt+Tab, Win+L, ...) or everyday ones (Ctrl+C, Ctrl+V, ...) are refused, and so is one another
+  program already holds ("in use by another app").
+- **Save** (enabled once something changed) writes only the settings you changed into `config.toml`;
+  every comment and every other line stays as it was. The result is checked first: if it isn't valid, the
+  problem is shown and nothing is written. The tray app picks the new settings up as soon as the window
+  closes and says "Settings saved."
+- Per-program settings (`[apps."program.exe"]`, `[dictionary.apps."program.exe"]`) and exact replacements
+  stay in the file: **Open settings file** opens it (also in the tray menu).
+
+The window is its own short-lived process (`ParakeetDictate.exe --settings`, or
+`python -m parakeet_dictate --settings` from source), like the correction window.
+
 ### Spoken commands
 
 A command only counts when the whole phrase (what you say between two pauses) is just the command, so

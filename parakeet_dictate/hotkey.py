@@ -18,6 +18,8 @@ _NAMED = {
     "pause": 0x13, "scrolllock": 0x91, "capslock": 0x14, "up": 0x26, "down": 0x28, "left": 0x25,
     "right": 0x27, "`": 0xC0, "backtick": 0xC0, ";": 0xBA, "=": 0xBB, ",": 0xBC, "-": 0xBD, ".": 0xBE,
     "/": 0xBF, "[": 0xDB, "\\": 0xDC, "]": 0xDD, "'": 0xDE,
+    "apps": 0x5D, "numlock": 0x90, "multiply": 0x6A, "add": 0x6B, "subtract": 0x6D, "decimal": 0x6E,
+    "divide": 0x6F, "oem102": 0xE2, **{f"num{i}": 0x60 + i for i in range(10)},
 }
 _ID_MAIN, _ID_ESC = 1, 2
 _MSG_ESC_ON, _MSG_ESC_OFF, _MSG_REREGISTER = WM_APP + 1, WM_APP + 2, WM_APP + 3
@@ -57,6 +59,88 @@ def parse(spec: str) -> tuple[int, int]:
     if mods == 0 and not (0x70 <= vk <= 0x87 or vk in (0x13, 0x91)):
         raise HotkeyError(f"'{spec}' needs a modifier (ctrl/alt/shift/win) unless it is F1-F24, Pause or ScrollLock")
     return mods, vk
+
+
+# --- naming keys for the Settings window's shortcut recorder ---------------------------------------
+
+MOD_ORDER = ("ctrl", "alt", "shift", "win")
+MODIFIER_VKS = frozenset({0x10, 0x11, 0x12, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5})
+_CANONICAL = {"escape": "esc", "backtick": "`", "control": "ctrl"}
+_VK_NAME = {vk: name for name, vk in _NAMED.items() if name not in _CANONICAL}
+_DISPLAY = {"pageup": "PageUp", "pagedown": "PageDown", "scrolllock": "ScrollLock", "capslock": "CapsLock",
+            "numlock": "NumLock", "apps": "Menu", "oem102": "<>", "multiply": "Num *", "add": "Num +",
+            "subtract": "Num -", "decimal": "Num .", "divide": "Num /", "esc": "Esc",
+            **{f"num{i}": f"Num {i}" for i in range(10)}}
+
+
+def vk_name(vk: int) -> str | None:
+    """The spec name of a virtual key ("space", "q", "f5"), or None for keys a hotkey can't use."""
+    if 0x41 <= vk <= 0x5A or 0x30 <= vk <= 0x39:
+        return chr(vk).lower()
+    if 0x70 <= vk <= 0x87:
+        return f"f{vk - 0x6F}"
+    return _VK_NAME.get(vk)
+
+
+def spec_for(mods, vk: int) -> str:
+    """Modifier names + a virtual key -> the [hotkey] keys spec, e.g. ({"alt", "ctrl"}, 0x20) -> "ctrl+alt+space"."""
+    name = vk_name(vk)
+    if name is None:
+        raise HotkeyError(f"that key (code {vk}) can't be used in a shortcut")
+    mods = {_CANONICAL.get(m, m) for m in mods}
+    return "+".join([m for m in MOD_ORDER if m in mods] + [name])
+
+
+def display(spec: str) -> str:
+    """"ctrl+alt+space" -> "Ctrl+Alt+Space" (the spec itself when it can't be read)."""
+    parts = [p.strip().lower() for p in spec.replace(" ", "").split("+") if p.strip()]
+    if not parts:
+        return spec
+    out = [_CANONICAL.get(p, p).capitalize() for p in parts[:-1]]
+    key = _CANONICAL.get(parts[-1], parts[-1])
+    out.append(_DISPLAY.get(key) or (key.upper() if len(key) == 1 or key[1:].isdigit() else key.capitalize()))
+    return "+".join(out)
+
+
+# Combinations Windows keeps for itself, or that would break everyday typing if taken over everywhere.
+RESERVED = {
+    "alt+tab": "switches windows", "alt+shift+tab": "switches windows", "alt+esc": "switches windows",
+    "alt+f4": "closes windows", "alt+space": "opens the window menu", "ctrl+esc": "opens Start",
+    "ctrl+shift+esc": "opens Task Manager", "ctrl+alt+delete": "is the security screen",
+    "f12": "is kept for debuggers", "win+l": "locks the PC", "win+d": "shows the desktop",
+    "win+e": "opens File Explorer", "win+r": "opens Run", "win+tab": "opens Task View",
+    "win+x": "opens the Start menu's context menu", "win+i": "opens Settings", "win+a": "opens Quick Settings",
+    "win+s": "opens Search", "win+v": "opens the clipboard history", "win+.": "opens the emoji panel",
+    "win+space": "switches the keyboard layout", "win+m": "minimises all windows", "win+p": "switches displays",
+    "win+h": "starts voice typing", "win+g": "opens the Game Bar", "win+k": "opens Cast",
+    "win+u": "opens Accessibility", "win+n": "opens notifications",
+    "ctrl+c": "copies", "ctrl+v": "pastes", "ctrl+x": "cuts", "ctrl+z": "undoes", "ctrl+y": "redoes",
+    "ctrl+a": "selects all", "ctrl+s": "saves",
+}
+
+
+def check_combo(spec: str) -> str | None:
+    """Why `spec` can't be the dictation shortcut, or None when it is fine (availability not checked)."""
+    try:
+        mods, vk = parse(spec)
+    except HotkeyError as e:
+        return str(e)
+    canon = spec_for({m for m, bit in MOD.items() if mods & bit}, vk)
+    if canon in RESERVED:
+        return f"{display(canon)} {RESERVED[canon]} in Windows. Pick another shortcut."
+    if mods == MOD["shift"] and not (0x70 <= vk <= 0x87 or vk in (0x13, 0x91)):
+        return f"{display(canon)} types a character. Add Ctrl, Alt or Win."
+    return None
+
+
+def available(spec: str) -> bool:
+    """True if no other program holds `spec` (tries to register it on this thread, then lets it go)."""
+    mods, vk = parse(spec)
+    probe = 0xBFFE
+    if not user32.RegisterHotKey(None, probe, mods | MOD_NOREPEAT, vk):
+        return False
+    user32.UnregisterHotKey(None, probe)
+    return True
 
 
 def key_down(vk: int) -> bool:
