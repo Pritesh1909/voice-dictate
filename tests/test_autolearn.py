@@ -498,3 +498,198 @@ def test_no_temp_files_left_behind(store):
     leftovers = [p.name for d in (store.learning_dir, store.learned_auto_file.parent)
                  for p in d.iterdir() if p.name.endswith(".tmp")]
     assert leftovers == []
+
+
+# --- state.json lost (an uninstall deletes it, learned_auto.toml stays) or damaged -------------------------
+
+def lose_state(store, how):
+    path = store.learning_dir / "state.json"
+    if how == "deleted":
+        path.unlink()
+    else:
+        path.write_bytes(b"\xff{half written")
+
+
+def pairs(fixes):
+    return [(f.term, f.heard_as) for f in fixes]
+
+
+def sight_again(store, entry, n=2):
+    for i in range(n):
+        store.note(f"rec-again-{i}", [prop(entry)], [], "again", "2026-11-20 09:00")
+
+
+@pytest.mark.parametrize("how", ["deleted", "damaged"])
+def test_lost_state_lists_the_fixes_the_toml_still_applies(store, how):
+    two_sightings(store)
+    two_sightings(store, KEYCLOAK)
+    before = store.active()
+    lose_state(store, how)
+    assert store.active() == before                       # what, when learned, how often seen, the example
+    assert second_store(store).active() == before          # the Settings window sees them too
+
+
+@pytest.mark.parametrize("how", ["deleted", "damaged"])
+def test_lost_state_undo_works_and_stays_undone(store, how):
+    two_sightings(store)
+    two_sightings(store, KEYCLOAK)
+    lose_state(store, how)
+    store.undo(MAILZZY)
+    assert pairs(store.active()) == [KEYCLOAK]
+    assert learn.load(store.learned_auto_file) == [KEYCLOAK]   # no longer applied
+    sight_again(store, MAILZZY)
+    assert pairs(store.active()) == [KEYCLOAK] and store.pending_count() == 0
+
+
+@pytest.mark.parametrize("how", ["deleted", "damaged"])
+def test_lost_state_after_an_undo_keeps_it_blocked(store, how):
+    two_sightings(store)
+    two_sightings(store, KEYCLOAK)
+    store.undo(MAILZZY)
+    lose_state(store, how)
+    assert pairs(store.active()) == [KEYCLOAK]
+    sight_again(store, MAILZZY)
+    assert pairs(store.active()) == [KEYCLOAK] and store.pending_count() == 0
+
+
+@pytest.mark.parametrize("how", ["deleted", "damaged"])
+def test_lost_state_after_undoing_every_fix_keeps_them_blocked(store, how):
+    two_sightings(store)
+    two_sightings(store, KEYCLOAK)
+    store.reset_all()
+    lose_state(store, how)
+    assert store.active() == []
+    sight_again(store, MAILZZY)
+    sight_again(store, KEYCLOAK)
+    assert store.active() == [] and store.pending_count() == 0
+
+
+def test_lost_state_reset_all_works(store):
+    two_sightings(store)
+    two_sightings(store, KEYCLOAK)
+    lose_state(store, "deleted")
+    store.reset_all()
+    assert store.active() == [] and learn.load(store.learned_auto_file) == []
+    sight_again(store, MAILZZY)
+    assert store.active() == []
+
+
+def test_lost_state_is_not_wiped_by_the_next_write(store):
+    two_sightings(store)
+    lose_state(store, "deleted")
+    store.note("rec-3", [prop(KEYCLOAK)], [], "k", "2026-11-13 09:00")   # one sighting of something else
+    assert pairs(store.active()) == [MAILZZY] and learn.load(store.learned_auto_file) == [("Mailzzy", ""), MAILZZY]
+    store.note("rec-4", [prop(MAILZZY)], [], "fourth", "2026-11-13 10:00")
+    [fix] = store.active()
+    assert (fix.seen, fix.first_learned, fix.example) == (3, "2026-11-12 10:00", "fourth")
+
+
+def test_lost_state_keeps_a_term_only_fix_next_to_a_heard_as_one(store):
+    two_sightings(store, ("Mailzzy", ""))                   # learned.toml's shape has no line of its own for it
+    two_sightings(store, MAILZZY)
+    before = store.active()
+    lose_state(store, "deleted")
+    assert store.active() == before
+
+
+def test_never_list_is_kept_in_learned_auto_toml_and_learn_load_ignores_it(store):
+    two_sightings(store)
+    store.undo(MAILZZY)
+    store.undo(("Postgres", ""))
+    d = tomllib.loads(store.learned_auto_file.read_text("utf-8"))
+    assert d["never"] == {"keys": [entry_key(MAILZZY), entry_key(("Postgres", ""))]}
+    assert learn.load(store.learned_auto_file) == []
+    two_sightings(store, KEYCLOAK)
+    assert learn.load(store.learned_auto_file) == [KEYCLOAK]
+    assert autolearn.load_active(store.learned_auto_file) == [KEYCLOAK]
+
+
+def test_damaged_toml_with_lost_state_starts_empty(store):
+    two_sightings(store)
+    lose_state(store, "deleted")
+    store.learned_auto_file.write_text("[dictionary\nhalf", "utf-8")
+    assert store.active() == []
+    assert two_sightings(store, KEYCLOAK)                   # and the next write replaces it
+    assert learn.load(store.learned_auto_file) == [KEYCLOAK]
+
+
+# --- learned_auto.toml out of date with state.json (its write failed after state.json's) --------------------
+
+@pytest.fixture
+def toml_write_fails(store, monkeypatch):
+    """Writing learned_auto.toml raises OSError while the returned list holds True."""
+    failing = [True]
+    real = autolearn._write
+
+    def write(path, text):
+        if failing[0] and path == store.learned_auto_file:
+            raise OSError("disk full")
+        real(path, text)
+
+    monkeypatch.setattr(autolearn, "_write", write)
+    return failing
+
+
+def test_sync_rewrites_a_toml_left_behind_by_a_failed_undo(store, toml_write_fails):
+    toml_write_fails[0] = False
+    two_sightings(store)
+    two_sightings(store, KEYCLOAK)
+    toml_write_fails[0] = True
+    with pytest.raises(OSError):
+        store.undo(MAILZZY)                                  # state.json written, the toml not
+    toml_write_fails[0] = False
+    assert pairs(store.active()) == [KEYCLOAK]
+    assert MAILZZY in learn.load(store.learned_auto_file)   # still applied by the tray...
+    store.sync()                                             # ...until the next check starts
+    assert learn.load(store.learned_auto_file) == [KEYCLOAK]
+    assert pairs(store.active()) == [KEYCLOAK]
+
+
+def test_a_failed_undo_of_the_last_fix_is_not_rebuilt_from_the_stale_toml(store, toml_write_fails):
+    toml_write_fails[0] = False
+    two_sightings(store)
+    toml_write_fails[0] = True
+    with pytest.raises(OSError):
+        store.undo(MAILZZY)
+    toml_write_fails[0] = False
+    assert store.active() == []                              # on the never-learn list in state.json
+    store.sync()
+    assert learn.load(store.learned_auto_file) == []
+    sight_again(store, MAILZZY)
+    assert store.active() == []
+
+
+def test_every_fix_write_resyncs_a_stale_toml(store, toml_write_fails):
+    toml_write_fails[0] = False
+    two_sightings(store)
+    two_sightings(store, KEYCLOAK)
+    toml_write_fails[0] = True
+    with pytest.raises(OSError):
+        store.undo(MAILZZY)
+    toml_write_fails[0] = False
+    store.note("rec-2", [prop(KEYCLOAK)], [], "k", "2026-11-13 09:00")   # counted already: changes nothing
+    assert learn.load(store.learned_auto_file) == [KEYCLOAK]
+
+
+def test_sync_leaves_an_up_to_date_toml_alone(store, monkeypatch):
+    two_sightings(store)
+    writes = []
+    real = autolearn._write
+    monkeypatch.setattr(autolearn, "_write", lambda path, text: (writes.append(path.name), real(path, text)))
+    store.sync()
+    store.note("rec-2", [prop(MAILZZY)], [], "x", "2026-11-13 09:00")    # counted already
+    assert writes == []
+
+
+def test_sync_saves_a_rebuilt_state(store):
+    two_sightings(store)
+    store.undo(("Postgres", ""))
+    lose_state(store, "deleted")
+    store.sync()
+    state = json.loads((store.learning_dir / "state.json").read_text("utf-8"))
+    assert list(state["active"]) == [entry_key(MAILZZY)] and state["never"] == [entry_key(("Postgres", ""))]
+
+
+def test_sync_without_any_files_writes_nothing(store):
+    store.sync()
+    assert not store.learned_auto_file.exists() and not (store.learning_dir / "state.json").exists()

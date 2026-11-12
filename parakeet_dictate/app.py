@@ -20,7 +20,7 @@ from . import autolearn, commands, context, correct, idle, learn, models, output
 from . import history as hist
 from .appsettings import settings_for
 from .audio import SR, Recorder, preprocess, resample, silence_stop_due, silence_stop_message
-from .checker import Checker
+from .checker import STATUS_NO_GPU, Checker
 from .engine import GPU_MARKER, Engine, EngineError, EngineSpec
 from .hotkey import HotkeyError, HotkeyThread, key_down
 from .hotkey import display as hotkey_display
@@ -340,7 +340,9 @@ class App:
     learned_auto: list[tuple[str, str]] = []   # learned_auto.toml (background learning); set by _check_learned
     checker: Checker | None = None           # the background checker, made at its first run
     learning_paused: str | None = None       # the checker's "error: ..." result: no more checks until a restart
-    PRUNE_EVERY_SECONDS = 24 * 3600         # how often old kept recordings are cleared out (tests shorten it)
+    _no_discrete_gpu = False                 # Whisper's set-up found no discrete graphics card: keep no recordings
+    PRUNE_EVERY_SECONDS = 3600              # how often old kept recordings are cleared out: hourly, so a laptop
+                                            # that sleeps at night still keeps none past keep_days (tests shorten it)
     IDLE_EVERY_SECONDS = 30                 # how often the background checker's conditions are looked at
 
     def __init__(self, paths: cfgmod.Paths):
@@ -377,7 +379,7 @@ class App:
         self.last_stats = ""
         self.failed: FailedRecording | None = None   # the last dictation that couldn't be transcribed
         self._lock = threading.Lock()
-        self._quitting = threading.Event()   # set when the user quits: ends the daily clear-out of recordings
+        self._quitting = threading.Event()   # set when the user quits: ends the hourly clear-out of recordings
         self._session = 0
         self.current: Session | None = None
         self._adding_model = False   # the "Add a model file…" dialog is open
@@ -1136,7 +1138,11 @@ class App:
 
     @property
     def _keeps_recordings(self) -> bool:
-        return self.cfg.learning_enabled and self.cfg.keep_recordings
+        """Only where learning can run: not on a PC without a discrete graphics card (found by Whisper's
+        set-up), nor after dictation crashed the card (gpu-failed.json), since nothing would ever listen to
+        them. Recordings kept earlier are still cleared out by the prune timer."""
+        return (self.cfg.learning_enabled and self.cfg.keep_recordings and not self._no_discrete_gpu
+                and not (self.paths.data_dir / GPU_MARKER).exists())
 
     def _save_recording(self, session: "Session", raw: str, text: str) -> None:
         """A dictation has landed (typed, or copied to the clipboard): keep its audio and a record of it.
@@ -1281,25 +1287,41 @@ class App:
         return [*self.cfg.dictionary, *self.learned]
 
     def _stop_learning(self) -> None:
-        """The hotkey was pressed: end a background check at once. Checker.stop kills Whisper's process
-        without taking a lock; never unload() it from here, that waits for the Whisper call in progress.
-        Also a check starting just now (Checker.run forgets an earlier stop) sees the user is back."""
-        self._dictation_asked_at = time.monotonic()
-        checker = self.checker
-        if checker is not None:
-            checker.stop()
+        """The hotkey (or tray → Retry) was pressed: end a background check at once, so Parakeet never
+        loads next to Whisper on the graphics card. Checker.stop kills Whisper's process without taking a
+        lock; never unload() it from here, that waits for the Whisper call in progress. Also a check
+        starting just now (Checker.run forgets an earlier stop) sees the user is back. Never raises: a
+        checker bug must not break dictation."""
+        try:
+            self._dictation_asked_at = time.monotonic()
+            checker = self.checker
+            if checker is not None:
+                checker.stop()
+        except Exception:
+            log.exception("could not stop the background check")
 
     def _setup_teacher(self) -> None:
         """Thread body: Whisper for background learning, downloaded (886 MB) only on a PC with a discrete
-        graphics card. Orca's copy is used if it has one. A failure is tried again at the next app start."""
+        graphics card that dictation hasn't crashed (gpu-failed.json). Orca's copy is used if it has one.
+        A failure is tried again at the next app start. Turning learning off stops a download; its .part
+        stays, and turning learning on again starts the set-up again, which resumes it."""
         try:
+            if (self.paths.data_dir / GPU_MARKER).exists():
+                log.info("background learning: dictation crashed the graphics card before, Whisper is not downloaded")
+                self._learning_status(STATUS_NO_GPU)
+                return
             if not teacher.has_discrete_gpu(_own_command()):
                 log.info("background learning: no discrete graphics card, Whisper is not downloaded")
+                self._no_discrete_gpu = True
                 self._learning_status("Waiting for a graphics card")
                 return
             path = teacher.ensure(self.paths.teacher_dir, _orca_models_dir(), self._teacher_progress(),
                                   learning_dir=self.paths.learning_dir)
         except _Quitting:
+            if not self._quitting.is_set():   # learning was turned off
+                log.info("background learning: turned off, the Whisper download stopped")
+                self._teacher_tried = False
+                self._learning_status("Off")
             return
         except Exception as e:
             log.warning("background learning: Whisper download failed: %s", e, exc_info=not isinstance(e, OSError))
@@ -1313,7 +1335,7 @@ class App:
         last = [-1]
 
         def cb(done: int, total: int) -> None:
-            if self._quitting.is_set():
+            if self._quitting.is_set() or not self.cfg.learning_enabled:
                 raise _Quitting()
             pct = int(done * 100 / max(total, 1))
             if done < total and pct != last[0]:   # a finished (or already there) file says "Whisper ready"
@@ -1354,6 +1376,7 @@ class App:
                     self.sounds.play("error")   # a dictation is running; retry once it's done
                 return
             self.state = "busy"
+        self._stop_learning()   # first: Whisper's process ends now, the graphics card is free for Parakeet
         if self.overlay:
             self.overlay.working()
         self._refresh()
@@ -1600,7 +1623,7 @@ class App:
             else:
                 self._note(f"Ready. Press {self.cfg.hotkey} to dictate.")   # no pop-up at every start
             self.context.refresh()   # first look at the [context] folders, in the background
-            self._start_prune()      # old kept recordings: now and then every day, in the background
+            self._start_prune()      # old kept recordings: now and then every hour, in the background
             self._start_learning()   # Whisper's download, then checks while the PC is idle, in the background
             winutil.trim_working_set()
 

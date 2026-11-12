@@ -258,8 +258,9 @@ max_recordings_mb = 1500
 # the PC is on mains power, and stops the moment you press the dictation shortcut.
 idle_minutes = 3
 # Ask Claude (the Claude Code you are signed in to) to confirm a fix. Only text is sent, never audio.
-# With false (or when Claude is not installed or not signed in), only fixes to names you already have
-# (your [dictionary], learned.toml and names from your notes) are learned; other disagreements are skipped.
+# With false (or when Claude is not installed), only fixes to names you already have (your [dictionary],
+# learned.toml and names from your notes) are learned; other disagreements are skipped. When Claude runs
+# but can't answer (not signed in, a usage limit, offline), they wait for the next day or app start.
 use_claude = true
 # Ask Claude at most this many times a day (0..200). 0 = never.
 claude_calls_per_day = 20

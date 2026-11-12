@@ -115,6 +115,25 @@ def test_download_resumes_from_part(tmp_path, body, known, serve):
     assert not part.exists()
 
 
+def test_download_stopped_by_its_progress_callback_keeps_the_part_for_a_resume(tmp_path, body, known, serve):
+    """The app stops Whisper's download from the progress callback (quitting, or learning turned off)."""
+    class Stop(Exception):
+        pass
+
+    def stop_after_1_mb(done, total):
+        if done >= 1 << 20:
+            raise Stop()
+
+    s = serve()
+    part = tmp_path / "dl" / teacher.KEY / (NAME + ".part")
+    with pytest.raises(Stop):
+        teacher.ensure(tmp_path / "dl", tmp_path / "orca", stop_after_1_mb, base_url=s.url)
+    have = part.stat().st_size
+    assert have >= 1 << 20 and part.read_bytes() == body[:have]
+    assert teacher.ensure(tmp_path / "dl", tmp_path / "orca", base_url=s.url).read_bytes() == body
+    assert s.ranges == [None, f"bytes={have}-"]
+
+
 def test_resume_falls_back_when_server_ignores_range(tmp_path, body, known, serve):
     s = serve(honour_range=False)
     part = tmp_path / "dl" / teacher.KEY / (NAME + ".part")
@@ -341,10 +360,23 @@ def test_has_discrete_gpu_logs_the_exit_code_and_stderr_tail_when_it_fails(caplo
     assert len(msg) < 1500                                        # only the tail of stderr
 
 
+def test_has_discrete_gpu_logs_and_removes_the_error_file(monkeypatch, caplog):
+    """The windowed .exe has no stderr, so --list-devices writes its error to <out>.err instead."""
+    caplog.set_level(logging.INFO, logger="parakeet_dictate.teacher")
+    removed = []
+    real_unlink = Path.unlink
+    monkeypatch.setattr(Path, "unlink", lambda self, *a, **k: (removed.append(self.name), real_unlink(self, *a, **k)))
+    code = "import sys; open(sys.argv[2] + '.err', 'w').write('RuntimeError: no Vulkan'); sys.exit(1)"
+    assert teacher.has_discrete_gpu(py(code)) is False
+    msg = " ".join(r.getMessage() for r in caplog.records)
+    assert "RuntimeError: no Vulkan" in msg and "devices.json.err" in removed
+
+
 def test_has_discrete_gpu_leaves_no_temp_file_behind(monkeypatch, tmp_path):
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     assert teacher.has_discrete_gpu(writes('[["gpu","a"]]')) is True
     assert teacher.has_discrete_gpu(py("import sys; sys.exit(1)")) is False
+    assert teacher.has_discrete_gpu(py("import sys; open(sys.argv[2] + '.err', 'w').write('x'); sys.exit(1)")) is False
     assert list(tmp_path.iterdir()) == []
 
 
@@ -405,25 +437,30 @@ def test_list_devices_runs_before_anything_else_is_set_up(monkeypatch, tmp_path)
     assert not (tmp_path / "roaming").exists() and not (tmp_path / "local").exists()
 
 
-def test_list_devices_writes_nothing_and_exits_1_on_any_error(monkeypatch, tmp_path):
+@pytest.mark.parametrize("stderr", ["console", None])         # None: the windowed .exe has no stderr
+def test_list_devices_writes_only_the_error_file_and_exits_1_on_any_error(monkeypatch, tmp_path, capsys, stderr):
+    if stderr is None:
+        monkeypatch.setattr(sys, "stderr", None)
     fake_engine(monkeypatch, RuntimeError("no Vulkan"))
     out = tmp_path / "devices.json"
     monkeypatch.setattr(sys, "argv", ["ParakeetDictate", "--list-devices", str(out)])
     assert entry.main() == 1
-    assert list(tmp_path.iterdir()) == []
+    assert [p.name for p in tmp_path.iterdir()] == ["devices.json.err"]
+    assert (tmp_path / "devices.json.err").read_text(encoding="utf-8") == "RuntimeError: no Vulkan"
 
 
 def test_list_devices_exits_1_when_the_engine_cannot_be_imported(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "transcribe_cpp", None)             # makes `import transcribe_cpp` fail
     out = tmp_path / "devices.json"
     monkeypatch.setattr(sys, "argv", ["ParakeetDictate", "--list-devices", str(out)])
-    assert entry.main() == 1 and list(tmp_path.iterdir()) == []
+    assert entry.main() == 1 and [p.name for p in tmp_path.iterdir()] == ["devices.json.err"]
+    assert "transcribe_cpp" in (tmp_path / "devices.json.err").read_text(encoding="utf-8")
 
 
 def test_list_devices_exits_1_when_the_file_cannot_be_written(monkeypatch, tmp_path):
     fake_engine(monkeypatch, [dev("cpu", "CPU")])
     monkeypatch.setattr(sys, "argv", ["ParakeetDictate", "--list-devices", str(tmp_path / "no" / "such" / "devices.json")])
-    assert entry.main() == 1
+    assert entry.main() == 1                                  # nor can the error file be: still no crash
 
 
 def test_list_devices_without_a_file_name_is_a_usage_error_and_does_not_start_the_app(monkeypatch):

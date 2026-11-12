@@ -70,9 +70,10 @@ def main() -> int:
 
 def list_devices(out_path: str) -> int:
     """ParakeetDictate.exe --list-devices out.json : write the speech engine's devices to out.json as JSON,
-    [[type, name], ...] (type is "gpu" for a discrete card, "igpu" or "cpu"), and exit 0. On any error nothing
-    is written and the exit code is 1. The tray app never loads the engine itself, so it asks a short-lived
-    process like this one (teacher.has_discrete_gpu). A file, not stdout: the windowed .exe has no stdout."""
+    [[type, name], ...] (type is "gpu" for a discrete card, "igpu" or "cpu"), and exit 0. On any error out.json
+    is not written, the error goes to out.json.err (and to stderr, when there is one), and the exit code is 1.
+    The tray app never loads the engine itself, so it asks a short-lived process like this one
+    (teacher.has_discrete_gpu). Files, not stdout or stderr: the windowed .exe has neither."""
     import json
 
     tmp = out_path + ".tmp"
@@ -88,7 +89,14 @@ def list_devices(out_path: str) -> int:
             os.remove(tmp)
         except OSError:
             pass
-        print(f"{type(e).__name__}: {e}", file=sys.stderr)  # the caller logs the tail of this
+        error = f"{type(e).__name__}: {e}"
+        try:
+            with open(out_path + ".err", "w", encoding="utf-8") as f:   # the caller logs this
+                f.write(error)
+        except OSError:
+            pass
+        if sys.stderr is not None:
+            print(error, file=sys.stderr)
         return 1
     return 0
 

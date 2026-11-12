@@ -16,7 +16,7 @@ import pytest
 from test_app_flow import SR, FakeEngine, FakeRecorder, dictate, make_app, out, retry, speech  # noqa: F401
 
 from parakeet_dictate import autolearn, config, idle, learn, models, recordings, teacher, winutil
-from parakeet_dictate.app import FAILED_NOTE, App, Session
+from parakeet_dictate.app import FAILED_NOTE, App, FailedRecording, Session
 from parakeet_dictate.engine import GPU_MARKER, Engine, EngineError, EngineSpec
 
 MODEL = "parakeet-tdt-0.6b-v3.gguf"
@@ -272,8 +272,10 @@ def test_prune_uses_the_settings_and_local_time(tmp_path, monkeypatch):
     assert now.tzinfo is None and abs(now - datetime.now()) < timedelta(seconds=5)
 
 
-def test_clear_out_runs_daily_by_default():
-    assert App.PRUNE_EVERY_SECONDS == 24 * 3600
+def test_clear_out_runs_hourly_by_default():
+    """Hourly, not daily: a laptop that sleeps at night (the timer doesn't run while it sleeps) would
+    otherwise keep recordings well past keep_days. The clear-out is cheap and goes by age."""
+    assert App.PRUNE_EVERY_SECONDS == 3600
 
 
 def test_clear_out_repeats_on_its_own_timer(tmp_path, monkeypatch, pruning):
@@ -300,7 +302,7 @@ def test_quitting_stops_the_clear_out(tmp_path, monkeypatch, pruning):
     monkeypatch.setattr(recordings, "prune", lambda *a: calls.append(a) or 0)
     app = learning_app(tmp_path, FakeEngine())
     pruning(app)
-    wait_for(lambda: len(calls) == 1)                # once at start, then it waits a day
+    wait_for(lambda: len(calls) == 1)                # once at start, then it waits an hour
     app._quitting.set()
     wait_for(lambda: not prune_threads())
     assert len(calls) == 1
@@ -466,6 +468,46 @@ def test_check_starting_just_as_the_hotkey_is_pressed_stops_too(learner):
     app.recorder = types.SimpleNamespace(start=lambda: (_ for _ in ()).throw(OSError("test: no microphone")))
     app._on_hotkey()                                      # no check running: nothing to stop, no error
     assert app.state == "idle" and app._should_stop_check() is True
+
+
+def test_retry_during_check_stops_teacher_first(learner, out):
+    """Tray → Retry while Whisper is in the middle of a recording: like the hotkey, its process is killed
+    before Parakeet transcribes (both on the 4 GB card would not fit), and Retry never waits for the check."""
+    app = learner()
+    kept(app, "send the mail t campaign")
+    events = []
+    whisper = FakeTeacher(events, block=True)
+    app._new_teacher_engine = lambda spec: whisper
+    app._learning_tick()
+    assert whisper.transcribing.wait(5)                   # the check is waiting for Whisper
+    stop = app.checker.stop
+    app.checker.stop = lambda: (events.append("stop"), stop())
+    app.failed = FailedRecording(speech(), SR, False)
+    app.engine = FakeEngine("Hello again.")
+    transcribe = app.engine.transcribe
+    app.engine.transcribe = lambda audio: (events.append("transcribe"), transcribe(audio))[1]
+    t0 = time.monotonic()
+    retry(app)
+    assert time.monotonic() - t0 < 1
+    finish_check(app)
+    assert [e for e in events if isinstance(e, str)] == ["stop", "kill", "transcribe"]
+    assert out.typed == ["Hello again. "] and app.failed is None
+    assert app.learning_paused is None                    # stopped by the user: not a crash
+
+
+def test_a_checker_bug_never_breaks_the_hotkey(learner, caplog):
+    app = learner()
+
+    def broken():
+        raise RuntimeError("checker bug")
+
+    app.checker = types.SimpleNamespace(stop=broken)
+    opened = []
+    app.recorder = types.SimpleNamespace(start=lambda: (opened.append(1), (_ for _ in ()).throw(OSError("test: no mic"))))
+    with caplog.at_level(logging.ERROR, logger="parakeet_dictate.app"):
+        app._on_hotkey()
+    assert opened == [1] and logged(caplog, "checker bug")   # the microphone was still opened
+    app.checker = None                                    # the fixture's clean-up calls stop() again
 
 
 # --- when the check runs -----------------------------------------------------------------------------
@@ -692,6 +734,85 @@ def test_quitting_ends_the_download(learner, monkeypatch):
     monkeypatch.setattr(teacher, "ensure", ensure)
     app._setup_teacher()
     assert app.statuses == ["Downloading Whisper 1%"] and app.teacher_path is None
+
+
+def test_turning_learning_off_stops_the_download(learner, monkeypatch):
+    """The progress callback ends the download (its .part stays, see test_teacher), the status says "Off",
+    and turning learning on again in the same app run starts the set-up again, so the download resumes."""
+    monkeypatch.setattr(teacher, "has_discrete_gpu", lambda cmd, timeout=30: True)
+    app = learner(teacher_ready=False)
+    calls = []
+
+    def ensure(teacher_dir, orca_dir, progress, **k):
+        calls.append(1)
+        progress(10, 1000)
+        app.cfg = dataclasses.replace(app.cfg, learning_enabled=False)   # Settings saved, the tray reloaded
+        progress(20, 1000)                                # the download ends here
+        raise AssertionError("not reached")
+
+    monkeypatch.setattr(teacher, "ensure", ensure)
+    app._teacher_tried = True                             # what the idle loop does before it starts the set-up
+    app._setup_teacher()
+    assert app.statuses == ["Downloading Whisper 1%", "Off"] and app.teacher_path is None
+    assert app.learning_store.status() == "Off" and app.notes == []
+    app._learning_tick()                                  # still off: nothing starts
+    assert calls == [1]
+    app.cfg = dataclasses.replace(app.cfg, learning_enabled=True)
+    monkeypatch.setattr(teacher, "ensure", lambda *a, **k: calls.append(2) or app.paths.teacher_dir / WHISPER)
+    app._learning_tick()
+    wait_for(lambda: app.teacher_path is not None)
+    assert calls == [1, 2]
+
+
+def test_gpu_marker_skips_download(learner, monkeypatch):
+    """Dictation already crashed the graphics card (gpu-failed.json): learning can never run, so the 886 MB
+    are not downloaded, and the card isn't even asked about."""
+    asked, ensured = [], []
+    monkeypatch.setattr(teacher, "has_discrete_gpu", lambda cmd, timeout=30: asked.append(cmd) or True)
+    monkeypatch.setattr(teacher, "ensure", lambda *a, **k: ensured.append(a))
+    app = learner(teacher_ready=False)
+    app.paths.data_dir.mkdir(parents=True, exist_ok=True)
+    (app.paths.data_dir / GPU_MARKER).write_text("{}", "utf-8")
+    app._setup_teacher()
+    assert asked == [] and ensured == [] and app.teacher_path is None
+    assert app.statuses == ["Paused: no graphics card"] and app.notes == []
+
+
+# --- no voice kept where learning can never run -------------------------------------------------------
+
+def test_no_discrete_gpu_keeps_no_recordings(learner, out, saves, monkeypatch, pruning):
+    monkeypatch.setattr(teacher, "has_discrete_gpu", lambda cmd, timeout=30: False)
+    app = learner(teacher_ready=False)
+    old, recent = old_recording(app.paths.recordings_dir, 30), old_recording(app.paths.recordings_dir, 1)
+    app._setup_teacher()
+    app.engine = FakeEngine("Hello world.")
+    dictate(app)
+    finish_saving()
+    assert out.typed == ["Hello world. "] and [s.rec.id for s in saves] == [old, recent]   # only the two above
+    pruning(app)                                          # recordings kept earlier still age out
+    wait_for(lambda: [r.id for r in recordings.list_records(app.paths.recordings_dir)] == [recent])
+
+
+def test_gpu_marker_keeps_no_recordings(learner, out, saves):
+    app = learner()
+    app.paths.data_dir.mkdir(parents=True, exist_ok=True)
+    (app.paths.data_dir / GPU_MARKER).write_text("{}", "utf-8")
+    app.engine = FakeEngine("Hello world.")
+    dictate(app)
+    finish_saving()
+    assert out.typed == ["Hello world. "] and saves == []
+
+
+def test_recordings_kept_when_the_pc_has_a_graphics_card(learner, out, saves, monkeypatch):
+    monkeypatch.setattr(teacher, "has_discrete_gpu", lambda cmd, timeout=30: True)
+    app = learner(teacher_ready=False)
+    monkeypatch.setattr(teacher, "ensure", lambda *a, **k: app.paths.teacher_dir / WHISPER)
+    app._setup_teacher()
+    app.engine = FakeEngine("Hello world.")
+    dictate(app)
+    finish_saving()
+    [s] = saves
+    assert s.rec.raw == "Hello world."
 
 
 # --- what the checker is given -----------------------------------------------------------------------
