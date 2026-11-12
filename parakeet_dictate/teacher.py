@@ -93,11 +93,22 @@ def ensure(teacher_dir: Path, orca_dir: Path, progress: models.Progress = lambda
     return models.download(teacher_dir, progress, base_url=base_url, key=KEY, resume=True).path
 
 
+def _read_error(path: Path) -> str:
+    """The text --list-devices wrote to its .err file, which is then removed; "" when there is none."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        path.unlink()
+    except OSError:
+        return ""
+    return text
+
+
 def has_discrete_gpu(exe_cmd: list[str], timeout: float = LIST_DEVICES_TIMEOUT) -> bool:
     """True if the speech engine sees a discrete graphics card. Runs `exe_cmd --list-devices <out.json>` (the
     app's own command line, see __main__.list_devices; a file because the windowed .exe has no stdout) and
     reads [[device_type, name], ...] from that file once the child has exited. Any failure (missing program,
-    timeout, non-zero exit, no or bad file) counts as no card: learning then simply waits."""
+    timeout, non-zero exit, no or bad file) counts as no card: learning then simply waits. The child's error
+    is logged, from <file>.err (the windowed .exe has no stderr) or else the tail of its stderr."""
     try:
         with tempfile.TemporaryDirectory(prefix="parakeet-devices-", ignore_cleanup_errors=True) as tmp:
             out = Path(tmp) / "devices.json"
@@ -110,7 +121,7 @@ def has_discrete_gpu(exe_cmd: list[str], timeout: float = LIST_DEVICES_TIMEOUT) 
                 devices = None
             if not isinstance(devices, list):
                 log.info("--list-devices gave no usable answer (exit code %s): %s", done.returncode,
-                         (done.stderr or "").strip()[-500:])
+                         (_read_error(out.with_name(out.name + ".err")) or done.stderr or "").strip()[-500:])
                 return False
             return any(isinstance(d, list) and d and d[0] == "gpu" for d in devices)
     except (OSError, ValueError, subprocess.SubprocessError) as e:
