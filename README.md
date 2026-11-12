@@ -18,7 +18,11 @@ Nothing leaves the laptop, and no admin rights are needed.
 A small pill at the bottom of the screen you're working on shows **● Listening** (with a live mic
 meter and timer), then **Transcribing…**, then **✓ Typed** (or *Cancelled* / *No speech heard*). It stays on
 top of all windows, never takes focus and lets clicks pass through. Turn it off or move it to the top with
-`[overlay]` in the settings.
+`[overlay]` in the settings. When the microphone clips it turns red and reads **Too loud**.
+
+In tap mode a dictation stops by itself (and types what you said) after a minute without speech
+(`[audio] silence_stop_seconds`, 0 = off). If the microphone is unplugged mid-dictation it stops the same way;
+if the microphone named in `[audio] input_device` isn't there, the Windows default is used and a notification says so.
 
 **Transcribes while you talk.** Each time you pause for 0.8 s, the part before the pause is transcribed in
 the background, so when you stop only the last bit is left and the text appears almost right away. Tested:

@@ -102,4 +102,9 @@ position = "bottom"
 
 [audio]
 # Part of the microphone's name, e.g. "Headset". Empty = the Windows default input.
+# If no microphone matches (headset not plugged in), the Windows default is used and a notification says so.
 input_device = ""
+# Stop the dictation (and type what you said) when nothing has been said for this many seconds, so a
+# forgotten tap doesn't keep the microphone open. Only in tap mode, never while you hold the keys.
+# 0 = never stop for silence (max_seconds still applies).
+silence_stop_seconds = 60
