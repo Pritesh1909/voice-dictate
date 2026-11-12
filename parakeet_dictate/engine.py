@@ -8,19 +8,29 @@ transcribe.cpp (the engine Orca uses) runs on the GPU through Vulkan when there 
 laptop with Parakeet v2, 16 s of speech: NVIDIA RTX 2050 0.3 s, CPU (i7-1260P) ~4.5 s; loading ~2 s on
 the GPU, ~0.5 s on the CPU. The very first GPU run on a PC compiles shaders once (~20 s); the driver
 caches them, so later processes don't pay it again.
+
+If the engine process dies while loading or decoding on a graphics card (a driver crash takes the whole
+process down, so no error message arrives), that is written to gpu-failed.json in the data folder, and
+device = "auto" uses only the CPU from then on, retrying the failed request there once.
 """
 from __future__ import annotations
 
+import dataclasses
+import json
 import logging
 import multiprocessing as mp
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 log = logging.getLogger(__name__)
 
 
 DEVICES = ("auto", "gpu", "igpu", "cpu")
+GPU_MARKER = "gpu-failed.json"
+LOAD_TIMEOUT = 60.0      # the first GPU run compiles shaders (~20 s), which fits
+DECODE_TIMEOUT = 60.0
 
 
 @dataclass(frozen=True)
@@ -30,6 +40,8 @@ class EngineSpec:
     device: str = "auto"                # one of DEVICES
     vocabulary: tuple[str, ...] = ()    # boosted words, for models that support it
     vad: str = ""                       # path of the voice-activity detector .gguf ("" = none)
+    language: str = "auto"              # [model] language: "auto" or an ISO-639-1 code
+    gpu_marker: str = ""                # path of gpu-failed.json ("" = don't remember GPU crashes)
 
     @classmethod
     def for_model(cls, m, threads: int, **kw) -> "EngineSpec":
@@ -46,23 +58,81 @@ def device_order(devices, want: str) -> list:
     return out or list(devices)
 
 
-def _load(spec: EngineSpec):
+# --- remembering GPU crashes ----------------------------------------------------------------------
+
+def read_gpu_marker(path: str) -> dict | None:
+    """The recorded GPU crash, or None. A marker that exists but can't be read still counts."""
+    if not path:
+        return None
+    try:
+        d = json.loads(Path(path).read_text("utf-8"))
+        return d if isinstance(d, dict) else {}
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        return {}
+
+
+def write_gpu_marker(path: str, device: str, during: str, exit_code) -> bool:
+    try:
+        Path(path).write_text(json.dumps({"device": device, "during": during, "exit_code": exit_code,
+                                          "time": time.strftime("%Y-%m-%d %H:%M:%S")}, indent=1), "utf-8")
+        return True
+    except OSError as e:
+        log.warning("could not record the GPU crash in %s: %s", path, e)
+        return False
+
+
+def choose_device(want: str, marker: dict | None) -> tuple[str, str]:
+    """(device to load on, why it isn't `want`). A recorded GPU crash turns "auto" into the CPU;
+    "gpu" and "igpu" chosen explicitly ignore it (that is how to try the card again)."""
+    if want != "auto" or marker is None:
+        return want, ""
+    what = marker.get("device") or "the graphics card"
+    when = f" on {marker['time']}" if marker.get("time") else ""
+    return "cpu", (f"CPU only: {what} crashed the speech engine{when}; delete {GPU_MARKER} "
+                   "or set [model] device to \"gpu\" to try it again")
+
+
+def _on_gpu(device_type: str | None) -> bool:
+    return device_type in ("gpu", "igpu")
+
+
+# --- the child process ----------------------------------------------------------------------------
+
+def _run_language(model, want: str) -> tuple[str | None, str]:
+    """(language to pass to run(), a note when the setting is ignored)."""
+    if want in ("", "auto"):
+        return None, ""
+    from .models import match_language
+    try:
+        langs = model.capabilities.languages
+    except Exception:
+        langs = ()
+    got = match_language(want, langs)
+    return got, "" if got else f"[model] language \"{want}\" ignored: this model can't be told the language"
+
+
+def _load(spec: EngineSpec, report=lambda device_type, name: None):
     import transcribe_cpp as tc
     tc.set_log_callback(None)  # silence native info logging (nowhere to show it in a tray app)
     tried = []
     for dev in device_order(tc.backends(), spec.device):
+        name = dev.description or dev.name
+        report(dev.device_type, name)  # so the parent knows the device if this crashes the process
         try:
             model = tc.Model(spec.model, device=dev)
         except Exception as e:
-            tried.append(f"{dev.description or dev.name}: {e}")
+            tried.append(f"{name}: {e}")
             continue
         threads = spec.threads if dev.device_type == "cpu" else 0
         session = model.session(n_threads=threads)
         vocab = list(spec.vocabulary) if spec.vocabulary and model.supports("vocabulary") else None
-        note = f"on {dev.description or dev.name}"
+        language, lang_note = _run_language(model, spec.language)
+        note = f"on {name}"
         if tried:
             note += f" (fell back after: {'; '.join(tried)})"
-        return model, session, vocab, note
+        return model, session, vocab, language, note, lang_note, (dev.device_type, name)
     raise RuntimeError("could not load the model on any device: " + "; ".join(tried))
 
 
@@ -84,11 +154,14 @@ def _load_vad(path: str):
 def _worker(conn, spec: EngineSpec) -> None:  # runs in the child process
     try:
         t = time.perf_counter()
-        model, session, vocab, note = _load(spec)  # `model` must stay referenced while the session is used
+        # `model` must stay referenced while the session is used
+        model, session, vocab, language, note, lang_note, device = _load(
+            spec, lambda kind, name: conn.send(("loading", kind, name)))
+        conn.send(("loading", "cpu", "voice detector"))
         vad_model, vad, vad_frame, vad_note = _load_vad(spec.vad)
         if vad_note:
             note += f"; {vad_note}"
-        conn.send(("ready", time.perf_counter() - t, note, vad_frame))
+        conn.send(("ready", time.perf_counter() - t, note, vad_frame, device, lang_note))
     except Exception as e:
         conn.send(("error", f"{type(e).__name__}: {e}"))
         return
@@ -113,7 +186,7 @@ def _worker(conn, spec: EngineSpec) -> None:  # runs in the child process
         if msg[0] == "decode":
             t = time.perf_counter()
             try:
-                r = session.run(msg[1], vocabulary=vocab)
+                r = session.run(msg[1], vocabulary=vocab, language=language)
                 conn.send(("text", r.text, time.perf_counter() - t))
             except Exception as e:
                 conn.send(("error", f"{type(e).__name__}: {e}"))
@@ -139,6 +212,10 @@ class Engine:
         self.note = ""
         self.load_seconds = 0.0
         self.vad_frame = 0          # samples per voice-detector score; 0 = no detector loaded
+        self.device: tuple[str, str] | None = None     # (device type, name) the model is loaded on
+        self._loading: tuple[str, str] | None = None   # what the engine process is loading on right now
+        self._why_cpu = ""          # why "auto" runs on the CPU this time (a recorded GPU crash)
+        self._unsaved_crash: dict | None = None        # a GPU crash that could not be written to the marker
 
     @property
     def state(self) -> str:
@@ -163,63 +240,114 @@ class Engine:
                 raise EngineError("no speech model selected yet")
             if self._proc is not None and self._proc.is_alive():
                 return
-            self._cleanup()
-            ctx = mp.get_context("spawn")
-            parent, child = ctx.Pipe()
-            self._proc = ctx.Process(target=_worker, args=(child, self._spec), daemon=True,
-                                     name="parakeet-engine")
-            self._proc.start()
-            child.close()
-            self._conn = parent
-            self._ready.clear()
-            self._error = None
-            self._gen += 1
-            threading.Thread(target=self._await_ready, args=(parent, self._gen), daemon=True).start()
+            self._start()
         self._on_change()
 
+    def _start(self) -> None:  # with the lock held
+        self._cleanup()
+        spec = self._spec
+        marker = read_gpu_marker(spec.gpu_marker)
+        device, self._why_cpu = choose_device(spec.device, self._unsaved_crash if marker is None else marker)
+        if self._why_cpu:
+            log.info("speech engine: %s", self._why_cpu)
+            spec = dataclasses.replace(spec, device=device)
+        ctx = mp.get_context("spawn")
+        parent, child = ctx.Pipe()
+        self._proc = ctx.Process(target=_worker, args=(child, spec), daemon=True, name="parakeet-engine")
+        self._proc.start()
+        child.close()
+        self._conn = parent
+        self._ready.clear()
+        self._error = None
+        self.device = self._loading = None
+        self._gen += 1
+        threading.Thread(target=self._await_ready, args=(parent, self._gen), daemon=True).start()
+
     def _await_ready(self, conn, gen: int) -> None:
-        try:
-            msg = conn.recv()
-        except (EOFError, OSError):
-            msg = ("error", "speech engine stopped while loading")
+        while True:
+            try:
+                msg = conn.recv()
+            except (EOFError, OSError):
+                msg = ("stopped",)
+            if msg[0] != "loading":
+                break
+            with self._lock:
+                if gen == self._gen:
+                    self._loading = (msg[1], msg[2])
         with self._lock:
             if gen != self._gen or self._conn is not conn:
-                return  # unloaded or restarted meanwhile
+                return  # unloaded or restarted meanwhile: an ordinary unload, never a crash
             if msg[0] == "ready":
-                self.load_seconds, self.note, self.vad_frame = msg[1], msg[2], msg[3]
-                log.info("model loaded in %.1fs %s", msg[1], msg[2])
+                self.load_seconds, note, self.vad_frame, self.device, lang_note = msg[1:6]
+                self.note = f"{note}; {self._why_cpu}" if self._why_cpu else note
+                log.info("model loaded in %.1fs %s", self.load_seconds, self.note)
+                if lang_note:
+                    log.info("%s", lang_note)
+            elif msg[0] == "stopped":
+                if self._gpu_crashed(self._loading, "loading") and self._spec.device == "auto":
+                    log.warning("loading the model again on the CPU")
+                    self._start()  # transcribe() keeps waiting for this one
+                    return
+                self._error = "speech engine stopped while loading"
+                log.error("model failed to load: %s", self._error)
             else:
                 self._error = msg[1]
                 log.error("model failed to load: %s", msg[1])
             self._ready.set()
         self._on_change()
 
-    def transcribe(self, samples, timeout: float = 120.0) -> tuple[str, float]:
+    def _gpu_crashed(self, device: tuple[str, str] | None, during: str) -> bool:
+        """The engine process went away unexpectedly (lock held). True, and recorded, if it was on a GPU."""
+        proc = self._proc
+        code = None
+        if proc is not None:
+            proc.join(1)
+            code = proc.exitcode
+        log.error("speech engine process ended while %s on %s (exit code %s)",
+                  during, device[1] if device else "?", code)
+        if code == 0 or device is None or not _on_gpu(device[0]):
+            return False
+        saved = bool(self._spec.gpu_marker) and write_gpu_marker(self._spec.gpu_marker, device[1], during, code)
+        # Not written: remember it until the app restarts, so "auto" doesn't crash the card again.
+        self._unsaved_crash = None if saved else {"device": device[1], "time": time.strftime("%Y-%m-%d %H:%M")}
+        return True
+
+    def transcribe(self, samples, _retry: bool = True) -> tuple[str, float]:
         if getattr(samples, "size", len(samples)) < 1600:  # < 0.1 s: the model can't take it, and it holds no words
             return "", 0.0
         self.warm()
-        if not self._ready.wait(timeout):
+        if not self._ready.wait(LOAD_TIMEOUT):
             self.unload()
-            raise EngineError("the model took too long to load")
+            raise EngineError("The speech model took longer than a minute to load.")
         with self._lock:
             if self._error:
                 err = self._error
                 self.unload()
                 raise EngineError(err)
             conn = self._conn
+            if conn is None:
+                raise EngineError("speech engine stopped")
             try:
                 conn.send(("decode", samples))
-                if not conn.poll(timeout):
-                    raise EngineError("transcription timed out")
+                if not conn.poll(DECODE_TIMEOUT):
+                    log.error("transcription timed out; restarting the engine")
+                    self.unload()   # a late reply would otherwise be read as the answer to the next request
+                    raise EngineError("Transcription took longer than a minute.")
                 msg = conn.recv()
             except (EOFError, OSError) as e:
+                on_gpu = self._gpu_crashed(self.device, "decoding")
                 self.unload()
-                raise EngineError(f"speech engine stopped: {e}") from None
+                if not (on_gpu and _retry and self._spec is not None and self._spec.device == "auto"):
+                    raise EngineError(f"speech engine stopped: {e}") from None
+                msg = None
+        if msg is None:
+            log.warning("transcribing again on the CPU")
+            return self.transcribe(samples, _retry=False)
         if msg[0] != "text":
             raise EngineError(msg[1])
         return msg[1], msg[2]
 
-    def wait_ready(self, timeout: float = 120.0) -> bool:
+    def wait_ready(self, timeout: float = LOAD_TIMEOUT) -> bool:
         """Wait for the model (started by warm()). False if it failed, timed out or was unloaded."""
         return self._ready.wait(timeout) and not self._error and self._proc is not None
 

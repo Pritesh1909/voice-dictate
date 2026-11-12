@@ -15,7 +15,7 @@ from . import APP_NAME, __version__
 from . import config as cfgmod
 from . import models, output, winutil
 from .audio import SR, Recorder, preprocess, resample, silence_stop_due, silence_stop_message
-from .engine import Engine, EngineError, EngineSpec
+from .engine import GPU_MARKER, Engine, EngineError, EngineSpec
 from .hotkey import HotkeyError, HotkeyThread, key_down
 from .overlay import GREEN, MUTED, RED, Overlay
 from .segmenter import Segmenter, VadSegmenter
@@ -60,7 +60,8 @@ class Session:
         self.segmenter = Segmenter(self.rate, self.pause)
         self.seg_rate = self.rate
         self.normalize = app.cfg.normalize_audio
-        self.typer = (output.PhraseTyper(app.cleaner.clean, app.cfg.output_method, app.cfg.add_trailing_space)
+        self.cleaner = app.cleaner_for(app.target_exe)   # the program dictated into: its terms come first
+        self.typer = (output.PhraseTyper(self.cleaner.clean, app.cfg.output_method, app.cfg.add_trailing_space)
                       if self.parallel and app.cfg.type_while_speaking else None)
         self.total_samples = 0
         self.parts = 0
@@ -198,6 +199,7 @@ class App:
         self.ico = write_ico(paths.data_dir / "icon.ico")
         self.cleaner = self._make_cleaner(self.cfg)
         self.recorder = Recorder(self.cfg.input_device)
+        self.target_exe = ""         # the program in front when the current dictation started
         self.icon: pystray.Icon | None = None
         self.problem: str | None = None
         self.model: models.Model | None = None
@@ -342,9 +344,22 @@ class App:
 
     # --- setup ------------------------------------------------------------------------------------
 
-    @staticmethod
-    def _make_cleaner(c: cfgmod.Config) -> Cleaner:
+    def _make_cleaner(self, c: cfgmod.Config) -> Cleaner:
+        self._cleaners: dict[tuple, Cleaner] = {}   # (program, languages) -> Cleaner, for these settings
         return Cleaner.from_config(c)
+
+    def cleaner_for(self, exe: str) -> Cleaner:
+        """The clean-up for dictating into `exe` ("Code.exe"; "" = unknown): that program's
+        [dictionary.apps] terms before your own, and the filler words of the dictation language."""
+        langs = models.dictated_languages(self.model.languages if self.model else (), self.cfg.language)
+        key = (cfgmod.app_key(exe), langs)
+        cleaner = self._cleaners.get(key)
+        if cleaner is None:
+            terms = [t for name, entry in self.cfg.app_dictionaries if name == key[0] for t in entry]
+            log.info("clean-up for %s: %d program term(s), fillers for %s", exe or "an unknown program",
+                     len(terms), "/".join(langs) or "an unknown language")
+            cleaner = self._cleaners[key] = Cleaner.from_config(self.cfg, languages=langs, app_terms=terms)
+        return cleaner
 
     @staticmethod
     def _find_vad(c: cfgmod.Config):
@@ -360,7 +375,8 @@ class App:
         if m is None:
             return None
         return EngineSpec.for_model(m, c.threads, device=c.device, vocabulary=c.hotwords,
-                                    vad=str(self.vad_path or ""))
+                                    vad=str(self.vad_path or ""), language=c.language,
+                                    gpu_marker=str(self.paths.data_dir / GPU_MARKER))
 
     def apply_config(self, c: cfgmod.Config) -> str | None:
         """Switch to new settings. Returns a problem to show, or None."""
@@ -430,6 +446,7 @@ class App:
             log.info("recording started at %d Hz", self.recorder.rate)
             self._session += 1
             session = self._session
+            self.target_exe = winutil.foreground_exe()   # for its [dictionary.apps] terms
             self.current = Session(self, session, use_vad=self.vad_path is not None)
             self.sounds.play("start")
             if self.cfg.esc_cancels:
@@ -534,7 +551,8 @@ class App:
                 return
             typer = session.typer
             # Live: the phrases are already typed, apart from any that couldn't be (they go to the clipboard).
-            text = " ".join(t for t in (typer.text, typer.untyped) if t) if typer else self.cleaner.clean(raw)
+            text = (" ".join(t for t in (typer.text, typer.untyped) if t) if typer
+                    else session.cleaner.clean(raw))
             self.last_stats = (f"{spoken:.1f}s speech in {session.parts} part(s), "
                                f"{'voice detector' if session.vad_mode else 'loudness'} cuts; "
                                f"text done {waited:.1f}s after you stopped")

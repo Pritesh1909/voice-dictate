@@ -72,6 +72,36 @@ class Model:
         return f"{self.name} — {self.source} ({self.path})"
 
 
+# --- dictation language -------------------------------------------------------------------------
+
+def match_language(setting: str, supported) -> str | None:
+    """The code to tell the engine for the [model] language setting, or None to let it detect the language.
+    Like Orca: the model's exact code, else its first regional one ("zh" -> "zh-CN"); None when the setting
+    is "auto" or the model doesn't list it (a model that lists no languages can't be told one)."""
+    want = (setting or "").strip().lower()
+    if want in ("", "auto"):
+        return None
+    supported = [str(x) for x in supported or ()]
+    return next((x for x in supported if x.lower() == want), None) or next(
+        (x for x in supported if x.lower().startswith(want + "-")), None)
+
+
+def dictated_languages(model_languages, setting: str) -> tuple[str, ...]:
+    """The languages the dictated text is in, for the filler words; () when unknown. A model with one
+    language (or two, as in Chinese-English) uses its own; a multilingual one the setting, if it lists it;
+    one whose header lists no languages the setting as it is."""
+    langs = tuple(str(x) for x in model_languages or ())
+    if 0 < len(langs) <= 2:
+        return langs
+    want = (setting or "").strip().lower()
+    if want in ("", "auto"):
+        return ()
+    if not langs:
+        return (want,)
+    got = match_language(want, langs)
+    return (got,) if got else ()
+
+
 # --- reading a GGUF header ------------------------------------------------------------------------
 
 _SCALAR = {0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i", 6: "f", 7: "?", 10: "Q", 11: "q", 12: "d"}

@@ -22,6 +22,9 @@ dir = "auto"
 # Where the model runs. "auto" = graphics card if there is one (NVIDIA RTX 2050 here: 16 s of speech in
 # 0.3 s), else the CPU (~4.5 s). "gpu" = discrete card, "igpu" = built-in Intel graphics, "cpu" = CPU.
 # If the chosen device fails, the CPU is used instead.
+# If the graphics card ever crashes the speech engine, that is remembered in
+# %LOCALAPPDATA%\ParakeetDictate\gpu-failed.json and "auto" then uses only the CPU (the log says so).
+# To try the graphics card again, delete that file, or set "gpu" or "igpu" here (they ignore it).
 device = "auto"
 # CPU threads used while transcribing on the CPU. 4 was the fastest on this laptop (i7-1260P).
 threads = 4
@@ -42,6 +45,11 @@ pause_seconds = 0.6
 # "auto" = find it on this PC; "off" = use the simple loudness detector; or the path of a .gguf file.
 # If it can't be found or fails, the loudness detector is used.
 vad = "auto"
+# The language you dictate in: "auto", or a code such as "en", "de", "fr", "es", "ja", "zh".
+# It is passed to models that can be told the language (multilingual Whisper, SenseVoice, ...); models that
+# can't be told it detect the language themselves (the log says when it is ignored). It also picks the
+# filler words removed below. An English-only model (Parakeet v2) always counts as English.
+language = "auto"
 
 [accuracy]
 # Words and names the model should prefer. Only used by models that support it (transcribe.cpp's
@@ -52,8 +60,16 @@ hotwords = ["Keycloak", "Inkfree", "Mailzzy", "SoftSages", "CodeCommit"]
 normalize_audio = true
 
 [cleanup]
-# Removed when they appear as a whole word. Each letter may be stretched: "uh" also removes
-# "uhh", "ah" also removes "AHH", "hm" also removes "hmm". "uh-huh" is never touched.
+# Remove the thinking sounds of the dictation language (from Orca): English "um", "uh", "er", "hmm";
+# German "äh", "ähm"; French "euh"; Spanish "ehh"; Japanese "えーと"; Chinese "呃"; and more. When the
+# language isn't known, only sounds that are no word in any language go ("uh", "umm", "hmm").
+# A filler on its own before ? or ! ("Hm?") is kept, and so is an all-caps "UM" or "ER" in normal text
+# (more likely a name). false = only remove the words listed in fillers below.
+language_fillers = true
+# Your own fillers, removed on top of the language's when they appear as a whole word. Each letter may be
+# stretched: "uh" also removes "uhh", "ah" also removes "AHH", "hm" also removes "hmm". "uh-huh" is never
+# touched. These are English sounds; if you dictate in another language, take out any that are real words
+# there (German "um", Spanish "eh").
 fillers = ["uh", "um", "uhm", "ah", "er", "erm", "eh", "hm", "mm"]
 # Collapse stutters such as "the the" or "I, I".
 remove_repeated_words = true
@@ -74,6 +90,14 @@ terms = ["Keycloak", "Inkfree", "SoftSages", "CodeCommit", "Flyway", "DataGrip",
 # Spacing and capitals don't matter here either ("mail sey" also covers "Mail-Sey" and "mailsey").
 [dictionary.heard_as]
 "Mailzzy" = ["mail te", "mail sey", "mail say", "mail sea", "mailsy", "mail zee", "mailzy", "mail z", "mail c", "mail tc"]
+
+# Terms for one program only, used when that program's window is in front as you start dictating.
+# Name the program's .exe file (not case sensitive); its terms win over the ones above. For example:
+#   [dictionary.apps."code.exe"]
+#   terms = ["useAudioCapture", "pnpm", "tsconfig"]
+#   [dictionary.apps."code.exe".heard_as]
+#   "kubectl" = ["cube control", "cube cuddle"]
+[dictionary.apps]
 
 [output]
 # "type" sends the text as keystrokes and leaves the clipboard alone.

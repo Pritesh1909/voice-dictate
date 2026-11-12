@@ -118,3 +118,45 @@ def trim_working_set() -> None:
         ctypes.windll.psapi.EmptyWorkingSet(ctypes.c_void_p(-1))
     except OSError:
         pass
+
+
+# --- foreground program ---------------------------------------------------------------------------
+
+user32 = ctypes.WinDLL("user32", use_last_error=True)   # own instance: argtypes here don't affect other modules
+user32.GetForegroundWindow.argtypes = []
+user32.GetForegroundWindow.restype = wt.HWND
+user32.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
+user32.GetWindowThreadProcessId.restype = wt.DWORD
+kernel32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+kernel32.OpenProcess.restype = wt.HANDLE
+kernel32.QueryFullProcessImageNameW.argtypes = [wt.HANDLE, wt.DWORD, wt.LPWSTR, ctypes.POINTER(wt.DWORD)]
+kernel32.QueryFullProcessImageNameW.restype = wt.BOOL
+kernel32.CloseHandle.argtypes = [wt.HANDLE]
+kernel32.CloseHandle.restype = wt.BOOL
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+
+def foreground_exe() -> str:
+    """File name of the program whose window is in front ("Code.exe"), or "" if it can't be told
+    (no window, or a program running as administrator)."""
+    try:
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return ""
+        pid = wt.DWORD(0)
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if not pid.value:
+            return ""
+        h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+        if not h:
+            return ""
+        try:
+            size = wt.DWORD(32768)
+            buf = ctypes.create_unicode_buffer(size.value)
+            if not kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                return ""
+        finally:
+            kernel32.CloseHandle(h)
+        return buf.value.rsplit("\\", 1)[-1]
+    except (OSError, ctypes.ArgumentError):
+        return ""
