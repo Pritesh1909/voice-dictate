@@ -463,8 +463,8 @@ class App:
                 return
             keep = self.model is not None and any(x.path == self.model.path for x in found)
             if keep:
-                self._notify(f"Found {len(found)} speech model(s). Still using {self.model.name}; "
-                             "pick another under Model in the tray menu.")
+                self._note(f"Found {len(found)} speech model(s). Still using {self.model.name}; "
+                           "pick another under Model in the tray menu.")
                 return
             self._switch_to(found[0], announce=True)
         self._model_thread(job)
@@ -473,11 +473,11 @@ class App:
         """Use `m`, copying it to this PC first if it lives inside WSL. Runs in a model job."""
         if m.in_wsl:
             mb = m.size // (1 << 20)
-            self._notify(f"Copying {m.name} from {m.source} to this PC once (about {mb} MB)…")
+            self._note(f"Copying {m.name} from {m.source} to this PC once (about {mb} MB)…")
             m = models.import_copy(m, self.paths.data_dir / "models", self._progress("copying from WSL"))
         self._use_model(m)
         if announce:
-            self._notify(f"{m.name} ready ({m.source}). Press {self.cfg.hotkey} to dictate.")
+            self._note(f"{m.name} ready ({m.source}). Press {self.cfg.hotkey} to dictate.")
 
     def choose_model(self, m: "models.Model") -> None:
         if self.model is not None and m.path == self.model.path:
@@ -486,14 +486,14 @@ class App:
             self._model_thread(lambda: self._switch_to(m, announce=True))
         else:
             self._switch_to(m)
-            self._notify(f"Now using {m.name} ({m.languages_label()}).")
+            self._note(f"Now using {m.name} ({m.languages_label()}).")
 
     def download_model(self) -> None:
         def job():
-            self._notify("Downloading Parakeet v2 (about 730 MB, checksum verified)…")
+            self._note("Downloading Parakeet v2 (about 730 MB, checksum verified)…")
             m = models.download(self.paths.data_dir / "models", self._progress("downloading"))
             self._use_model(m)
-            self._notify(f"Parakeet v2 downloaded. Press {self.cfg.hotkey} to dictate.")
+            self._note(f"Parakeet v2 downloaded. Press {self.cfg.hotkey} to dictate.")
         self._model_thread(job)
 
     def add_model_file(self) -> None:
@@ -549,7 +549,7 @@ class App:
             return True
         self._use_model(m, apply=False)      # remembered, so the reload below keeps it picked
         err = self.reload_if_changed(force=True)
-        self._notify(err or f"Now using {m.name} ({m.languages_label()}).")
+        (self._notify if err else self._note)(err or f"Now using {m.name} ({m.languages_label()}).")
         self._refresh()
         return True
 
@@ -709,7 +709,7 @@ class App:
 
     def copy_last(self) -> None:
         if not self.last_text:
-            self._notify("Nothing dictated yet.")
+            self._nothing_to_do("Nothing dictated yet.")
             return
         try:
             output.copy_to_clipboard(self.last_text)
@@ -721,7 +721,7 @@ class App:
 
     def correct_last(self) -> None:
         if not self.last_text:
-            self._notify("Nothing dictated yet.")
+            self._nothing_to_do("Nothing dictated yet.")
             return
         try:
             correct.launch(self.last_text, self.paths.data_dir)
@@ -757,7 +757,7 @@ class App:
         if p is not None and p.poll() is None:
             return
         if not len(h):
-            self._notify("No dictations in the history yet.")
+            self._nothing_to_do("No dictations in the history yet.")
             return
         data = self.paths.data_dir
         hist.drop_requests(data)    # left by a window that crashed before reading them
@@ -817,7 +817,7 @@ class App:
             self.search_model()
         elif action == "free_memory":
             self.engine.unload()
-            self._notify("Model memory freed.")
+            self._note("Model memory freed.")
         elif action == "download_model":
             self.download_model()
 
@@ -847,7 +847,7 @@ class App:
                 changed = False
             if changed:
                 err = self.reload_if_changed(force=True)
-                self._notify(err or "Settings saved.")
+                (self._notify if err else self._note)(err or "Settings saved.")
                 self._refresh()
             for action in self._settings_actions():
                 self._run_settings_action(action)
@@ -867,10 +867,11 @@ class App:
                 return
             if self.state == "moving":       # never dictate while the pill can take the focus
                 self._end_move_locked(save=True)
-                self._notify(f"Pill position saved. Press {self.cfg.hotkey} again to dictate.")
+                self._note(f"Pill position saved. Press {self.cfg.hotkey} again to dictate.")
                 return
             if self.overlay is not None and self.overlay.is_foreground():
-                self._notify("Click the window you want to type into, then press the hotkey again.")
+                self._note("Click the window you want to type into, then press the hotkey again.")
+                self.overlay.flash("Click where the text should go", MUTED, 1500)   # the pill is in front
                 self.sounds.play("error")
                 return
             problem = self.reload_if_changed()
@@ -888,8 +889,10 @@ class App:
                 self._notify(f"Microphone could not be opened: {e}")
                 self.sounds.play("error")
                 return
-            if self.recorder.warning:   # chosen microphone missing; recording from the default instead
-                self._notify(self.recorder.warning)
+            warning = self.recorder.warning   # chosen microphone missing; recording from the default instead
+            if warning and warning != getattr(self, "_mic_warning_shown", None):
+                self._notify(warning)         # once, not at every dictation while it stays unplugged
+            self._mic_warning_shown = warning
             self.state = "recording"
             log.info("recording started at %d Hz", self.recorder.rate)
             self._session += 1
@@ -921,7 +924,7 @@ class App:
         deadline = t0 + self.cfg.max_seconds
         vk = self.hotkeys.vk
         rec = self.recorder
-        reason = ""
+        reason, quiet = "", False
         while key_down(vk) and time.monotonic() < deadline:
             time.sleep(0.02)
             if self._session != session or self.state != "recording":
@@ -944,6 +947,7 @@ class App:
                 reason = MIC_LOST
             elif silence_stop_due(rec.meter.last_speech_at, rec.started_at, now, self.cfg.silence_stop_seconds):
                 reason = silence_stop_message(self.cfg.silence_stop_seconds)
+                quiet = True   # you stopped talking: nothing lost, so no Windows notification
             else:
                 time.sleep(0.25)
                 if self._session != session or self.state != "recording":
@@ -951,7 +955,7 @@ class App:
         with self._lock:
             if self._session == session and self.state == "recording":
                 log.info("auto stop: %s", reason)
-                self._notify(reason)
+                (self._note if quiet else self._notify)(reason)
                 self._finish_locked()
 
     def stop_from_voice(self, sid: int) -> None:
@@ -1116,7 +1120,7 @@ class App:
             if self.cfg.log_transcripts:
                 log.info("retry raw: %r | clean: %r", raw, text)
             if not text:
-                self._notify("Retried: no speech heard in the kept recording.")
+                self._note("Retried: no speech heard in the kept recording.")
                 if self.overlay:
                     self.overlay.flash("No speech heard", MUTED, 1200)
                 return
@@ -1200,7 +1204,7 @@ class App:
             if (self.state == "idle" and getattr(self.cfg, "overlay_style", "pill") == "button"
                     and getattr(self.cfg, "overlay_always", False)):
                 self.overlay.hide()     # the always-on button moves back at once (shows Ready there)
-        self._notify("Back at its usual place.")
+        self._note("Back at its usual place.")
         self._refresh()
 
     # --- tray -------------------------------------------------------------------------------------
@@ -1236,7 +1240,21 @@ class App:
         except Exception:
             pass
 
+    # Windows notifications are only for something that went wrong or needs you to act (a failed
+    # transcription, text left on the clipboard, a missing microphone, a bad setting). Everything that
+    # just confirms what you did, or what the tray icon / pill already shows, goes to the log only.
+
+    def _note(self, message: str) -> None:
+        """Log only: no Windows notification."""
+        log.info(message)
+
+    def _nothing_to_do(self, message: str) -> None:
+        """A shortcut pressed with nothing to act on: the error sound, no notification."""
+        self._note(message)
+        self.sounds.play("error")
+
     def _notify(self, message: str) -> None:
+        """A Windows notification, for problems only (see above)."""
         log.warning(message)
         if self.icon is not None:
             try:
@@ -1317,7 +1335,10 @@ class App:
             icon.visible = True
             self._refresh()
             first = hotkey_error or self.problem
-            self._notify(first or f"Ready. Press {self.cfg.hotkey} to dictate.")
+            if first:
+                self._notify(first)
+            else:
+                self._note(f"Ready. Press {self.cfg.hotkey} to dictate.")   # no pop-up at every start
             self.context.refresh()   # first look at the [context] folders, in the background
             winutil.trim_working_set()
 

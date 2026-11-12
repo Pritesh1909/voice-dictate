@@ -281,6 +281,10 @@ class FakePill:
         self.on_end = None
         self.ends = []
         self.foreground = False
+        self.flashes = []
+
+    def flash(self, text, colour, ms):
+        self.flashes.append(text)
 
     def start_move(self, on_end):
         self.on_end = on_end
@@ -302,8 +306,9 @@ def make_app(tmp_path):
     app.overlay = FakePill()
     app.cfg = types.SimpleNamespace(hotkey="ctrl+q")
     app.sounds = types.SimpleNamespace(play=lambda name: app.sounds_played.append(name))
-    app.sounds_played, app.notes = [], []
+    app.sounds_played, app.notes, app.quiet = [], [], []
     app._notify = app.notes.append
+    app._note = app.quiet.append
     app.failed = None
     app.recorder = types.SimpleNamespace(start=lambda: pytest.fail("a dictation must not start"))
     return app
@@ -333,7 +338,7 @@ def test_hotkey_while_moving_ends_move_mode_and_does_not_dictate(tmp_path):
     app.move_pill()
     app._on_hotkey()                         # recorder.start would fail the test
     assert app.overlay.ends == [True] and wait_idle(app)
-    assert "again to dictate" in app.notes[-1]
+    assert "again to dictate" in app.quiet[-1] and app.notes == []   # logged, no Windows notification
 
 
 def test_no_dictation_while_the_pill_has_the_focus(tmp_path):
@@ -341,6 +346,7 @@ def test_no_dictation_while_the_pill_has_the_focus(tmp_path):
     app.overlay.foreground = True
     app._on_hotkey()
     assert app.sounds_played == ["error"] and app.state == "idle"
+    assert app.overlay.flashes == ["Click where the text should go"] and app.notes == []   # said on the pill
 
 
 def test_move_only_from_idle_and_retry_blocked_while_moving(tmp_path):

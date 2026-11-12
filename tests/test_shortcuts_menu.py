@@ -74,8 +74,10 @@ def _app(tmp_path, **cfg):
     app.last_text, app.failed, app.state, app.model, app.model_job = "", None, "idle", object(), ""
     app.overlay, app.icon, app.problem = None, None, None
     app.engine = types.SimpleNamespace(state="unloaded", unload=lambda: app.calls.append("unload"))
-    app.notes, app.calls = [], []
+    app.notes, app.calls, app.quiet, app.sounds_played = [], [], [], []
     app._notify = app.notes.append
+    app._note = app.quiet.append
+    app.sounds = types.SimpleNamespace(play=app.sounds_played.append)
     app._status_text = lambda: "Ready"
     for name in ("move_pill", "search_model", "reset_pill_position", "download_model"):
         setattr(app, name, (lambda n: lambda: app.calls.append(n))(name))
@@ -107,7 +109,9 @@ def test_copy_last_shortcut(tmp_path, monkeypatch):
     monkeypatch.setattr(output, "copy_to_clipboard", copied.append)
     app = _app(tmp_path)
     app.copy_last()
-    assert copied == [] and app.notes == ["Nothing dictated yet."]
+    # nothing to copy: the error sound, no Windows notification
+    assert copied == [] and app.notes == [] and app.quiet == ["Nothing dictated yet."]
+    assert app.sounds_played == ["error"]
     app.last_text = "Deploy core first."
     app.copy_last()
     assert copied == ["Deploy core first."]
