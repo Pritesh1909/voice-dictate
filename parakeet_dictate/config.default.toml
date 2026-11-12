@@ -1,0 +1,105 @@
+# Parakeet Dictate settings.
+# Edit and save. Changes are picked up at the start of the next dictation, or right away with
+# "Reload settings" in the tray menu.
+
+[hotkey]
+# Tap once to start and again to stop, OR hold the keys while you talk and let go to stop.
+keys = "ctrl+q"
+# Holding longer than this many seconds counts as "hold to talk".
+hold_threshold = 0.4
+# Esc cancels a recording without typing anything.
+esc_cancels = true
+
+[model]
+# Speech model (a .gguf file, the format Orca uses). "auto" finds every one already on this PC: Orca's
+# downloads, other apps' model folders, or inside a WSL Linux distribution (copied to this PC once so it
+# loads fast). New models you download in Orca (Parakeet v3, Whisper, ...) are found automatically;
+# pick one in the tray menu under "Model". Parakeet TDT v2 (English) is preferred when there is a choice.
+# If none is found, the tray menu offers to download Orca's Parakeet v2 (~730 MB, checksum verified).
+# Or put a .gguf file or folder here, e.g. "%APPDATA%\\orca\\speech-models\\parakeet-tdt-0.6b-v2-int8".
+# Models are only ever read, never changed.
+dir = "auto"
+# Where the model runs. "auto" = graphics card if there is one (NVIDIA RTX 2050 here: 16 s of speech in
+# 0.3 s), else the CPU (~4.5 s). "gpu" = discrete card, "igpu" = built-in Intel graphics, "cpu" = CPU.
+# If the chosen device fails, the CPU is used instead.
+device = "auto"
+# CPU threads used while transcribing on the CPU. 4 was the fastest on this laptop (i7-1260P).
+threads = 4
+# The model needs ~700 MB while loaded. It starts loading when you press the hotkey (while you are
+# still talking) and its process is shut down this many seconds after a dictation ends, which gives
+# all of that memory back to Windows. A new dictation within this time starts instantly.
+# 0 = free it right after each dictation, -1 = keep it loaded.
+unload_after_seconds = 30
+# Transcribe what you've said so far at each pause while you keep talking, so only the last part is
+# left when you stop (text appears almost immediately). false = transcribe everything after you stop.
+process_while_speaking = true
+# A pause at least this long (seconds) ends a phrase, which is then transcribed in the background.
+# Shorter = text sooner but more risk of splitting a sentence. 0.6 is what Orca uses with its voice detector.
+pause_seconds = 0.6
+# Voice detector that decides where phrases start and end (Silero VAD, the ~1 MB file Orca downloads
+# next to its speech models). Much better than a loudness level at telling speech from keyboard and fan
+# noise, and it keeps 0.4 s before each phrase so first words aren't clipped.
+# "auto" = find it on this PC; "off" = use the simple loudness detector; or the path of a .gguf file.
+# If it can't be found or fails, the loudness detector is used.
+vad = "auto"
+
+[accuracy]
+# Words and names the model should prefer. Only used by models that support it (transcribe.cpp's
+# Parakeet does not, so for Parakeet the [cleanup.replacements] below do this job). Only add words the
+# model actually gets WRONG.
+hotwords = ["Keycloak", "Inkfree", "Mailzzy", "SoftSages", "CodeCommit"]
+# Clean the recording before transcribing: remove DC offset, trim silence, raise quiet speech.
+normalize_audio = true
+
+[cleanup]
+# Removed when they appear as a whole word. Each letter may be stretched: "uh" also removes
+# "uhh", "ah" also removes "AHH", "hm" also removes "hmm". "uh-huh" is never touched.
+fillers = ["uh", "um", "uhm", "ah", "er", "erm", "eh", "hm", "mm"]
+# Collapse stutters such as "the the" or "I, I".
+remove_repeated_words = true
+# Words that can legitimately repeat ("he had had enough").
+repeated_words_allowed = ["that", "had"]
+
+# Exact fixes applied after transcription. Whole words only, not case sensitive.
+# Usually [dictionary] below is the better place; use this only for fixes that aren't a name or term.
+[cleanup.replacements]
+
+[dictionary]
+# Names and code terms spelled your way. Each one also fixes the spacing, hyphens and capitals the model
+# hears it with: "Keycloak" fixes "key cloak", "Key-Cloak" and "KEYCLOAK"; "useAudioCapture" fixes
+# "use audio capture". Only add words the model actually gets wrong.
+terms = ["Keycloak", "Inkfree", "SoftSages", "CodeCommit", "Flyway", "DataGrip", "Postgres"]
+
+# "Heard as": what the model writes when it mishears a term in a way the spelling alone can't fix.
+# Spacing and capitals don't matter here either ("mail sey" also covers "Mail-Sey" and "mailsey").
+[dictionary.heard_as]
+"Mailzzy" = ["mail te", "mail sey", "mail say", "mail sea", "mailsy", "mail zee", "mailzy", "mail z", "mail c", "mail tc"]
+
+[output]
+# "type" sends the text as keystrokes and leaves the clipboard alone.
+# "paste" puts it on the clipboard, presses Ctrl+V, then restores what was on the clipboard.
+method = "type"
+# Type each phrase as soon as it is transcribed, while you keep talking (needs process_while_speaking).
+# Nothing is typed while Ctrl/Alt/Shift/Win is held (hold-to-talk), so letters never turn into shortcuts;
+# those phrases are typed the moment you let go. Esc stops the recording but keeps what was already typed.
+# false = type everything at once after you stop.
+type_while_speaking = true
+# Add a space after each dictation so the next one doesn't stick to it.
+add_trailing_space = true
+# Short beeps when recording starts / stops / is cancelled.
+sounds = true
+# Stop automatically after this many seconds.
+max_seconds = 180
+# Write the recognised text to the log file. Off by default: dictation can contain sensitive text.
+log_transcripts = false
+
+[overlay]
+# Small "Listening / Transcribing / Typed" pill on top of all windows, on the screen you're working on.
+# It never takes focus and clicks pass through it.
+enabled = true
+# "bottom" or "top" of the screen.
+position = "bottom"
+
+[audio]
+# Part of the microphone's name, e.g. "Headset". Empty = the Windows default input.
+input_device = ""

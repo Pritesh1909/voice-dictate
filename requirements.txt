@@ -1,0 +1,11 @@
+# Speech engine: transcribe.cpp, the same engine and version Orca uses (GGUF models, CPU + Vulkan GPU).
+# Runs only in the short-lived model process. The -native package carries the DLLs.
+transcribe-cpp==0.4.1
+transcribe-cpp-native==0.4.1
+# Microphone capture (PortAudio), opened only while recording.
+sounddevice==0.5.6
+numpy==2.5.4
+# Tray icon (plain Win32, no GUI toolkit) + icon drawing.
+pystray==0.19.5
+Pillow==13.0.0
+pytest>=8.0
