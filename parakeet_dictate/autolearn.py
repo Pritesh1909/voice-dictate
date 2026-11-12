@@ -10,7 +10,15 @@ Files:
 - learning_dir/state.lock    the cross-process lock (an exclusive msvcrt lock on its first byte)
 - learning_dir/checked.jsonl one row per checked recording (each row has an "id"), the last 5000 kept
 - learned_auto_file          the active fixes in the shape of learned.toml, written from state.json after
-                             every change; the [meta."<entry key>"] tables are ignored by learn.load
+                             every change; the [meta."<entry key>"] tables and the [never] table (a copy
+                             of the never-learn list) are ignored by learn.load
+
+The two live in folders with different lifetimes: state.json in %LOCALAPPDATA% (the uninstaller deletes
+it), learned_auto.toml in %APPDATA% (kept). So learned_auto.toml is also the backup: its never-learn list
+is always merged back into what is read, and when state.json is missing, damaged or has no active fix
+while the toml still has some, the active fixes are rebuilt from it (without the never-learn ones). The
+toml is re-synced from state.json by sync() (the checker calls it at the start of every run) and by
+every write of the fixes, so an undo whose toml write failed stops being applied.
 
 Damaged files never raise: state.json (or a damaged part of it) starts from empty with a warning, and
 the next write replaces it. A file that cannot be read at all (an I/O error such as PermissionError) is
@@ -25,6 +33,7 @@ import logging
 import msvcrt
 import os
 import time
+import tomllib
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,7 +54,7 @@ RECS_KEPT = 20            # recording ids remembered per active fix, to count on
 
 HEADER = ("# Fixes learned automatically by Parakeet Dictate (background learning).\n"
           "# The app rewrites this file whenever a fix is learned or undone. Undo fixes in Settings;\n"
-          "# the [meta] tables are bookkeeping and are ignored when the dictionary is loaded.\n")
+          "# the [never] and [meta] tables are bookkeeping and are ignored when the dictionary is loaded.\n")
 
 _T = TypeVar("_T")
 
@@ -133,13 +142,49 @@ def _write(path: Path, text: str) -> None:
     _retry(lambda: os.replace(tmp, path))
 
 
-def _toml(active: dict) -> str:
+def _toml(active: dict, never: list[str]) -> str:
     entries = [(a["term"], a["heard_as"]) for a in active.values()]
     lines = [HEADER + learn.dumps(entries).removeprefix(learn.HEADER).rstrip("\n")]
+    if never:
+        lines += ["", "[never]", "keys = [" + ", ".join(_q(k) for k in never) + "]"]
     for key, a in active.items():
         lines += ["", f"[meta.{_q(key)}]", f"first_learned = {_q(a['first_learned'])}",
                   f"seen = {a['seen']}", f"example = {_q(a['example'])}"]
     return "\n".join(lines) + "\n"
+
+
+def _from_toml(d: dict) -> tuple[dict, list[str]]:
+    """The active fixes (in state.json's shape, in the order they were written: the [meta] tables') and the
+    never-learn keys kept in a parsed learned_auto.toml. Damaged parts are left out, never an error."""
+    meta = d.get("meta")
+    meta = meta if isinstance(meta, dict) else {}
+    found: list[Entry] = []
+    sec = d.get("dictionary")
+    if isinstance(sec, dict):
+        terms = sec.get("terms")
+        found += [(t, "") for t in terms if isinstance(t, str)] if isinstance(terms, list) else []
+        heard = sec.get("heard_as")
+        for term, v in heard.items() if isinstance(heard, dict) else ():
+            if entry_key((term, "")) in meta:   # a term-only fix next to a heard_as one has no line of its own
+                found.append((term, ""))
+            spellings = [v] if isinstance(v, str) else v if isinstance(v, list) else []
+            found += [(term, x) for x in spellings if isinstance(x, str)]
+    by_key: dict[str, Entry] = {}
+    for e in found:
+        n = _norm(e)
+        if n is not None:
+            by_key.setdefault(entry_key(n), n)
+    active = {}
+    for key in [*(k for k in meta if k in by_key), *(k for k in by_key if k not in meta)]:
+        m = meta.get(key)
+        m = m if isinstance(m, dict) else {}
+        term, heard_as = by_key[key]
+        active[key] = {"term": term, "heard_as": heard_as, "recs": [], "example": _text(m.get("example")) or "",
+                       "first_learned": _text(m.get("first_learned")) or "",
+                       "seen": _count(m.get("seen")) or SIGHTINGS_TO_ACTIVATE}
+    never = d.get("never")
+    keys = never.get("keys") if isinstance(never, dict) else None
+    return active, [k for k in keys if isinstance(k, str)] if isinstance(keys, list) else []
 
 
 def _norm(e: Entry) -> Entry | None:
@@ -187,16 +232,52 @@ class Store:
                 msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
 
     def _load(self) -> dict:
-        """state.json as it is on disk, for a read-modify-write. A missing file or damaged content is an
-        empty state; an I/O error propagates, so a write never replaces a state it could not read."""
+        """state.json as it is on disk, with what learned_auto.toml keeps merged back (_merge_toml), for a
+        read-modify-write. A missing file or damaged content is an empty state; an I/O error propagates,
+        so a write never replaces a state it could not read."""
+        return self._load_merged()[0]
+
+    def _load_merged(self) -> tuple[dict, bool]:
+        """_load, and whether learned_auto.toml added something state.json didn't have."""
         try:
             raw = json.loads(_retry(lambda: self._state_file.read_text("utf-8")))
         except FileNotFoundError:
-            return _empty()
+            st = _empty()
         except (ValueError, RecursionError) as e:   # ValueError: bad JSON or bad UTF-8
             log.warning("learning state not loaded (%s), starting empty: %s", self._state_file.name, e)
-            return _empty()
-        return _clean(raw)
+            st = _empty()
+        else:
+            st = _clean(raw)
+        return st, self._merge_toml(st)
+
+    def _read_toml(self) -> bytes | None:
+        """learned_auto.toml's bytes, None when it is missing; an I/O error propagates."""
+        try:
+            return _retry(self.learned_auto_file.read_bytes)
+        except FileNotFoundError:
+            return None
+
+    def _merge_toml(self, st: dict) -> bool:
+        """Merge learned_auto.toml's never-learn list into st, and when st has no active fix, take back the
+        ones the toml still has (a lost or damaged state.json), except those on the never-learn list.
+        True when st changed. A damaged toml adds nothing."""
+        data = self._read_toml()
+        if data is None:
+            return False
+        try:
+            active, never = _from_toml(tomllib.loads(data.decode("utf-8-sig")))
+        except (ValueError, RecursionError) as e:   # ValueError: bad TOML or bad UTF-8
+            log.warning("learned fixes not read (%s): %s", self.learned_auto_file.name, e)
+            return False
+        added = [k for k in never if k not in st["never"]]
+        st["never"] += added
+        taken = {} if st["active"] else {k: a for k, a in active.items() if k not in st["never"]}
+        if taken:
+            log.info("learning state: %d fix(es) taken back from %s", len(taken), self.learned_auto_file.name)
+            st["active"] = taken
+            for key in taken:
+                st["pending"].pop(key, None)
+        return bool(added or taken)
 
     def _peek(self) -> dict:
         """_load for the read-only methods: a file that cannot be read shows as empty instead of raising."""
@@ -212,7 +293,27 @@ class Store:
     def _save(self, st: dict) -> None:
         """state.json first (the truth), then learned_auto.toml made from it."""
         self._save_state(st)
-        _write(self.learned_auto_file, _toml(st["active"]))
+        self._sync_toml(st)
+
+    def _sync_toml(self, st: dict) -> bool:
+        """Write learned_auto.toml from st when it is out of date (only then: the tray reloads its clean-up
+        when the file changes); True when it was written. A missing toml with nothing to say stays missing."""
+        text = _toml(st["active"], st["never"])
+        current = self._read_toml()
+        if current == text.encode("utf-8") or (current is None and not st["active"] and not st["never"]):
+            return False
+        _write(self.learned_auto_file, text)
+        return True
+
+    def sync(self) -> None:
+        """Make learned_auto.toml match state.json again, and save to state.json what was taken back from
+        the toml. The checker calls this at the start of every run. Raises OSError or TimeoutError."""
+        with self.lock():
+            st, merged = self._load_merged()
+            if merged:
+                self._save_state(st)
+            if self._sync_toml(st):
+                log.info("learned fixes written again from the learning state (%s)", self.learned_auto_file.name)
 
     # --- fixes -----------------------------------------------------------------------------------
 
@@ -224,10 +325,9 @@ class Store:
         list or clashing with a user entry (same heard_as spelling, different term) is dropped."""
         user = _spelling_keys(user_entries)
         with self.lock():
-            st = self._load()
+            st, changed = self._load_merged()   # what the toml gave back is saved too
             never = set(st["never"])
             became: list[AutoFix] = []
-            changed = False
             for p in proposals:
                 e = _norm(p.entry) if p.checked else None
                 if e is None:
@@ -258,6 +358,8 @@ class Store:
                     became.append(AutoFix(e[0], e[1], now, len(cand["recs"]), cand["example"]))
             if changed:
                 self._save(st)
+            else:
+                self._sync_toml(st)   # a toml left behind by a failed write is put right here too
             return became
 
     def active(self) -> list[AutoFix]:

@@ -112,6 +112,10 @@ class Checker:
         if today != self._day:
             self._day, self._waiting_for_claude = today, set()
         self._checked = self._learned = 0
+        try:
+            self._store.sync()   # an undo whose learned_auto.toml write failed stops being applied
+        except (OSError, TimeoutError) as e:
+            log.warning("background check: learned fixes not re-synced: %s", e)
         engine = None
         try:
             todo = self._unchecked()

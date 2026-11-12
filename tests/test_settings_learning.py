@@ -273,6 +273,27 @@ def test_undo_while_the_checker_holds_the_lock_gives_up_politely(window, auto, m
     assert auto.active() == [] and "mail sey" in window.msg.cget("text")
 
 
+@pytest.mark.parametrize("how", ["deleted", "damaged"])
+def test_fixes_still_listed_and_undoable_when_state_json_is_lost(window, auto, paths, how):
+    """An uninstall deletes %LOCALAPPDATA% (state.json) but keeps learned_auto.toml in %APPDATA%: the fixes
+    the tray still applies are listed, and Undo and Reset all still work."""
+    learn_fix(auto, MAILZZY)
+    learn_fix(auto, KEYCLOAK)
+    state = paths.learning_dir / "state.json"
+    state.unlink() if how == "deleted" else state.write_text("{half", "utf-8")
+    c = learned(window)
+    assert texts(c.frame)[1:] == [
+        "mail sey → Mailzzy", "2026-11-12", "seen ×2", "Undo",
+        "key cloak → Keycloak", "2026-11-12", "seen ×2", "Undo",
+        "Reset all"]
+    assert buttons(c.frame, "Reset all")[0].instate(["!disabled"])
+    buttons(c.frame, "Undo")[0].invoke()
+    assert [(f.term, f.heard_as) for f in auto.active()] == [KEYCLOAK]
+    assert learn.load(paths.learned_auto_file) == [("Keycloak", ""), KEYCLOAK]
+    learn_fix(auto, MAILZZY, recs=("rec-8", "rec-9"))                    # undone stays undone
+    assert [(f.term, f.heard_as) for f in auto.active()] == [KEYCLOAK]
+
+
 def test_damaged_learning_files_show_as_empty(window, paths):
     paths.learning_dir.mkdir(parents=True)
     (paths.learning_dir / "state.json").write_text("{not json", "utf-8")

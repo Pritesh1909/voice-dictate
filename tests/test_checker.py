@@ -415,6 +415,26 @@ def test_claude_that_ran_and_failed_is_counted(env):
     assert env["store"].claude_calls_today(TODAY) == 1
 
 
+def test_each_run_first_resyncs_learned_auto_toml(env, monkeypatch):
+    """So an undo whose learned_auto.toml write failed stops being applied by the next idle check."""
+    calls = []
+    monkeypatch.setattr(env["store"], "sync", lambda: calls.append(1))
+    assert env["make"]().run(never_stop) == "nothing to check"
+    assert calls == [1]
+
+
+@pytest.mark.parametrize("error", [OSError("learned_auto.toml: access denied"), TimeoutError("locked")])
+def test_a_failed_resync_is_only_logged(env, monkeypatch, caplog, error):
+    def fail():
+        raise error
+
+    monkeypatch.setattr(env["store"], "sync", fail)
+    env["add"]("Send the campaign.")
+    summary = env["make"](whisper="send the campaign").run(never_stop)
+    assert not summary.startswith("error") and len(env["rows"]()) == 1
+    assert str(error) in caplog.text
+
+
 def test_missing_audio_is_checked_once(env):
     rec_id = env["add"]("Send the campaign.")
     (env["tmp"] / "recordings" / f"{rec_id}.wav").write_bytes(b"RIFF....")   # truncated
