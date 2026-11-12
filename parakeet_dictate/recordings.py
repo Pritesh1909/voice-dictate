@@ -9,9 +9,10 @@ Both files are written atomically (name.tmp, then os.replace) and the .json goes
 has a complete .wav next to it. A crash between the two leaves a .wav alone, which list_records ignores
 and prune clears.
 
-Only files named like a new_id are ever pruned or deleted here, so anything else a user (or another part
-of the app) puts in the folder is left alone. Damaged files never raise: list_records skips them and
-load_audio returns None.
+An id is always a new_id: save refuses any other, and list_records, load_audio, prune and delete_all only
+see files named that way. So everything listed is also pruned and deleted, and anything else a user (or
+another part of the app) puts in the folder is left alone. Damaged files never raise: list_records skips
+them and load_audio returns None.
 """
 from __future__ import annotations
 
@@ -31,8 +32,9 @@ from .audio import SR
 log = logging.getLogger(__name__)
 
 _ID_FORMAT = "%Y%m%d-%H%M%S-%f"
+_ID_SHAPE = re.compile(r"\d{8}-\d{6}-\d{6}")
 # <id>.wav / <id>.json, plus their .tmp forms left behind by a crash mid-save
-_FILE = re.compile(r"^(\d{8}-\d{6}-\d{6})\.(?:wav|json)(?:\.tmp)?$")
+_FILE = re.compile(r"(.+?)\.(?:wav|json)(?:\.tmp)?")
 _MB = 1024 * 1024
 
 
@@ -50,6 +52,16 @@ class Record:
 
 def new_id(now: datetime) -> str:
     return now.strftime(_ID_FORMAT)
+
+
+def _id_time(id: str) -> datetime | None:
+    """When a recording id was made, or None if it is not a new_id (so not a name this module may touch)."""
+    if not _ID_SHAPE.fullmatch(id):
+        return None
+    try:
+        return datetime.strptime(id, _ID_FORMAT)
+    except ValueError:   # right shape, not a real date
+        return None
 
 
 def _write_atomically(path: Path, write) -> None:
@@ -74,7 +86,12 @@ def _write_wav(path: Path, audio16k: np.ndarray) -> None:
 
 
 def save(dir: Path, audio16k: np.ndarray, rec: Record) -> None:
-    """Write <id>.wav, then <id>.json (last, so it never points at a missing or partial wav)."""
+    """Write <id>.wav, then <id>.json (last, so it never points at a missing or partial wav).
+
+    Raises ValueError if rec.id is not a new_id: any other name could not be listed, pruned or deleted
+    (or, with path separators in it, would land outside dir)."""
+    if _id_time(rec.id) is None:
+        raise ValueError(f"not a recording id (use new_id): {rec.id!r}")
     dir.mkdir(parents=True, exist_ok=True)
     _write_atomically(dir / f"{rec.id}.wav", lambda tmp: _write_wav(tmp, audio16k))
     _write_atomically(dir / f"{rec.id}.json",
@@ -83,6 +100,8 @@ def save(dir: Path, audio16k: np.ndarray, rec: Record) -> None:
 
 def _read_record(path: Path) -> Record | None:
     """The Record in a .json, or None if it is damaged, incomplete or named for a different id."""
+    if _id_time(path.stem) is None:
+        return None
     try:
         data = json.loads(path.read_text("utf-8"))
         rec = Record(**{f.name: data[f.name] for f in fields(Record)})
@@ -105,7 +124,10 @@ def list_records(dir: Path) -> list[Record]:
 
 
 def load_audio(dir: Path, id: str) -> np.ndarray | None:
-    """The recording as float32 in [-1, 1] at 16 kHz, or None if the wav is missing, truncated or foreign."""
+    """The recording as float32 in [-1, 1] at 16 kHz, or None if the wav is missing, truncated or foreign
+    (or id is not a new_id)."""
+    if _id_time(id) is None:
+        return None
     try:
         with wave.open(str(dir / f"{id}.wav")) as w:
             if (w.getnchannels(), w.getsampwidth(), w.getframerate()) != (1, 2, SR):
@@ -123,8 +145,8 @@ def _groups(dir: Path) -> dict[str, list[Path]]:
     """Recording files in the folder, grouped by id (a recording is its .wav and .json, plus any .tmp)."""
     groups: dict[str, list[Path]] = {}
     for path in dir.iterdir() if dir.is_dir() else []:
-        m = _FILE.match(path.name)
-        if m and path.is_file():
+        m = _FILE.fullmatch(path.name)
+        if m and _id_time(m.group(1)) is not None and path.is_file():
             groups.setdefault(m.group(1), []).append(path)
     return groups
 
@@ -156,11 +178,7 @@ def prune(dir: Path, keep_days: int, max_mb: int, now: datetime) -> int:
     groups = _groups(dir)
     deleted = 0
     for id in sorted(groups):   # ids sort by time, so this is oldest first
-        try:
-            age = now - datetime.strptime(id, _ID_FORMAT)
-        except ValueError:      # looks like an id but is not a real date
-            continue
-        if age > timedelta(days=keep_days) and _delete(groups[id]):
+        if now - _id_time(id) > timedelta(days=keep_days) and _delete(groups[id]):
             del groups[id]
             deleted += 1
     sizes = {id: sum(_size(p) for p in files) for id, files in groups.items()}

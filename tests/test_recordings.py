@@ -1,5 +1,7 @@
+import json
 import os
 import wave
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -165,17 +167,61 @@ def test_truncated_wav_returns_none(tmp_path, keep):
 
 
 def test_load_audio_rejects_missing_garbage_and_foreign_formats(tmp_path):
-    assert recordings.load_audio(tmp_path, "missing") is None
-    (tmp_path / "junk.wav").write_bytes(b"this is not a wav file at all, just text" * 5)
-    assert recordings.load_audio(tmp_path, "junk") is None
-    with wave.open(str(tmp_path / "stereo.wav"), "wb") as w:
+    junk, stereo, cd, missing = (recordings.new_id(NOW - timedelta(minutes=m)) for m in range(4))
+    assert recordings.load_audio(tmp_path, missing) is None
+    (tmp_path / f"{junk}.wav").write_bytes(b"this is not a wav file at all, just text" * 5)
+    with wave.open(str(tmp_path / f"{stereo}.wav"), "wb") as w:
         w.setnchannels(2), w.setsampwidth(2), w.setframerate(SR)
         w.writeframes(b"\0" * 400)
-    with wave.open(str(tmp_path / "cd.wav"), "wb") as w:
+    with wave.open(str(tmp_path / f"{cd}.wav"), "wb") as w:
         w.setnchannels(1), w.setsampwidth(2), w.setframerate(44100)
         w.writeframes(b"\0" * 400)
-    assert recordings.load_audio(tmp_path, "stereo") is None
-    assert recordings.load_audio(tmp_path, "cd") is None
+    for i in (junk, stereo, cd):
+        assert recordings.load_audio(tmp_path, i) is None
+
+
+BAD_IDS = ["r1", "..\\x", "../x", "sub/20260101-000000-000000", "20260101-000000-000000\n",
+           "20261399-000000-000000", "20260101-000000", ""]
+
+
+@pytest.mark.parametrize("bad", BAD_IDS)
+def test_save_rejects_an_id_that_is_not_a_new_id(tmp_path, bad):
+    folder = tmp_path / "recordings"
+    with pytest.raises(ValueError):
+        recordings.save(folder, tone(0.1), rec_at(NOW, id=bad))
+    assert not folder.exists()                       # nothing created, and nothing written next to it either
+    assert names(tmp_path) == []
+
+
+def test_list_records_ignores_a_json_not_named_like_a_new_id(tmp_path):
+    good = rec_at(NOW - timedelta(hours=1))
+    recordings.save(tmp_path, tone(0.1), good)
+    wav_bytes = (tmp_path / f"{good.id}.wav").read_bytes()
+
+    def planted(name, rec):                           # a complete, valid-looking pair under any name
+        (tmp_path / f"{name}.wav").write_bytes(wav_bytes)
+        (tmp_path / f"{name}.json").write_text(json.dumps(asdict(rec)), "utf-8")
+
+    planted("r1", rec_at(NOW, id="r1"))
+    planted("backup-copy", rec_at(NOW, id="backup-copy"))
+    other = recordings.new_id(NOW - timedelta(hours=2))
+    planted(other, rec_at(NOW, id="r1"))              # right file name, but the record inside says otherwise
+
+    assert recordings.list_records(tmp_path) == [good]
+    # ...and prune / delete_all leave exactly the same set alone, so nothing is shown that cannot be removed
+    assert recordings.delete_all(tmp_path) == 2       # the good one, and the mismatched one (new_id-named)
+    assert names(tmp_path) == ["backup-copy.json", "backup-copy.wav", "r1.json", "r1.wav"]
+
+
+@pytest.mark.parametrize("bad", ["r1", "..\\outside", "../outside", ""])
+def test_load_audio_only_reads_new_id_names(tmp_path, bad):
+    folder = tmp_path / "recordings"
+    folder.mkdir()
+    for wav in (folder / "r1.wav", tmp_path / "outside.wav", folder / ".wav"):   # all perfectly readable files
+        with wave.open(str(wav), "wb") as w:
+            w.setnchannels(1), w.setsampwidth(2), w.setframerate(SR)
+            w.writeframes(b"\0" * 400)
+    assert recordings.load_audio(folder, bad) is None
 
 
 def test_delete_all_leaves_other_files(tmp_path):
