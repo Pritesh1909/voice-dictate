@@ -48,21 +48,23 @@ def _spelling(term: str) -> tuple[str, str, str]:
     return term, (m.group(1) if m else ""), (m.group(2) if m else "")
 
 
-def build(entries: Iterable[tuple[str, str]]) -> Callable[[str], str] | None:
-    """A function that respells dictated text, or None when there are no terms."""
+def build(entries: Iterable[tuple[str, str]],
+          ahead: Iterable[tuple[str, str]] = ()) -> Callable[[str], str] | None:
+    """A function that respells dictated text, or None when there are no terms. Entries in `ahead` (one
+    program's own terms) win over all of `entries`, even over a "heard as" there that keys the same."""
     by_key: dict[str, tuple[str, str, str]] = {}
     unspaced: list[tuple[str, str]] = []
-    terms = normalize_terms(entries)
-    # A "heard as" is what the user asked for, so it beats another term that keys the same.
-    for term, heard in terms:
-        if heard and _UNSPACED_RE.search(heard):
-            unspaced.append((heard, term))
-        elif heard:
-            by_key.setdefault(word_key(heard), _spelling(term))
-    for term, _ in terms:
-        k = word_key(term)
-        if k:
-            by_key.setdefault(k, _spelling(term))
+    for terms in (normalize_terms(ahead), normalize_terms(entries)):
+        # A "heard as" is what the user asked for, so it beats another term that keys the same.
+        for term, heard in terms:
+            if heard and _UNSPACED_RE.search(heard):
+                unspaced.append((heard, term))
+            elif heard:
+                by_key.setdefault(word_key(heard), _spelling(term))
+        for term, _ in terms:
+            k = word_key(term)
+            if k:
+                by_key.setdefault(k, _spelling(term))
     by_key.pop("", None)
     if not by_key and not unspaced:
         return None
