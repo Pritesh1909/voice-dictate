@@ -103,7 +103,7 @@ def make_app(tmp_path, monkeypatch, cfg_text=""):
     app.cfg_model_dir, app.cfg_model_folders = app.cfg.model_dir, app.cfg.model_folders
     app.model, app.found, app.problem, app.model_job, app.icon, app.overlay = None, [], None, "", None, None
     app.state, app._lock, app.learned, app.vad_path = "idle", threading.Lock(), [], None
-    app.hotkeys = types.SimpleNamespace(change=lambda keys: None)
+    app.hotkeys = types.SimpleNamespace(change=lambda keys: None, set_extras=lambda wanted: {})
     app.context = types.SimpleNamespace(configure=lambda *a: None, everywhere=())
     app.recorder = types.SimpleNamespace(device_hint="")
     app.sounds = types.SimpleNamespace(enabled=True, play=lambda name: None)

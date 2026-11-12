@@ -299,7 +299,8 @@ def test_tray_opens_one_window_and_reloads_when_it_closes(paths, monkeypatch):
     monkeypatch.setattr(settings_ui, "launch", lambda: launched.append(1) or Proc())
     fake = types.SimpleNamespace(paths=paths, _settings_proc=None, _notify=notes.append,
                                  reload_if_changed=lambda force=False: reloads.append(force),
-                                 _refresh=lambda: done.set())
+                                 _refresh=lambda: done.set(), _settings_actions=lambda: [],
+                                 _run_settings_action=lambda a: None)
     App.open_settings_window(fake)
     App.open_settings_window(fake)          # still open: no second window
     assert len(launched) == 1

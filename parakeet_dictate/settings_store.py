@@ -170,16 +170,21 @@ def same_hotkey(a: str, b: str) -> bool:
 
 
 def record_key(vk: int, mods: Iterable[str], current: str,
-               available: Callable[[str], bool] = hotkey.available) -> Recorded:
+               available: Callable[[str], bool] = hotkey.available,
+               default: str = DEFAULT_HOTKEY, others: dict[str, str] | None = None) -> Recorded:
     """What a key press means while the recorder listens. `mods` = modifiers held ("ctrl", "alt", "shift",
-    "win"); `current` = the shortcut the running tray app holds (not checked: it is ours)."""
+    "win"); `current` = the shortcut the running tray app holds for this action (not checked: it is ours).
+    `default` = what Backspace goes back to ("" = no shortcut, for the optional ones); `others` = the
+    other shortcuts {name: spec}, which this one may not repeat."""
     mods = set(mods)
     if vk in hotkey.MODIFIER_VKS:
         return Recorded("listen")
     if not mods and vk == 0x1B:
         return Recorded("cancel")
     if not mods and vk == 0x08:
-        return Recorded("set", DEFAULT_HOTKEY, f"Back to the default, {hotkey.display(DEFAULT_HOTKEY)}.")
+        if not default:
+            return Recorded("set", "", "No shortcut.")
+        return Recorded("set", default, f"Back to the default, {hotkey.display(default)}.")
     try:
         spec = hotkey.spec_for(mods, vk)
     except hotkey.HotkeyError as e:
@@ -190,6 +195,9 @@ def record_key(vk: int, mods: Iterable[str], current: str,
     problem = hotkey.check_combo(spec)
     if problem:
         return Recorded("error", spec, problem)
+    for name, other in (others or {}).items():
+        if other and same_hotkey(spec, other):
+            return Recorded("error", spec, f"{hotkey.display(spec)} is already the {name} shortcut.")
     if not same_hotkey(spec, current) and not available(spec):
         return Recorded("error", spec, f"{hotkey.display(spec)} is in use by another app. Pick another shortcut.")
     return Recorded("set", spec)

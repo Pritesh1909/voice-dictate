@@ -9,6 +9,11 @@ keys = "ctrl+q"
 hold_threshold = 0.4
 # Esc cancels a recording without typing anything.
 esc_cancels = true
+# More shortcuts, written like keys above (e.g. "ctrl+alt+c"); "" = none.
+# Copy the last dictation to the clipboard:
+copy_last = ""
+# Open "Correct last dictation", to fix a word and teach it to the dictionary:
+correct_last = ""
 
 [model]
 # Speech model (a .gguf file, the format Orca uses). "auto" finds every one already on this PC: Orca's
@@ -133,7 +138,7 @@ press_enter = false
 # Short beeps when recording starts / stops / is cancelled.
 sounds = true
 # Stop automatically after this many seconds.
-max_seconds = 180
+max_seconds = 360
 # Write the recognised text to the log file. Off by default: dictation can contain sensitive text.
 log_transcripts = false
 

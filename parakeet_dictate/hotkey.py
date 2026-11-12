@@ -22,7 +22,8 @@ _NAMED = {
     "divide": 0x6F, "oem102": 0xE2, **{f"num{i}": 0x60 + i for i in range(10)},
 }
 _ID_MAIN, _ID_ESC = 1, 2
-_MSG_ESC_ON, _MSG_ESC_OFF, _MSG_REREGISTER = WM_APP + 1, WM_APP + 2, WM_APP + 3
+_ID_EXTRA = 10       # extra shortcuts (copy last dictation, ...) use ids 10, 11, ...
+_MSG_ESC_ON, _MSG_ESC_OFF, _MSG_REREGISTER, _MSG_EXTRAS = WM_APP + 1, WM_APP + 2, WM_APP + 3, WM_APP + 4
 
 user32.RegisterHotKey.argtypes = [wt.HWND, ctypes.c_int, wt.UINT, wt.UINT]
 user32.UnregisterHotKey.argtypes = [wt.HWND, ctypes.c_int]
@@ -150,11 +151,15 @@ def key_down(vk: int) -> bool:
 class HotkeyThread(threading.Thread):
     """Owns the registrations and a message loop; callbacks run on this thread, so keep them short."""
 
-    def __init__(self, spec: str, on_press, on_cancel):
+    def __init__(self, spec: str, on_press, on_cancel, on_extra=None):
         super().__init__(daemon=True, name="hotkey")
         self.mods, self.vk = parse(spec)
         self.spec = spec
         self._on_press, self._on_cancel = on_press, on_cancel
+        self._on_extra = on_extra or (lambda name: None)
+        self._extras: dict[int, str] = {}                 # registered id -> name
+        self._extras_pending: dict[str, str] | None = None
+        self.extra_errors: dict[str, str] = {}
         self._tid = 0
         self._started = threading.Event()
         self.error: str | None = None
@@ -180,6 +185,11 @@ class HotkeyThread(threading.Thread):
                     self._on_press()
                 elif msg.wParam == _ID_ESC:
                     self._on_cancel()
+                elif msg.wParam in self._extras:
+                    self._on_extra(self._extras[msg.wParam])
+            elif msg.message == _MSG_EXTRAS and self._extras_pending is not None:
+                self._register_extras(self._extras_pending)
+                self._reply.set()
             elif msg.message == _MSG_ESC_ON:
                 user32.RegisterHotKey(None, _ID_ESC, MOD_NOREPEAT, VK_ESCAPE)
             elif msg.message == _MSG_ESC_OFF:
@@ -196,6 +206,44 @@ class HotkeyThread(threading.Thread):
                 self._reply.set()
         user32.UnregisterHotKey(None, _ID_ESC)
         user32.UnregisterHotKey(None, _ID_MAIN)
+        for i in self._extras:
+            user32.UnregisterHotKey(None, i)
+
+    def _register_extras(self, wanted: dict[str, str]) -> None:
+        """On this thread: replace the extra shortcuts. Each failure is kept in extra_errors by name."""
+        for i in self._extras:
+            user32.UnregisterHotKey(None, i)
+        self._extras, self.extra_errors = {}, {}
+        main = (self.mods, self.vk)
+        taken: dict[tuple[int, int], str] = {}
+        for n, (name, spec) in enumerate(sorted(wanted.items())):
+            if not spec:
+                continue
+            try:
+                mods, vk = parse(spec)
+            except HotkeyError as e:
+                self.extra_errors[name] = str(e)
+                continue
+            if (mods, vk) == main or (mods, vk) in taken:
+                other = "dictation" if (mods, vk) == main else taken[(mods, vk)]
+                self.extra_errors[name] = f"{display(spec)} is already the {other} shortcut"
+                continue
+            if user32.RegisterHotKey(None, _ID_EXTRA + n, mods | MOD_NOREPEAT, vk):
+                self._extras[_ID_EXTRA + n] = name
+                taken[(mods, vk)] = name.replace("_", " ")
+            else:
+                self.extra_errors[name] = f"{display(spec)} is already used by another program"
+
+    def set_extras(self, wanted: dict[str, str]) -> dict[str, str]:
+        """Register the extra shortcuts {name: spec} ("" = none), replacing the previous ones. Returns
+        {name: problem} for any that couldn't be registered (the others work)."""
+        self._extras_pending = dict(wanted)
+        self._reply.clear()
+        self._post(_MSG_EXTRAS)
+        if threading.get_ident() == self.ident:
+            return {}
+        self._reply.wait(3)
+        return dict(self.extra_errors)
 
     def wait_started(self, timeout: float = 5) -> str | None:
         self._started.wait(timeout)

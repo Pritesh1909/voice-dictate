@@ -42,122 +42,146 @@ class Spec:
 
 
 S = Spec
-PAGES: list[tuple[str, list[Spec]]] = [
+# Pages, each made of titled groups (boxes) of settings. Everyday settings are on General; what improves
+# recognition is on Improvements; what is rarely touched is on Extras.
+PAGES: list[tuple[str, list[tuple[str, list[Spec]]]]] = [
     ("General", [
-        S(("hotkey", "keys"), "hotkey", "Dictation shortcut",
-          "Tap once to start and again to stop, or hold it while you talk and let go to stop."),
-        S(("hotkey", "hold_threshold"), "float", "Hold time (seconds)",
-          "Holding the shortcut longer than this counts as hold-to-talk.", lo=0, hi=5, step=0.1),
-        S(("hotkey", "esc_cancels"), "switch", "Esc cancels", "Esc stops a recording without typing anything."),
-        S(None, "startup", "Start with Windows", "Start Parakeet Dictate when you sign in to Windows."),
-        S(("output", "sounds"), "switch", "Sounds", "Short beeps when recording starts, stops or is cancelled."),
-        S(("output", "log_transcripts"), "switch", "Write dictated text to the log",
-          "Off by default: dictation can contain sensitive text."),
+        ("Start-up", [
+            S(None, "startup", "Start with Windows", "Start Parakeet Dictate when you sign in to Windows."),
+            S(("output", "sounds"), "switch", "Sounds", "Short beeps when recording starts, stops or is cancelled."),
+        ]),
+        ("Microphone", [
+            S(("audio", "input_device"), "mic", "Microphone",
+              "When it isn't connected, the Windows default is used."),
+            S(("audio", "silence_stop_seconds"), "int", "Stop after silence (seconds)",
+              "Ends a tapped dictation when nothing has been said this long. 0 = never.",
+              lo=0, hi=3600, step=5),
+        ]),
+        ("Speech model", [
+            S(("model", "dir"), "model", "Model",
+              "Automatic picks the best model found on this PC."),
+            S(("model", "folders"), "list", "Your model files and folders",
+              "Models in these .gguf files or folders are offered too.", browse="files+folders"),
+            S(("model", "device"), "choice", "Runs on",
+              "Automatic = the graphics card if there is one, else the CPU.",
+              choices=(("auto", "Automatic"), ("gpu", "Graphics card"),
+                       ("igpu", "Built-in graphics (Intel)"), ("cpu", "CPU"))),
+            S(("model", "language"), "combo", "Language",
+              "auto, or a code such as en, de, fr. It also picks which filler sounds are removed.",
+              choices=tuple((c, c) for c in ("auto", "en", "de", "fr", "es", "it", "pt", "nl", "pl", "ja", "zh",
+                                             "ko", "ru", "uk", "hi"))),
+            S(None, "action", "Look for models again", "Searches this PC and WSL when this window closes.",
+              choices=(("search_models", "Find models"),)),
+        ]),
+        ("Typing", [
+            S(("output", "method"), "choice", "Typing method",
+              "Type leaves the clipboard alone. Paste uses Ctrl+V, then restores the clipboard.",
+              choices=(("type", "Type (keystrokes)"), ("paste", "Paste (clipboard)"))),
+            S(("output", "type_while_speaking"), "switch", "Type while speaking",
+              "Type each phrase as soon as it is ready, instead of everything after you stop."),
+            S(("model", "stream_while_speaking"), "switch", "Show words as you speak",
+              "Words appear about a second behind your voice (Type method only)."),
+            S(("output", "press_enter"), "switch", "Press Enter after typing",
+              "Sends a chat message or runs a command straight away."),
+        ]),
+        ("Pill", [
+            S(("overlay", "enabled"), "switch", "Show the pill",
+              "The small Listening pill on top of all windows. Clicks pass through it."),
+            S(("overlay", "position"), "choice", "Edge", "Used until you move the pill yourself.",
+              choices=(("top", "Top"), ("bottom", "Bottom"))),
+            S(("overlay", "margin"), "int", "Distance from the edge (pixels)",
+              "-1 = the default (24 at the top, 56 at the bottom).", lo=-1, hi=600),
+            S(None, "action", "Place it yourself", "Drag the pill anywhere; it stays there.",
+              choices=(("move_pill", "Move the pill…"), ("reset_pill", "Reset"))),
+        ]),
     ]),
-    ("Microphone", [
-        S(("audio", "input_device"), "mic", "Microphone",
-          "Part of a microphone's name also works. When it isn't connected, the Windows default is used."),
-        S(("audio", "silence_stop_seconds"), "int", "Stop after silence (seconds)",
-          "Ends a tapped dictation when nothing has been said this long (5 or more). 0 = never.",
-          lo=0, hi=3600, step=5),
-        S(("output", "max_seconds"), "int", "Longest dictation (seconds)",
-          "A dictation stops automatically after this long.", lo=5, hi=1800, step=10),
+    ("Shortcuts", [
+        ("Shortcuts", [
+            S(("hotkey", "keys"), "hotkey", "Dictate",
+              "Tap to start and again to stop, or hold while you talk."),
+            S(("hotkey", "copy_last"), "hotkey_opt", "Copy last dictation",
+              "Puts the last dictated text on the clipboard."),
+            S(("hotkey", "correct_last"), "hotkey_opt", "Correct last dictation",
+              "Opens the last dictation to fix a word; fixes are learned."),
+        ]),
+        ("While recording", [
+            S(("hotkey", "hold_threshold"), "float", "Hold time (seconds)",
+              "Holding Dictate longer than this means hold-to-talk.", lo=0, hi=5, step=0.1),
+            S(("hotkey", "esc_cancels"), "switch", "Esc cancels", "Esc stops a recording without typing anything."),
+        ]),
     ]),
-    ("Speech model", [
-        S(("model", "dir"), "model", "Speech model",
-          "Automatic finds every model on this PC. You can also switch in the tray menu under Model."),
-        S(("model", "folders"), "list", "Custom model folders",
-          "More .gguf files, or folders holding them, to find models in besides the automatic search.",
-          browse="files+folders"),
-        S(("model", "device"), "choice", "Runs on",
-          "Automatic = the graphics card if there is one. If the model fails there, the CPU is used.",
-          choices=(("auto", "Automatic"), ("gpu", "Graphics card"),
-                   ("igpu", "Built-in graphics (Intel)"), ("cpu", "CPU"))),
-        S(("model", "threads"), "int", "CPU threads", "Threads used while transcribing on the CPU.", lo=1, hi=32),
-        S(("model", "language"), "combo", "Language",
-          "auto, or a code such as en, de, fr. It also picks the filler words that are removed.",
-          choices=tuple((c, c) for c in ("auto", "en", "de", "fr", "es", "it", "pt", "nl", "pl", "ja", "zh",
-                                         "ko", "ru", "uk", "hi"))),
-        S(("model", "unload_after_seconds"), "int", "Free memory after (seconds)",
-          "The model (about 700 MB) is unloaded this long after a dictation. 0 = right away, -1 = never.",
-          lo=-1, hi=86400, step=10),
-        S(("model", "process_while_speaking"), "switch", "Transcribe at each pause",
-          "Text appears almost as soon as you stop. Off = transcribe everything after you stop."),
-        S(("model", "stream_while_speaking"), "switch", "Show words while speaking",
-          "Words appear about a second behind your voice. Needs the voice detector and the Type method."),
-        S(("model", "pause_seconds"), "float", "Pause length (seconds)",
-          "A pause this long ends a phrase. Shorter = text sooner, but sentences may be split.",
-          lo=0.3, hi=5, step=0.1),
-        S(("model", "vad"), "vad", "Voice detector",
-          "auto = find Silero VAD on this PC, off = loudness only, or the path of a .gguf file."),
-        S(("accuracy", "hotwords"), "list", "Preferred words",
-          "Words the model should prefer. Only models that support it use these (Parakeet doesn't)."),
-        S(("accuracy", "normalize_audio"), "switch", "Clean the recording",
-          "Removes silence and raises quiet speech before transcribing."),
+    ("Improvements", [
+        ("Dictionary", [
+            S(("dictionary", "terms"), "list", "Names and terms",
+              'Spelled your way. "Keycloak" also fixes "key cloak" and "KEYCLOAK".'),
+            S(("dictionary", "heard_as"), "pairs", "Heard as",
+              "What the model writes when it mishears a term in a way spelling alone can't fix."),
+            S(None, "action", "Learned words", "Fixes saved from \"Correct last dictation\".",
+              choices=(("open_learned", "Open"),)),
+        ]),
+        ("Clean-up", [
+            S(("cleanup", "language_fillers"), "switch", "Remove filler sounds",
+              '"um" and "uh" in English, "äh" in German, and so on.'),
+            S(("cleanup", "fillers"), "csv", "Your extra fillers",
+              'Separated by commas. "uh" also removes "uhh".'),
+            S(("cleanup", "remove_repeated_words"), "switch", "Remove repeated words",
+              'Collapses stutters such as "the the".'),
+        ]),
+        ("Context words", [
+            S(("context", "enabled"), "switch", "Use context words",
+              'Spells code names your way ("mcp auth filter" → "McpAuthFilter").'),
+            S(("context", "window_title"), "switch", "From the window title",
+              "Names in the title of the window you dictate into."),
+            S(("context", "folders"), "list", "Notes folders",
+              "Folders of .md notes (an Obsidian vault) to take names from. Only read.", browse="folders"),
+            S(("context", "code_apps"), "list", "Programs for code",
+              "Where names made of ordinary words (userId) are used too."),
+        ]),
+        ("Recognition", [
+            S(("model", "vad"), "vad", "Voice detector",
+              "auto = Silero VAD (finds where phrases start and end), off = loudness only."),
+            S(("accuracy", "normalize_audio"), "switch", "Clean the recording",
+              "Removes silence and raises quiet speech before transcribing."),
+            S(("accuracy", "hotwords"), "list", "Preferred words",
+              "Only models that support boosting use these (Parakeet doesn't)."),
+        ]),
     ]),
-    ("Typing", [
-        S(("output", "method"), "choice", "Typing method",
-          "Type leaves the clipboard alone. Paste uses Ctrl+V, then puts back what was on the clipboard.",
-          choices=(("type", "Type (keystrokes)"), ("paste", "Paste (clipboard + Ctrl+V)"))),
-        S(("output", "add_trailing_space"), "switch", "Space after each dictation",
-          "So the next dictation doesn't stick to the last one."),
-        S(("output", "type_while_speaking"), "switch", "Type while speaking",
-          "Type each phrase as soon as it is ready. Off = type everything after you stop."),
-        S(("output", "press_enter"), "switch", "Press Enter after typing",
-          "For example to send a chat message or run a command straight away."),
-        S(None, "note", "Settings for one program",
-          'Different typing settings for one program go in config.toml, under [apps."program.exe"].'),
-    ]),
-    ("Clean-up", [
-        S(("cleanup", "remove_repeated_words"), "switch", "Remove repeated words",
-          'Collapses stutters such as "the the" or "I, I".'),
-        S(("cleanup", "repeated_words_allowed"), "csv", "Words that may repeat",
-          'Separated by commas, as in "he had had enough".'),
-        S(("cleanup", "language_fillers"), "switch", "Remove filler sounds",
-          'The dictation language\'s thinking sounds: "um", "uh" in English, "äh" in German, and more.'),
-        S(("cleanup", "fillers"), "csv", "Your extra fillers",
-          'Separated by commas. Letters may be stretched: "uh" also removes "uhh".'),
-        S(("dictionary", "terms"), "list", "Dictionary",
-          'Names and code terms spelled your way. "Keycloak" also fixes "key cloak" and "KEYCLOAK".'),
-        S(("dictionary", "heard_as"), "pairs", "Heard as",
-          "What the model writes when it mishears a term in a way the spelling alone can't fix."),
-        S(None, "note", "More clean-up",
-          "Exact replacements ([cleanup.replacements]) and terms for one program only "
-          '([dictionary.apps."program.exe"]) are edited in config.toml.'),
-    ]),
-    ("Pill", [
-        S(("overlay", "enabled"), "switch", "Show the pill",
-          "A small Listening / Transcribing / Typed pill on top of all windows. Clicks pass through it."),
-        S(("overlay", "position"), "choice", "Position", "Which edge of the screen it sits at.",
-          choices=(("bottom", "Bottom"), ("top", "Top"))),
-        S(("overlay", "margin"), "int", "Distance from the edge (pixels)",
-          "-1 = 24 at the top, 56 at the bottom. At the top, 60-80 clears most title bars.", lo=-1, hi=600),
-    ]),
-    ("Commands", [
-        S(("commands", "enabled"), "switch", "Spoken commands",
-          "Say a command on its own, between two pauses, and it is carried out instead of typed."),
-        S(("commands", "phrases"), "commands", "Phrases",
-          "newline, paragraph, undo (removes the phrase typed just before) or stop (ends the dictation)."),
-    ]),
-    ("Context words", [
-        S(("context", "enabled"), "switch", "Use context words",
-          'Spells code names the way you write them ("mcp auth filter" -> "McpAuthFilter").'),
-        S(("context", "window_title"), "switch", "From the window title",
-          "Take names from the title of the window you are dictating into."),
-        S(("context", "folders"), "list", "Notes folders",
-          "Folders of .md notes (an Obsidian vault, say) to take names from. Only read, never changed.",
-          browse="folders"),
-        S(("context", "max_terms"), "int", "Most names kept", "The most used names first (0-500).", lo=0, hi=500),
-        S(("context", "refresh_minutes"), "int", "Look for changed notes every (minutes)",
-          "Only changed notes are read again.", lo=1, hi=1440),
-        S(("context", "code_apps"), "list", "Programs for code",
-          "Where names made of ordinary words (userId) are used too. Names: Task Manager -> Details."),
-    ]),
-    ("Per program", [
-        S(None, "note", "Settings for one program",
-          'Typing settings ([apps."program.exe"]) and dictionary terms ([dictionary.apps."program.exe"]) '
-          "for a single program, and exact replacements ([cleanup.replacements]), are edited in the "
-          "settings file. Its comments explain each one."),
+    ("Extras", [
+        ("Performance", [
+            S(("model", "unload_after_seconds"), "int", "Free memory after (seconds)",
+              "The model (about 700 MB) is unloaded this long after a dictation. -1 = never.",
+              lo=-1, hi=86400, step=10),
+            S(("model", "threads"), "int", "CPU threads", "Used while transcribing on the CPU.", lo=1, hi=32),
+            S(("model", "process_while_speaking"), "switch", "Transcribe at each pause",
+              "Off = transcribe everything after you stop."),
+            S(("model", "pause_seconds"), "float", "Pause length (seconds)",
+              "A pause this long ends a phrase.", lo=0.3, hi=5, step=0.1),
+            S(("output", "max_seconds"), "int", "Longest dictation (seconds)",
+              "A dictation stops by itself after this long.", lo=5, hi=1800, step=10),
+            S(None, "action", "Model memory", "Unloads the model now, when this window closes.",
+              choices=(("free_memory", "Free now"),)),
+        ]),
+        ("Spoken commands", [
+            S(("commands", "enabled"), "switch", "Spoken commands",
+              "Said on its own between two pauses, a command is carried out instead of typed."),
+            S(("commands", "phrases"), "commands", "Phrases",
+              "newline, paragraph, undo (removes the last phrase) or stop (ends the dictation)."),
+        ]),
+        ("Details", [
+            S(("output", "add_trailing_space"), "switch", "Space after each dictation",
+              "So the next dictation doesn't stick to the last one."),
+            S(("cleanup", "repeated_words_allowed"), "csv", "Words that may repeat",
+              'Separated by commas, as in "he had had enough".'),
+            S(("context", "max_terms"), "int", "Most context names kept", "0-500, most used first.", lo=0, hi=500),
+            S(("context", "refresh_minutes"), "int", "Check notes for changes every (minutes)",
+              "Only changed notes are read again.", lo=1, hi=1440),
+        ]),
+        ("Privacy and files", [
+            S(("output", "log_transcripts"), "switch", "Write dictated text to the log",
+              "Off by default: dictation can contain sensitive text."),
+            S(None, "action", "Files", "Per-program settings and exact replacements are in the settings file.",
+              choices=(("open_log", "Open log"), ("open_file", "Open settings file"))),
+        ]),
     ]),
 ]
 del S
@@ -258,8 +282,8 @@ class SettingsWindow:
         self.scale = max(1.0, root.winfo_fpixels("1i") / 96)
         self._styles()
         self._layout()
-        for name, specs in PAGES:
-            self._build_page(name, specs)
+        for name, groups in PAGES:
+            self._build_page(name, groups)
         self.nav.selection_set(PAGES[0][0])
         self.show(PAGES[0][0])
         if store.config_error:
@@ -283,9 +307,13 @@ class SettingsWindow:
         self.f_strong = f("SunValleyBodyStrongFont", ("Segoe UI Semibold", 10))
         self.f_caption = f("SunValleyCaptionFont", ("Segoe UI", 9))
         self.f_title = f("SunValleySubtitleFont", ("Segoe UI Semibold", 15))
+        self.border = "#3d3d3d" if dark else "#e3e3e3"     # the outline of a group box
+        self.f_group = ("Segoe UI Semibold", 11)
+        st.configure("Row.TFrame", background=self.bg)       # rows sit on the window colour: no stray boxes
         st.configure("Help.TLabel", foreground=self.muted, font=self.f_caption)
         st.configure("Strong.TLabel", font=self.f_strong)
         st.configure("Title.TLabel", font=self.f_title)
+        st.configure("Group.TLabel", font=self.f_group)
         st.configure("Error.TLabel", foreground=self.error_fg)
         st.configure("Nav.Treeview", rowheight=self.px(34))
         st.configure("Treeview", rowheight=self.px(26))
@@ -300,8 +328,6 @@ class SettingsWindow:
         self.save_btn = ttk.Button(bar, text="Save", style="Accent.TButton", command=self.save, width=10)
         self.save_btn.pack(side="right")
         ttk.Button(bar, text="Cancel", command=self.cancel, width=10).pack(side="right", padx=(0, self.px(8)))
-        ttk.Button(bar, text="Open settings file", command=self.open_settings_file).pack(side="right",
-                                                                                       padx=(0, self.px(8)))
         self.msg = ttk.Label(bar, text="", wraplength=self.px(430), justify="left")
         self.msg.pack(side="left", fill="x", expand=True)
 
@@ -317,15 +343,33 @@ class SettingsWindow:
         right = ttk.Frame(body)
         right.pack(side="left", fill="both", expand=True)
         self.canvas = tk.Canvas(right, highlightthickness=0, borderwidth=0, background=self.bg)
-        sb = ttk.Scrollbar(right, orient="vertical", command=self.canvas.yview)
+        sb = self.sb = ttk.Scrollbar(right, orient="vertical", command=self.canvas.yview)
         self.canvas.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         self.canvas.pack(side="left", fill="both", expand=True)
         self.holder = ttk.Frame(self.canvas, padding=(self.px(20), self.px(14), self.px(16), self.px(16)))
         self._win = self.canvas.create_window(0, 0, window=self.holder, anchor="nw")
-        self.holder.bind("<Configure>", lambda _e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-        self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfigure(self._win, width=e.width))
+
+        def holder_resized(_e=None):
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+            self._scrollbar_when_needed()
+
+        def canvas_resized(e):
+            self.canvas.itemconfigure(self._win, width=e.width)
+            self._scrollbar_when_needed()
+        self.holder.bind("<Configure>", holder_resized)
+        self.canvas.bind("<Configure>", canvas_resized)
         self.root.bind_all("<MouseWheel>", self._wheel)
+
+    def _scrollbar_when_needed(self) -> None:
+        """Only show the scrollbar on a page that doesn't fit."""
+        need = self.holder.winfo_reqheight() > self.canvas.winfo_height() > 1
+        shown = bool(self.sb.winfo_ismapped())
+        if need and not shown:
+            self.sb.pack(side="right", fill="y", before=self.canvas)
+        elif not need and shown:
+            self.sb.pack_forget()
+            self.canvas.yview_moveto(0)
 
     def _wheel(self, e) -> None:
         try:
@@ -343,36 +387,98 @@ class SettingsWindow:
         self.pages[name].pack(fill="both", expand=True)
         self.canvas.yview_moveto(0)
 
-    def _build_page(self, name: str, specs: list[Spec]) -> None:
-        ttk = self.ttk
+    def _build_page(self, name: str, groups: list[tuple[str, list[Spec]]]) -> None:
+        """A page: its title, then one outlined box per group, rows inside split by thin lines."""
+        tk, ttk, px = self.tk, self.ttk, self.px
         page = ttk.Frame(self.holder)
         self.pages[name] = page
-        ttk.Label(page, text=name, style="Title.TLabel").pack(anchor="w", pady=(0, self.px(10)))
-        for spec in specs:
-            card = ttk.Frame(page, style="Card.TFrame", padding=(self.px(14), self.px(10)))
-            card.pack(fill="x", pady=(0, self.px(6)))
-            card.columnconfigure(0, weight=1)
-            text = ttk.Frame(card, style="Card.TFrame")
-            text.grid(row=0, column=0, sticky="w")
-            ttk.Label(text, text=spec.label, style="Strong.TLabel").pack(anchor="w")
-            if spec.help:
-                ttk.Label(text, text=spec.help, style="Help.TLabel", justify="left",
-                          wraplength=self.px(560 if spec.kind in BELOW else 300)).pack(anchor="w")
-            if spec.kind == "note":
-                ttk.Button(card, text="Open the settings file", command=self.open_settings_file).grid(
-                    row=0, column=1, sticky="e", padx=(self.px(10), 0))
-                continue
-            ctl = CONTROLS[spec.kind](self, card, spec)
-            if spec.kind in BELOW:
-                ctl.frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(self.px(8), 0))
-            else:
-                ctl.frame.grid(row=0, column=1, sticky="e", padx=(self.px(12), 0))
-            if spec.key is None:
-                original = self.env.startup_on
-            else:
-                original = normalize(spec, self.store.value(spec.key))
-            ctl.set(original)
-            self.fields.append(Field(spec, ctl, original))
+        ttk.Label(page, text=name, style="Title.TLabel").pack(anchor="w", pady=(0, px(2)))
+        for gi, (group, specs) in enumerate(groups):
+            ttk.Label(page, text=group, style="Group.TLabel").pack(anchor="w", pady=(px(14), px(6)))
+            outline = tk.Frame(page, background=self.border, borderwidth=0, highlightthickness=0)
+            outline.pack(fill="x")
+            box = ttk.Frame(outline, style="Row.TFrame")
+            box.pack(fill="both", expand=True, padx=1, pady=1)
+            for si, spec in enumerate(specs):
+                if si:
+                    ttk.Separator(box).pack(fill="x", padx=px(14))
+                row = ttk.Frame(box, style="Row.TFrame", padding=(px(14), px(10)))
+                row.pack(fill="x")
+                self._build_row(row, spec)
+
+    def _build_row(self, card, spec: Spec) -> None:
+        ttk = self.ttk
+        card.columnconfigure(0, weight=1)
+        text = ttk.Frame(card, style="Row.TFrame")
+        text.grid(row=0, column=0, sticky="w")
+        ttk.Label(text, text=spec.label, style="Strong.TLabel").pack(anchor="w")
+        if spec.help:
+            ttk.Label(text, text=spec.help, style="Help.TLabel", justify="left",
+                      wraplength=self.px(540 if spec.kind in BELOW else 320)).pack(anchor="w")
+        if spec.kind == "action":
+            buttons = ttk.Frame(card, style="Row.TFrame")
+            buttons.grid(row=0, column=1, sticky="e", padx=(self.px(12), 0))
+            for i, (action, label) in enumerate(spec.choices):
+                ttk.Button(buttons, text=label, command=lambda a=action: self.do_action(a)).pack(
+                    side="left", padx=(self.px(6) if i else 0, 0))
+            return
+        ctl = CONTROLS[spec.kind](self, card, spec)
+        if spec.kind in BELOW:
+            ctl.frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(self.px(8), 0))
+        else:
+            ctl.frame.grid(row=0, column=1, sticky="e", padx=(self.px(12), 0))
+        if spec.key is None:
+            original = self.env.startup_on
+        else:
+            original = normalize(spec, self.store.value(spec.key))
+        ctl.set(original)
+        self.fields.append(Field(spec, ctl, original))
+
+    # actions (buttons that aren't a setting) ------------------------------------------------------------
+    def request(self, action: str) -> None:
+        """Ask the tray app to do something once this window closes (it reads settings_request.json)."""
+        import json
+        f = self.store.paths.data_dir / "settings_request.json"
+        try:
+            actions = json.loads(f.read_text("utf-8")).get("actions", [])
+        except (OSError, ValueError, AttributeError):
+            actions = []
+        if action not in actions:
+            actions.append(action)
+        try:
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(json.dumps({"actions": actions}), "utf-8")
+        except OSError as e:
+            self.message(f"Couldn't pass that on to the tray app: {e}", error=True)
+
+    def do_action(self, action: str) -> None:
+        paths = self.store.paths
+        if action == "move_pill":           # the tray app owns the pill: close (saving first), then it moves
+            if self.dirty() and not self.save(close=False):
+                return
+            self.request(action)
+            self.close()
+        elif action in ("reset_pill", "search_models", "free_memory"):
+            self.request(action)
+            self.message({"reset_pill": "The pill goes back to its usual place when this window closes.",
+                          "search_models": "The tray app looks for models when this window closes.",
+                          "free_memory": "The model is unloaded when this window closes."}[action])
+        elif action == "open_log":
+            self._open_if_there(paths.log_file, "There is no log yet.")
+        elif action == "open_learned":
+            self._open_if_there(paths.learned_file,
+                                'No learned words yet. Use "Correct last dictation" to teach some.')
+        elif action == "open_file":
+            self.open_settings_file()
+
+    def _open_if_there(self, path: Path, missing: str) -> None:
+        if not path.exists():
+            self.message(missing)
+            return
+        try:
+            self.open_file(path)
+        except OSError as e:
+            self.message(f"Couldn't open {path}: {e}", error=True)
 
     # state -----------------------------------------------------------------------------------------
     def field(self, key) -> "Field":
@@ -419,7 +525,7 @@ class SettingsWindow:
             pass
 
     # buttons ---------------------------------------------------------------------------------------
-    def save(self) -> bool:
+    def save(self, close: bool = True) -> bool:
         changes, errors = self.changes()
         if errors:
             self.message(errors[0], error=True)
@@ -445,7 +551,8 @@ class SettingsWindow:
                 return False
         log.info("settings saved (%s)", ", ".join(".".join(k) for k in changes) or "start-up only")
         self.saved = True
-        self.close()
+        if close:
+            self.close()
         return True
 
     def cancel(self) -> None:
@@ -480,7 +587,7 @@ class Control:
     def __init__(self, win: SettingsWindow, parent, spec: Spec):
         self.win, self.spec = win, spec
         self.tk, self.ttk = win.tk, win.ttk
-        self.frame = self.ttk.Frame(parent, style="Card.TFrame")
+        self.frame = self.ttk.Frame(parent, style="Row.TFrame")
         self.build()
 
     def build(self) -> None:
@@ -621,7 +728,7 @@ class ListEditor(Control):
         ttk, px = self.ttk, self.win.px
         self.tree = ttk.Treeview(self.frame, columns=("v",), show="", height=4, selectmode="extended")
         self.tree.pack(fill="x")
-        row = ttk.Frame(self.frame, style="Card.TFrame")
+        row = ttk.Frame(self.frame, style="Row.TFrame")
         row.pack(fill="x", pady=(px(6), 0))
         if self.spec.browse:
             if "files" in self.spec.browse:
@@ -689,7 +796,7 @@ class PairsEditor(Control):
             self.tree.heading(col, text=title, anchor="w")
             self.tree.column(col, width=px(220), anchor="w")
         self.tree.pack(fill="x")
-        row = ttk.Frame(self.frame, style="Card.TFrame")
+        row = ttk.Frame(self.frame, style="Row.TFrame")
         row.pack(fill="x", pady=(px(6), 0))
         self.a = self.tk.StringVar(self.win.root)
         self.b = self.tk.StringVar(self.win.root)
@@ -800,7 +907,7 @@ class HotkeyRecorder(Control):
         ttk, px = self.ttk, self.win.px
         self.spec_value = ""
         self.listening = False
-        top = ttk.Frame(self.frame, style="Card.TFrame")
+        top = ttk.Frame(self.frame, style="Row.TFrame")
         top.pack(anchor="e")
         self.shown = ttk.Label(top, text="", style="Strong.TLabel", width=16, anchor="e")
         self.shown.pack(side="left", padx=(0, px(10)))
@@ -815,14 +922,20 @@ class HotkeyRecorder(Control):
     def get(self):
         return self.spec_value
 
+    default = store_mod.DEFAULT_HOTKEY      # what Backspace goes back to ("" = no shortcut)
+
     def set(self, v):
-        self.spec_value = str(v)
-        self.shown.configure(text=hotkey.display(self.spec_value))
+        self.spec_value = str(v or "")
+        self.shown.configure(text=self._shown_text())
+
+    def _shown_text(self) -> str:
+        return hotkey.display(self.spec_value) if self.spec_value else "None"
 
     def start(self):
         self.listening = True
         self.shown.configure(text="Press keys…")
-        self.status.configure(text="Press the new shortcut. Esc cancels, Backspace goes back to Ctrl+Q.",
+        back = f"goes back to {hotkey.display(self.default)}" if self.default else "removes the shortcut"
+        self.status.configure(text=f"Press the new shortcut. Esc cancels, Backspace {back}.",
                               style="Help.TLabel")
         self.button.state(["disabled"])
         self.shown.focus_set()
@@ -830,8 +943,13 @@ class HotkeyRecorder(Control):
     def stop(self, text: str, error: bool = False):
         self.listening = False
         self.button.state(["!disabled"])
-        self.shown.configure(text=hotkey.display(self.spec_value))
+        self.shown.configure(text=self._shown_text())
         self.status.configure(text=text, style="Error.TLabel" if error else "Help.TLabel")
+
+    def others(self) -> dict[str, str]:
+        """The other shortcuts in the window right now, by name ("Dictate", "Copy last dictation")."""
+        return {f.spec.label: f.control.get() for f in self.win.fields
+                if f.spec.kind in ("hotkey", "hotkey_opt") and f.control is not self}
 
     @staticmethod
     def held_modifiers() -> set[str]:
@@ -848,7 +966,8 @@ class HotkeyRecorder(Control):
 
     def handle(self, vk: int, mods: set[str]) -> None:
         """One key press while listening (the Tk binding calls this; tests call it directly)."""
-        r = store_mod.record_key(vk, mods, self.win.current_hotkey, self.win.env.available)
+        held = str(self.win.store.value(self.spec.key, "") or "")      # what the running tray app holds
+        r = store_mod.record_key(vk, mods, held, self.win.env.available, self.default, self.others())
         if r.action == "listen":
             held = [m.capitalize() for m in hotkey.MOD_ORDER if m in mods]
             self.shown.configure(text="+".join(held + ["…"]))
@@ -863,7 +982,13 @@ class HotkeyRecorder(Control):
             self.changed()
 
 
+class OptionalHotkeyRecorder(HotkeyRecorder):
+    """An extra shortcut: none until one is recorded; Backspace removes it."""
+    default = ""
+
+
 CONTROLS: dict[str, type[Control]] = {
+    "hotkey_opt": OptionalHotkeyRecorder,
     "switch": Switch, "startup": Startup, "choice": Choice, "combo": Combo, "mic": Mic, "model": ModelChoice,
     "int": Number, "float": Decimal, "csv": Csv, "list": ListEditor, "pairs": PairsEditor,
     "commands": CommandsEditor, "vad": VadChoice, "hotkey": HotkeyRecorder,
@@ -905,7 +1030,8 @@ def run(paths: config.Paths) -> int:
     root.geometry(f"{w}x{h}+{x}+{y}")
     root.minsize(win.px(700), win.px(460))
     root.protocol("WM_DELETE_WINDOW", win.cancel)
-    root.bind("<Escape>", lambda _e: win.cancel() if not win.field(("hotkey", "keys")).control.listening else None)
+    recording = lambda: any(getattr(f.control, "listening", False) for f in win.fields)   # noqa: E731
+    root.bind("<Escape>", lambda _e: None if recording() else win.cancel())
     root.deiconify()
     root.attributes("-topmost", True)     # opened from the tray: make sure it isn't hidden behind
     root.after(200, lambda: root.attributes("-topmost", False))

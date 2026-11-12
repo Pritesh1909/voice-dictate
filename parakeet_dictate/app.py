@@ -18,6 +18,7 @@ from .appsettings import settings_for
 from .audio import SR, Recorder, preprocess, resample, silence_stop_due, silence_stop_message
 from .engine import GPU_MARKER, Engine, EngineError, EngineSpec
 from .hotkey import HotkeyError, HotkeyThread, key_down
+from .hotkey import display as hotkey_display
 from .overlay import GREEN, MUTED, RED, Overlay
 from .segmenter import Segmenter, VadSegmenter
 from .textclean import Cleaner
@@ -310,7 +311,7 @@ class App:
         self.vad_path = self._find_vad(self.cfg)
         self._resolve_model(self.cfg)
         self.engine.set_spec(self._engine_spec(self.cfg), self.cfg.unload_after_seconds)
-        self.hotkeys = HotkeyThread(self.cfg.hotkey, self._on_hotkey, self._on_cancel)
+        self.hotkeys = HotkeyThread(self.cfg.hotkey, self._on_hotkey, self._on_cancel, self._on_extra_hotkey)
         self.state = "idle"          # idle | recording | busy
         self.last_text = ""
         self.last_stats = ""
@@ -607,6 +608,7 @@ class App:
     def apply_config(self, c: cfgmod.Config) -> str | None:
         """Switch to new settings. Returns a problem to show, or None."""
         err = self.hotkeys.change(c.hotkey)
+        err = err or self._extras_problem(self.hotkeys.set_extras(self._extra_hotkeys(c)))
         if c.vad != self.cfg.vad:
             self.vad_path = self._find_vad(c)
         self.cfg = c
@@ -646,7 +648,84 @@ class App:
         log.info("settings reloaded")
         return err
 
+    # --- extra shortcuts ---------------------------------------------------------------------------
+
+    @staticmethod
+    def _extra_hotkeys(c: cfgmod.Config) -> dict[str, str]:
+        return {"copy_last": c.copy_last_hotkey, "correct_last": c.correct_last_hotkey}
+
+    @staticmethod
+    def _extras_problem(errors: dict[str, str]) -> str | None:
+        names = {"copy_last": "Copy last dictation", "correct_last": "Correct last dictation"}
+        return "; ".join(f"{names.get(k, k)} shortcut not set: {v}" for k, v in errors.items()) or None
+
+    def _on_extra_hotkey(self, name: str) -> None:  # hotkey thread: hand the work to a thread of its own
+        log.info("shortcut: %s", name)
+        target = {"copy_last": self.copy_last, "correct_last": self.correct_last}.get(name)
+        if target:
+            threading.Thread(target=target, daemon=True, name=name).start()
+
+    def copy_last(self) -> None:
+        if not self.last_text:
+            self._notify("Nothing dictated yet.")
+            return
+        try:
+            output.copy_to_clipboard(self.last_text)
+        except OSError as e:
+            self._notify(f"Couldn't copy: {e}")
+            return
+        if self.overlay and self.state == "idle":
+            self.overlay.flash("Copied to clipboard", GREEN, 900)
+
+    def correct_last(self) -> None:
+        if not self.last_text:
+            self._notify("Nothing dictated yet.")
+            return
+        try:
+            correct.launch(self.last_text, self.paths.data_dir)
+        except Exception as e:
+            log.exception("correction window")
+            self._notify(f"Couldn't open the correction window: {e}")
+
+    # --- the Settings window ------------------------------------------------------------------------
+
     _settings_proc = None   # the open Settings window's process
+
+    @property
+    def _settings_request(self):
+        """Where the Settings window leaves things for the tray to do once it closes (move the pill...)."""
+        return self.paths.data_dir / "settings_request.json"
+
+    def _settings_actions(self) -> list[str]:
+        import json
+        f = self._settings_request
+        try:
+            actions = json.loads(f.read_text("utf-8")).get("actions", [])
+        except (OSError, ValueError, AttributeError):
+            return []
+        finally:
+            try:
+                f.unlink()
+            except OSError:
+                pass
+        return [a for a in actions if isinstance(a, str)]
+
+    def _run_settings_action(self, action: str) -> None:
+        log.info("settings window asked for: %s", action)
+        if action == "move_pill":
+            if self.overlay is None:
+                self._notify("Turn the pill on first (Settings → General → Pill).")
+            elif self.state == "idle":
+                self.move_pill()
+        elif action == "reset_pill":
+            self.reset_pill_position()
+        elif action == "search_models":
+            self.search_model()
+        elif action == "free_memory":
+            self.engine.unload()
+            self._notify("Model memory freed.")
+        elif action == "download_model":
+            self.download_model()
 
     def open_settings_window(self) -> None:
         """The Settings window, its own process and only one at a time; settings reload when it closes."""
@@ -654,6 +733,7 @@ class App:
         p = self._settings_proc
         if p is not None and p.poll() is None:
             return
+        self._settings_actions()   # drop a request a crashed window may have left behind
         try:
             before = self.paths.config_file.stat().st_mtime
         except OSError:
@@ -675,6 +755,8 @@ class App:
                 err = self.reload_if_changed(force=True)
                 self._notify(err or "Settings saved.")
                 self._refresh()
+            for action in self._settings_actions():
+                self._run_settings_action(action)
 
         threading.Thread(target=wait, daemon=True, name="settings-window").start()
 
@@ -1089,46 +1171,6 @@ class App:
     def _menu(self) -> pystray.Menu:
         I, S = pystray.MenuItem, pystray.Menu.SEPARATOR
 
-        def copy_last(icon, item):
-            if self.last_text:
-                output.copy_to_clipboard(self.last_text)
-
-        def correct_last(icon, item):
-            if self.last_text:
-                try:
-                    correct.launch(self.last_text, self.paths.data_dir)
-                except Exception as e:
-                    log.exception("correction window")
-                    self._notify(f"Couldn't open the correction window: {e}")
-
-        def open_settings(icon, item):
-            self.open_settings_window()
-
-        def open_settings_file(icon, item):
-            os.startfile(self.paths.config_file)
-
-        def reload(icon, item):
-            err = self.reload_if_changed(force=True)
-            self._notify(err or "Settings reloaded.")
-            self._refresh()
-
-        def unload(icon, item):
-            self.engine.unload()
-
-        def toggle_autostart(icon, item):
-            lnk = winutil.startup_shortcut()
-            try:
-                if lnk.exists():
-                    lnk.unlink()
-                else:
-                    winutil.create_shortcut(lnk, self.ico)
-            except Exception as e:
-                self._notify(f"Could not change start-up setting: {e}")
-
-        def open_log(icon, item):
-            if self.paths.log_file.exists():
-                os.startfile(self.paths.log_file)
-
         def quit_app(icon, item):
             self.engine.unload()
             self.hotkeys.stop()
@@ -1136,43 +1178,35 @@ class App:
                 self.overlay.close()
             icon.stop()
 
+        def with_key(text: str, spec: str) -> str:
+            return f"{text}\t{hotkey_display(spec)}" if spec else text
+
+        # Only what is used day to day; everything else lives in Settings. Items that only sometimes
+        # apply (a failed recording, moving the pill, no model yet) appear only then.
         return pystray.Menu(
             I(lambda _: self._status_text(), None, enabled=False),
-            I(lambda _: f"Hotkey: {self.cfg.hotkey}", None, enabled=False),
-            I(lambda _: f"Last: {self.last_stats}" if self.last_stats else "Last: —", None, enabled=False),
-            I(lambda _: self._model_text(), pystray.Menu(self._model_items)),
-            I(lambda _: "Phrases: " + ("Silero voice detector" if self.vad_path else "loudness detector"),
-              None, enabled=False),
             S,
-            I("Copy last dictation", copy_last, enabled=lambda _: bool(self.last_text)),
-            I("Correct last dictation…", correct_last, enabled=lambda _: bool(self.last_text)),
-            I("Retry last recording", lambda i, it: self.retry_failed(), enabled=lambda _: self._can_retry()),
-            I("Discard last recording", lambda i, it: self.discard_failed(), enabled=lambda _: self._can_retry()),
-            I("Add a model file…", lambda i, it: self.add_model_file(),
-              enabled=lambda _: not self.model_job and not self._adding_model),
-            I("Find models again (Windows + WSL)", lambda i, it: self.search_model(),
-              enabled=lambda _: not self.model_job),
+            I(lambda _: with_key("Copy last dictation", self.cfg.copy_last_hotkey),
+              lambda i, it: self.copy_last(), enabled=lambda _: bool(self.last_text)),
+            I(lambda _: with_key("Correct last dictation…", self.cfg.correct_last_hotkey),
+              lambda i, it: self.correct_last(), enabled=lambda _: bool(self.last_text)),
+            I("Retry last recording", lambda i, it: self.retry_failed(), visible=lambda _: self.failed is not None,
+              enabled=lambda _: self._can_retry()),
+            I("Discard last recording", lambda i, it: self.discard_failed(),
+              visible=lambda _: self.failed is not None, enabled=lambda _: self._can_retry()),
+            I("Done moving the pill", lambda i, it: self.move_pill(), visible=lambda _: self.state == "moving"),
             I("Download Parakeet v2 model (about 730 MB)", lambda i, it: self.download_model(),
-              enabled=lambda _: not self.model_job),
-            I("Settings…", open_settings, default=True),
-            I("Open settings file", open_settings_file),
-            I("Reload settings", reload),
-            I("Free model memory now", unload, enabled=lambda _: self.engine.state != "unloaded"),
-            I("Start with Windows", toggle_autostart, checked=lambda _: winutil.startup_shortcut().exists()),
-            I(lambda _: "Done moving the pill" if self.state == "moving" else "Move the pill…",
-              lambda i, it: self.move_pill(),
-              enabled=lambda _: self.overlay is not None and self.state in ("idle", "moving")),
-            I("Reset pill position", lambda i, it: self.reset_pill_position(),
-              enabled=lambda _: self.state != "moving" and self._pill_file.exists()),
-            I("Open log", open_log),
+              visible=lambda _: self.model is None, enabled=lambda _: not self.model_job),
             S,
-            I(f"Quit {APP_NAME} {__version__}", quit_app),
+            I("Settings…", lambda i, it: self.open_settings_window(), default=True),
+            I(f"Quit {APP_NAME}", quit_app),
         )
 
     def run(self) -> None:
         self.sounds.enabled = self.cfg.sounds
         self.hotkeys.start()
         hotkey_error = self.hotkeys.wait_started()
+        hotkey_error = hotkey_error or self._extras_problem(self.hotkeys.set_extras(self._extra_hotkeys(self.cfg)))
         self.icon = pystray.Icon("parakeet_dictate", icon_image(self._visual_state()), APP_NAME, self._menu())
 
         def setup(icon):

@@ -73,6 +73,8 @@ class Config:
     hotkey: str
     hold_threshold: float
     esc_cancels: bool
+    copy_last_hotkey: str     # copies the last dictation to the clipboard; "" = no shortcut
+    correct_last_hotkey: str  # opens "Correct last dictation"; "" = no shortcut
     model_dir: str          # "auto", a .gguf file or a folder holding one (environment variables expanded)
     model_folders: tuple[str, ...]   # [model] folders: more .gguf files / folders to list (variables expanded)
     device: str             # auto | gpu | igpu | cpu
@@ -161,6 +163,8 @@ def parse(text: str, defaults_text: str | None = None) -> Config:
         hotkey=_get(d, "hotkey", "keys", str),
         hold_threshold=_get(d, "hotkey", "hold_threshold", float, lambda v: 0 <= v <= 5),
         esc_cancels=_get(d, "hotkey", "esc_cancels", bool),
+        copy_last_hotkey=_optional_hotkey(d, "copy_last"),
+        correct_last_hotkey=_optional_hotkey(d, "correct_last"),
         model_dir=_model_dir(_get(d, "model", "dir", str)),
         model_folders=_model_folders(_str_list(d, "model", "folders")),
         device=_get(d, "model", "device", str, lambda v: v in ("auto", "gpu", "igpu", "cpu")),
@@ -309,6 +313,18 @@ def _language(v: str) -> str:
         return "auto"
     if not re.fullmatch(r"[a-z]{2,3}", v):
         raise ConfigError(f'[model] language must be "auto" or a language code such as "en" or "de", got {v!r}')
+    return v
+
+
+def _optional_hotkey(d: dict, key: str) -> str:
+    """An extra shortcut: "" (none) or a combination like "ctrl+alt+c"."""
+    from .hotkey import HotkeyError, parse
+    v = _get(d, "hotkey", key, str).strip()
+    if v:
+        try:
+            parse(v)
+        except HotkeyError as e:
+            raise ConfigError(f"[hotkey] {key}: {e}") from None
     return v
 
 
