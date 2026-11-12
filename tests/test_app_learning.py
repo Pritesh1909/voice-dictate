@@ -16,7 +16,7 @@ import pytest
 from test_app_flow import SR, FakeEngine, FakeRecorder, dictate, make_app, out, retry, speech  # noqa: F401
 
 from parakeet_dictate import autolearn, config, idle, learn, models, recordings, teacher, winutil
-from parakeet_dictate.app import FAILED_NOTE, App, Session
+from parakeet_dictate.app import FAILED_NOTE, App, FailedRecording, Session
 from parakeet_dictate.engine import GPU_MARKER, Engine, EngineError, EngineSpec
 
 MODEL = "parakeet-tdt-0.6b-v3.gguf"
@@ -466,6 +466,46 @@ def test_check_starting_just_as_the_hotkey_is_pressed_stops_too(learner):
     app.recorder = types.SimpleNamespace(start=lambda: (_ for _ in ()).throw(OSError("test: no microphone")))
     app._on_hotkey()                                      # no check running: nothing to stop, no error
     assert app.state == "idle" and app._should_stop_check() is True
+
+
+def test_retry_during_check_stops_teacher_first(learner, out):
+    """Tray → Retry while Whisper is in the middle of a recording: like the hotkey, its process is killed
+    before Parakeet transcribes (both on the 4 GB card would not fit), and Retry never waits for the check."""
+    app = learner()
+    kept(app, "send the mail t campaign")
+    events = []
+    whisper = FakeTeacher(events, block=True)
+    app._new_teacher_engine = lambda spec: whisper
+    app._learning_tick()
+    assert whisper.transcribing.wait(5)                   # the check is waiting for Whisper
+    stop = app.checker.stop
+    app.checker.stop = lambda: (events.append("stop"), stop())
+    app.failed = FailedRecording(speech(), SR, False)
+    app.engine = FakeEngine("Hello again.")
+    transcribe = app.engine.transcribe
+    app.engine.transcribe = lambda audio: (events.append("transcribe"), transcribe(audio))[1]
+    t0 = time.monotonic()
+    retry(app)
+    assert time.monotonic() - t0 < 1
+    finish_check(app)
+    assert [e for e in events if isinstance(e, str)] == ["stop", "kill", "transcribe"]
+    assert out.typed == ["Hello again. "] and app.failed is None
+    assert app.learning_paused is None                    # stopped by the user: not a crash
+
+
+def test_a_checker_bug_never_breaks_the_hotkey(learner, caplog):
+    app = learner()
+
+    def broken():
+        raise RuntimeError("checker bug")
+
+    app.checker = types.SimpleNamespace(stop=broken)
+    opened = []
+    app.recorder = types.SimpleNamespace(start=lambda: (opened.append(1), (_ for _ in ()).throw(OSError("test: no mic"))))
+    with caplog.at_level(logging.ERROR, logger="parakeet_dictate.app"):
+        app._on_hotkey()
+    assert opened == [1] and logged(caplog, "checker bug")   # the microphone was still opened
+    app.checker = None                                    # the fixture's clean-up calls stop() again
 
 
 # --- when the check runs -----------------------------------------------------------------------------

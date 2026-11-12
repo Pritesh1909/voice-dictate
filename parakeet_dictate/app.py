@@ -1281,13 +1281,18 @@ class App:
         return [*self.cfg.dictionary, *self.learned]
 
     def _stop_learning(self) -> None:
-        """The hotkey was pressed: end a background check at once. Checker.stop kills Whisper's process
-        without taking a lock; never unload() it from here, that waits for the Whisper call in progress.
-        Also a check starting just now (Checker.run forgets an earlier stop) sees the user is back."""
-        self._dictation_asked_at = time.monotonic()
-        checker = self.checker
-        if checker is not None:
-            checker.stop()
+        """The hotkey (or tray → Retry) was pressed: end a background check at once, so Parakeet never
+        loads next to Whisper on the graphics card. Checker.stop kills Whisper's process without taking a
+        lock; never unload() it from here, that waits for the Whisper call in progress. Also a check
+        starting just now (Checker.run forgets an earlier stop) sees the user is back. Never raises: a
+        checker bug must not break dictation."""
+        try:
+            self._dictation_asked_at = time.monotonic()
+            checker = self.checker
+            if checker is not None:
+                checker.stop()
+        except Exception:
+            log.exception("could not stop the background check")
 
     def _setup_teacher(self) -> None:
         """Thread body: Whisper for background learning, downloaded (886 MB) only on a PC with a discrete
@@ -1354,6 +1359,7 @@ class App:
                     self.sounds.play("error")   # a dictation is running; retry once it's done
                 return
             self.state = "busy"
+        self._stop_learning()   # first: Whisper's process ends now, the graphics card is free for Parakeet
         if self.overlay:
             self.overlay.working()
         self._refresh()
