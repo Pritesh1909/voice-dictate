@@ -14,6 +14,7 @@ Nothing leaves the laptop, and no admin rights are needed.
 | Cancel a recording | **Esc** (nothing is typed) |
 | Retype the last result | Tray icon → *Copy last dictation*, then paste — or set a shortcut for it (Settings → Shortcuts) |
 | Fix a word for next time | Tray icon → *Correct last dictation…* (or its shortcut): fix the text, tick the spellings to learn, *Save* |
+| Find an earlier dictation | Tray icon → *History…* (or its shortcut): search, then *Copy* or *Copy and close* |
 | New line / empty line | Say **"new line"** or **"new paragraph"** on its own, between two pauses |
 | Take back the last phrase | Say **"scratch that"** (or "delete that") on its own |
 | Stop without the hotkey | Say **"stop listening"** on its own |
@@ -22,7 +23,7 @@ Nothing leaves the laptop, and no admin rights are needed.
 | Change settings | Tray icon → *Settings…* (applied as soon as the window closes) |
 
 The tray menu only holds what is used day to day: *Copy last dictation*, *Correct last dictation…*,
-*Settings…* and *Quit* (with the shortcut shown next to an item that has one). *Retry* / *Discard last
+*History…* (hidden when the history is off), *Settings…* and *Quit* (with the shortcut shown next to an item that has one). *Retry* / *Discard last
 recording*, *Done moving the pill* and *Download Parakeet v2 model* appear only when they apply.
 Everything else is in the Settings window.
 
@@ -67,15 +68,15 @@ following Windows) with four pages, each made of titled groups:
 | Page | Groups |
 |---|---|
 | **General** | Start-up (start with Windows, sounds) · Microphone · Speech model (model, your model files and folders, runs on, language, *Find models*) · Typing · Pill (show, edge, distance, *Move the pill…*, *Reset*) |
-| **Shortcuts** | Dictate · Copy last dictation · Correct last dictation · hold time · Esc cancels |
+| **Shortcuts** | Dictate · Copy last dictation · Correct last dictation · History · hold time · Esc cancels |
 | **Improvements** | Dictionary (names and terms, "heard as", learned words) · Clean-up (fillers, repeated words) · Context words · Recognition (voice detector, audio clean-up, preferred words) |
-| **Extras** | Performance (memory, threads, pauses, longest dictation, *Free now*) · Spoken commands · Details · Privacy and files (*Open log*, *Open settings file*) |
+| **Extras** | Performance (memory, threads, pauses, longest dictation, *Free now*) · Spoken commands · Details · Privacy and files (log dictated text, keep a history, history length, *Open log*, *Open settings file*) |
 
 - **Change…** next to a shortcut listens for the next key combination: Ctrl/Alt/Shift/Win plus one key
   (F-keys may be used alone). Esc cancels; Backspace goes back to Ctrl+Q for Dictate and removes the
-  shortcut for the other two. Combinations Windows keeps for itself (Alt+Tab, Win+L, ...), everyday ones
+  shortcut for the others. Combinations Windows keeps for itself (Alt+Tab, Win+L, ...), everyday ones
   (Ctrl+C, Ctrl+V, ...), one already used by another of these shortcuts, and one another program holds
-  ("in use by another app") are refused. In the file: `[hotkey] keys`, `copy_last`, `correct_last`.
+  ("in use by another app") are refused. In the file: `[hotkey] keys`, `copy_last`, `correct_last`, `history`.
 - **Save** (enabled once something changed) writes only the settings you changed into `config.toml`;
   every comment and every other line stays as it was. The result is checked first: if it isn't valid, the
   problem is shown and nothing is written. The tray app picks the new settings up as soon as the window
@@ -104,6 +105,27 @@ them off with `[commands] enabled = false`.
   **Limit:** editors that add characters by themselves while you type (auto-closing brackets or quotes,
   auto-indent, auto-complete) change what is on screen, so the count can be off there.
 - **"stop listening"** ends the dictation like the hotkey; it isn't typed.
+
+### History
+
+Tray → *History…* (or its shortcut, Settings → Shortcuts) lists recent dictations, newest first: time,
+program it was typed into and the first line. Type in the search box to filter as you type; the selected
+dictation's full text is shown below (select part of it and Ctrl+C, or use *Copy* / *Copy and close*,
+Enter or a double-click). *Delete* (or the Delete key) removes one, *Clear all…* asks first and removes all.
+
+Dictation can be sensitive, so where the history lives is a choice (Settings → Extras → Privacy and files,
+or `[history] keep`):
+
+| `keep` | What is kept |
+|---|---|
+| `"off"` | Nothing. The menu item is hidden. |
+| `"session"` (default) | The last `max_items` dictations in the tray app's memory only; gone when it quits. The History window gets them in a temporary file in `%LOCALAPPDATA%\ParakeetDictate` that it deletes as soon as it has read it. |
+| `"disk"` | Also `%LOCALAPPDATA%\ParakeetDictate\history.jsonl`, so it survives restarts. Trimming and deleting rewrite it in one step. Switching away from `"disk"` deletes the file. |
+
+`[history] max_items = 200` (10–5000): the oldest are dropped first. Only finished dictations are kept
+(also a retried recording); cancelled, empty and failed ones are not. What the window deletes goes back to
+the tray as a list of ids (no text) when it closes. The window is its own process
+(`ParakeetDictate.exe --history <file>`), like the correction window.
 
 ### Learn from corrections
 
@@ -212,6 +234,8 @@ A new dictation within the 30 s reuses the loaded model and starts instantly. Ch
   `%LOCALAPPDATA%\ParakeetDictate\context_terms.json` (names, file times and one-way word hashes; no note text)
 - Log, sounds, icon, the chosen model (`model_path.txt`), where you put the pill (`pill_position.json`):
   `%LOCALAPPDATA%\ParakeetDictate\`. Recognised text is **not** logged unless `[output] log_transcripts = true`.
+- Dictation history: in memory only by default; `%LOCALAPPDATA%\ParakeetDictate\history.jsonl` only with
+  `[history] keep = "disk"`.
 
 ## Install
 

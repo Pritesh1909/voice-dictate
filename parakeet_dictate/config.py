@@ -41,6 +41,11 @@ class Paths:
         """Terms harvested from the [context] folders, with the file times they came from."""
         return self.data_dir / "context_terms.json"
 
+    @property
+    def history_file(self) -> Path:
+        """Recent dictations, only with [history] keep = "disk"."""
+        return self.data_dir / "history.jsonl"
+
     @classmethod
     def default(cls) -> "Paths":
         roaming = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
@@ -75,6 +80,7 @@ class Config:
     esc_cancels: bool
     copy_last_hotkey: str     # copies the last dictation to the clipboard; "" = no shortcut
     correct_last_hotkey: str  # opens "Correct last dictation"; "" = no shortcut
+    history_hotkey: str       # opens the History window; "" = no shortcut
     model_dir: str          # "auto", a .gguf file or a folder holding one (environment variables expanded)
     model_folders: tuple[str, ...]   # [model] folders: more .gguf files / folders to list (variables expanded)
     device: str             # auto | gpu | igpu | cpu
@@ -115,6 +121,8 @@ class Config:
     context_refresh_minutes: int
     context_code_apps: tuple[str, ...]             # app_key() names
     apps: tuple[tuple[str, AppOverride], ...]      # (exe name, lower case, without ".exe"; overrides)
+    history_keep: str        # off | session (memory only) | disk (history.jsonl)
+    history_max_items: int
     source_mtime: float = field(default=0.0, compare=False)
 
 
@@ -165,6 +173,7 @@ def parse(text: str, defaults_text: str | None = None) -> Config:
         esc_cancels=_get(d, "hotkey", "esc_cancels", bool),
         copy_last_hotkey=_optional_hotkey(d, "copy_last"),
         correct_last_hotkey=_optional_hotkey(d, "correct_last"),
+        history_hotkey=_optional_hotkey(d, "history"),
         model_dir=_model_dir(_get(d, "model", "dir", str)),
         model_folders=_model_folders(_str_list(d, "model", "folders")),
         device=_get(d, "model", "device", str, lambda v: v in ("auto", "gpu", "igpu", "cpu")),
@@ -205,6 +214,8 @@ def parse(text: str, defaults_text: str | None = None) -> Config:
         context_refresh_minutes=_get(d, "context", "refresh_minutes", int, lambda v: 1 <= v <= 1440),
         context_code_apps=tuple(app_key(x) for x in _str_list(d, "context", "code_apps")),
         apps=_apps(d),
+        history_keep=_get(d, "history", "keep", str, lambda v: v in ("off", "session", "disk")),
+        history_max_items=_get(d, "history", "max_items", int, lambda v: 10 <= v <= 5000),
     )
 
 

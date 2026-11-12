@@ -103,6 +103,8 @@ PAGES: list[tuple[str, list[tuple[str, list[Spec]]]]] = [
               "Puts the last dictated text on the clipboard."),
             S(("hotkey", "correct_last"), "hotkey_opt", "Correct last dictation",
               "Opens the last dictation to fix a word; fixes are learned."),
+            S(("hotkey", "history"), "hotkey_opt", "History",
+              "Opens the list of recent dictations to copy one again."),
         ]),
         ("While recording", [
             S(("hotkey", "hold_threshold"), "float", "Hold time (seconds)",
@@ -179,6 +181,11 @@ PAGES: list[tuple[str, list[tuple[str, list[Spec]]]]] = [
         ("Privacy and files", [
             S(("output", "log_transcripts"), "switch", "Write dictated text to the log",
               "Off by default: dictation can contain sensitive text."),
+            S(("history", "keep"), "choice", "Keep a history of dictations",
+              "For tray menu → History. Until the app quits = memory only; On this PC = also on disk.",
+              choices=(("off", "Off"), ("session", "Until the app quits"), ("disk", "On this PC"))),
+            S(("history", "max_items"), "int", "History length (dictations)",
+              "10-5000, the oldest dropped first.", lo=10, hi=5000, step=10),
             S(None, "action", "Files", "Per-program settings and exact replacements are in the settings file.",
               choices=(("open_log", "Open log"), ("open_file", "Open settings file"))),
         ]),

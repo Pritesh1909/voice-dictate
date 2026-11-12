@@ -21,9 +21,10 @@ def main() -> int:
 
     paths = Paths.default()
     paths.ensure()
-    if len(sys.argv) >= 2 and sys.argv[1] in ("--correct", "--settings"):
-        # The "Correct last dictation…" and Settings windows, each its own process while the tray app keeps
-        # running (see correct.py for why). They append to the log without rotating it (the tray app owns it).
+    if len(sys.argv) >= 2 and sys.argv[1] in ("--correct", "--settings", "--history"):
+        # The "Correct last dictation…", Settings and History windows, each its own process while the tray
+        # app keeps running (see correct.py for why). They append to the log without rotating it (the tray
+        # app owns it).
         logging.basicConfig(level=logging.INFO, handlers=[logging.FileHandler(paths.log_file, encoding="utf-8")],
                             format="%(asctime)s %(levelname)s %(name)s: %(message)s")
         if sys.argv[1] == "--settings":
@@ -31,6 +32,9 @@ def main() -> int:
             return settings_ui.run(paths)
         if len(sys.argv) >= 3:
             from pathlib import Path
+            if sys.argv[1] == "--history":
+                from . import history_ui
+                return history_ui.run(paths, Path(sys.argv[2]))
 
             from .correct import run
             return run(paths, Path(sys.argv[2]))

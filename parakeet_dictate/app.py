@@ -14,6 +14,7 @@ import pystray
 from . import APP_NAME, __version__
 from . import config as cfgmod
 from . import commands, context, correct, learn, models, output, winutil
+from . import history as hist
 from .appsettings import settings_for
 from .audio import SR, Recorder, preprocess, resample, silence_stop_due, silence_stop_message
 from .engine import GPU_MARKER, Engine, EngineError, EngineSpec
@@ -285,6 +286,8 @@ class Session:
 
 
 class App:
+    history: "hist.History | None" = None   # recent dictations ([history]); set in __init__
+
     def __init__(self, paths: cfgmod.Paths):
         self.paths = paths
         self.cfg = cfgmod.load(paths)
@@ -314,6 +317,7 @@ class App:
         self.hotkeys = HotkeyThread(self.cfg.hotkey, self._on_hotkey, self._on_cancel, self._on_extra_hotkey)
         self.state = "idle"          # idle | recording | busy
         self.last_text = ""
+        self.history = hist.History(paths.history_file, self.cfg.history_keep, self.cfg.history_max_items)
         self.last_stats = ""
         self.failed: FailedRecording | None = None   # the last dictation that couldn't be transcribed
         self._lock = threading.Lock()
@@ -617,6 +621,8 @@ class App:
         self._vocab = self._vocabulary(c)
         self.recorder.device_hint = c.input_device
         self.sounds.enabled = c.sounds
+        if self.history is not None:
+            self.history.configure(c.history_keep, c.history_max_items)
         if c.overlay and self.overlay is None:
             self.overlay = self._new_overlay(c)
         elif self.overlay is not None and (not c.overlay or self.overlay.wide != c.stream_while_speaking):
@@ -652,16 +658,18 @@ class App:
 
     @staticmethod
     def _extra_hotkeys(c: cfgmod.Config) -> dict[str, str]:
-        return {"copy_last": c.copy_last_hotkey, "correct_last": c.correct_last_hotkey}
+        return {"copy_last": c.copy_last_hotkey, "correct_last": c.correct_last_hotkey,
+                "history": c.history_hotkey}
 
     @staticmethod
     def _extras_problem(errors: dict[str, str]) -> str | None:
-        names = {"copy_last": "Copy last dictation", "correct_last": "Correct last dictation"}
+        names = {"copy_last": "Copy last dictation", "correct_last": "Correct last dictation", "history": "History"}
         return "; ".join(f"{names.get(k, k)} shortcut not set: {v}" for k, v in errors.items()) or None
 
     def _on_extra_hotkey(self, name: str) -> None:  # hotkey thread: hand the work to a thread of its own
         log.info("shortcut: %s", name)
-        target = {"copy_last": self.copy_last, "correct_last": self.correct_last}.get(name)
+        target = {"copy_last": self.copy_last, "correct_last": self.correct_last,
+                  "history": self.open_history_window}.get(name)
         if target:
             threading.Thread(target=target, daemon=True, name=name).start()
 
@@ -686,6 +694,58 @@ class App:
         except Exception as e:
             log.exception("correction window")
             self._notify(f"Couldn't open the correction window: {e}")
+
+    # --- history of recent dictations ------------------------------------------------------------------
+
+    _history_proc = None    # the open History window's process
+
+    def _remember(self, text: str, program: str, seconds: float) -> None:
+        """Add a finished dictation to the history ([history] keep; nothing when it is "off")."""
+        if self.history is None:
+            return
+        try:
+            self.history.add(text, program, seconds)
+        except Exception:
+            log.exception("history")
+
+    def _has_history(self) -> bool:
+        return self.history is not None and self.history.enabled and len(self.history) > 0
+
+    def open_history_window(self) -> None:
+        """The History window, its own process and only one at a time. It gets the entries in a temporary
+        file it deletes on reading; what it deletes comes back in history_result.json when it closes."""
+        from . import history_ui
+        h = self.history
+        if h is None or not h.enabled:
+            self._notify("History is off (Settings → Extras → Privacy and files).")
+            return
+        p = self._history_proc
+        if p is not None and p.poll() is None:
+            return
+        if not len(h):
+            self._notify("No dictations in the history yet.")
+            return
+        data = self.paths.data_dir
+        hist.drop_requests(data)    # left by a window that crashed before reading them
+        hist.read_result(data)      # ... or a result nobody picked up
+        try:
+            p, request = history_ui.launch(h.keep, h.entries(), data)
+            self._history_proc = p
+        except Exception as e:
+            log.exception("history window")
+            self._notify(f"Couldn't open the History window: {e}")
+            return
+
+        def wait() -> None:
+            p.wait()
+            request.unlink(missing_ok=True)     # the window never got to read it
+            deleted = hist.read_result(data)
+            if deleted:
+                log.info("history: %d entr%s deleted", len(deleted), "y" if len(deleted) == 1 else "ies")
+                h.remove(deleted)
+                self._refresh()
+
+        threading.Thread(target=wait, daemon=True, name="history-window").start()
 
     # --- the Settings window ------------------------------------------------------------------------
 
@@ -933,6 +993,7 @@ class App:
                     self.overlay.flash("Only filler words heard", MUTED, 1200)
                 return
             self.last_text = text
+            self._remember(text, self.target_exe, spoken)
             if typer is None:
                 typed = self._land(text, session.out)
             elif typer.failed is not None:
@@ -1031,6 +1092,8 @@ class App:
                     self.overlay.working("Click where the text should go…")
                 output.wait_for_target(5.0)
             typed = self._land(text)
+            if self.history is not None and self.history.enabled:
+                self._remember(text, winutil.foreground_exe(), kept.audio.size / max(1, kept.rate))
             if kept.partly_typed:
                 self._notify(DOUBLED_NOTE)
             elif typed:
@@ -1190,6 +1253,9 @@ class App:
               lambda i, it: self.copy_last(), enabled=lambda _: bool(self.last_text)),
             I(lambda _: with_key("Correct last dictation…", self.cfg.correct_last_hotkey),
               lambda i, it: self.correct_last(), enabled=lambda _: bool(self.last_text)),
+            I(lambda _: with_key("History…", self.cfg.history_hotkey), lambda i, it: self.open_history_window(),
+              visible=lambda _: self.history is not None and self.history.enabled,
+              enabled=lambda _: self._has_history()),
             I("Retry last recording", lambda i, it: self.retry_failed(), visible=lambda _: self.failed is not None,
               enabled=lambda _: self._can_retry()),
             I("Discard last recording", lambda i, it: self.discard_failed(),
