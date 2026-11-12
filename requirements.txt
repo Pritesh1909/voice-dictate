@@ -8,4 +8,7 @@ numpy==2.5.4
 # Tray icon (plain Win32, no GUI toolkit) + icon drawing.
 pystray==0.19.5
 Pillow==13.0.0
+# Settings window: Windows 11 look for tkinter, and TOML editing that keeps the comments in config.toml.
+sv-ttk==2.6.1
+tomlkit==0.15.2
 pytest>=8.0
