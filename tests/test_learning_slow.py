@@ -121,6 +121,7 @@ def test_mishearing_learned_from_two_recordings(tmp_path, monkeypatch):
     print(f"learned_auto.toml:\n{auto_file.read_text('utf-8') if auto_file.exists() else '(missing)'}")
 
     assert not result.startswith("error:"), result
+    assert len(asked) == 2, f"the stub judge should have been asked about both recordings: {asked}"
     assert [f.term for f in fixes] == [TERM], f"expected one fix for {TERM}: {fixes}"
 
     # The clean-up built the way the app builds it: [dictionary], then learned.toml (none here), then the

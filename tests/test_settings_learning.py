@@ -63,7 +63,8 @@ def test_pages_have_learning_specs():
         ("learning", "keep_days"), "int", "1-365.", 1, 365)
     files = privacy["Recordings"]
     assert (files.key, files.kind, files.help, files.choices) == (
-        None, "action", "Saved dictations used for learning.",
+        None, "action",
+        "What you said, as audio and text; the checked text stays in learning\\checked.jsonl until you delete it.",
         (("delete_recordings", "Delete all"), ("open_recordings", "Open folder")))
 
 
