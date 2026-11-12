@@ -26,6 +26,16 @@ meter and timer), then **Transcribing…**, then **✓ Typed** (or *Cancelled* /
 top of all windows, never takes focus and lets clicks pass through. Turn it off or move it to the top with
 `[overlay]` in the settings. When the microphone clips it turns red and reads **Too loud**.
 
+**Put the pill anywhere:** tray → *Move the pill…* shows it with "Drag me · Enter to save · Esc to cancel".
+Drag it with the left mouse button to any spot on any monitor, then press **Enter**, double-click it, or pick
+*Done moving the pill* in the tray menu (Esc cancels). Only while you move it does the pill take the mouse
+and keyboard; afterwards it is click-through and never-focused again, and the window you were in gets the
+focus back. No dictation starts meanwhile: the hotkey just saves the position and ends moving. The spot is
+kept in `%LOCALAPPDATA%\ParakeetDictate\pill_position.json` (the monitor's name and where on it, as a share
+of the screen, so a resolution or scaling change keeps it in place) and the pill always stays fully on that
+screen. With a saved spot the pill **stays on that monitor** instead of following the window you type into;
+when that monitor isn't connected it goes back to its usual place. Tray → *Reset pill position* forgets it.
+
 In tap mode a dictation stops by itself (and types what you said) after a minute without speech
 (`[audio] silence_stop_seconds`, 0 = off). If the microphone is unplugged mid-dictation it stops the same way;
 if the microphone named in `[audio] input_device` isn't there, the Windows default is used and a notification says so.
@@ -166,8 +176,8 @@ A new dictation within the 30 s reuses the loaded model and starts instantly. Ch
 - Settings: `%APPDATA%\ParakeetDictate\config.toml` (created from `parakeet_dictate\config.default.toml`)
 - Learned words: `%APPDATA%\ParakeetDictate\learned.toml`; names found in your notes:
   `%LOCALAPPDATA%\ParakeetDictate\context_terms.json` (names, file times and one-way word hashes; no note text)
-- Log, sounds, icon, the chosen model (`model_path.txt`): `%LOCALAPPDATA%\ParakeetDictate\`. Recognised text is **not**
-  logged unless `[output] log_transcripts = true`.
+- Log, sounds, icon, the chosen model (`model_path.txt`), where you put the pill (`pill_position.json`):
+  `%LOCALAPPDATA%\ParakeetDictate\`. Recognised text is **not** logged unless `[output] log_transcripts = true`.
 
 ## Install
 
@@ -197,6 +207,14 @@ When run on Linux itself (or inside WSL), the same finder searches the Linux hom
 folders under `/mnt/c/Users`. The dictation app itself (hotkey, typing, tray, indicator) is Windows-only.
 
 Tray menu → *Find models again* re-runs the search. To force a model, set `[model] dir` to a `.gguf` file or its folder.
+
+**Your own models:** `[model] folders` lists more `.gguf` files or folders (searched two folder levels deep,
+environment variables allowed). Their models are listed under *Model* as "your folder (…)" next to the ones found
+automatically, also when `dir` is a fixed path (then `dir` is the one used at start, and a model picked in the menu
+is used until the app restarts). A folder that is gone (a USB drive, say) is simply not listed. Tray →
+*Add a model file…* opens the Windows file dialog: the file must be a speech-to-text model (a voice detector or
+an LLM `.gguf` is refused with a notification); it is added to `folders` in your `config.toml` (only that line
+changes, comments stay) and used right away. Your pick is remembered in `model_path.txt` like any other.
 
 ## Build the installer
 

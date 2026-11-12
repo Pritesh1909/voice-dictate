@@ -1,17 +1,29 @@
 """Small always-on-top pill that shows Listening / Transcribing / Typed.
 
 It never takes focus (WS_EX_NOACTIVATE), clicks go straight through it (WS_EX_TRANSPARENT), and it
-appears on the monitor of the window you are typing into. When hidden it is fully transparent and
-parked off-screen, and no timers run, so it costs nothing between dictations.
+appears on the monitor of the window you are typing into, or where the user dragged it to (see
+pillpos.py: then it stays on that monitor). When hidden it is fully transparent and parked off-screen,
+and no timers run, so it costs nothing between dictations.
+
+Move mode (tray → "Move the pill…") is the one exception: for as long as it lasts, the pill takes the
+mouse and the keyboard (WS_EX_TRANSPARENT and WS_EX_NOACTIVATE cleared) so it can be dragged, and
+Enter / a double-click saves, Esc cancels. Afterwards the exact original styles are put back and the
+window that was in front gets the focus again. The app never starts a dictation while it lasts.
 """
 from __future__ import annotations
 
 import ctypes
 import ctypes.wintypes as wt
+import logging
 import math
 import threading
 import time
 import tkinter as tk
+from pathlib import Path
+
+from . import pillpos
+
+log = logging.getLogger(__name__)
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
@@ -25,13 +37,22 @@ user32.GetMonitorInfoW.argtypes = [wt.HANDLE, ctypes.c_void_p]
 user32.GetParent.restype = wt.HWND
 user32.GetParent.argtypes = [wt.HWND]
 user32.GetForegroundWindow.restype = wt.HWND
+user32.SetForegroundWindow.argtypes = [wt.HWND]
+user32.IsWindow.argtypes = [wt.HWND]
 
 GWL_EXSTYLE = -20
 WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_EX_TOOLWINDOW = 0x8, 0x20, 0x80
 WS_EX_LAYERED, WS_EX_NOACTIVATE = 0x80000, 0x08000000
+PILL_EX = WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TOPMOST
+MOVE_CLEARS = WS_EX_TRANSPARENT | WS_EX_NOACTIVATE      # only while the user moves the pill
 HWND_TOPMOST = wt.HWND(-1)
-SWP_NOSIZE, SWP_NOACTIVATE, SWP_SHOWWINDOW = 0x1, 0x10, 0x40
+SWP_NOSIZE, SWP_NOMOVE, SWP_NOZORDER, SWP_NOACTIVATE = 0x1, 0x2, 0x4, 0x10
+SWP_FRAMECHANGED, SWP_SHOWWINDOW = 0x20, 0x40
 MONITOR_DEFAULTTONEAREST = 2
+
+# Move-mode hint, longest first: the first that fits the pill is shown.
+MOVE_HINTS = ("Drag me · Enter to save · Esc to cancel", "Drag · Enter saves · Esc cancels",
+              "Drag · Enter · Esc")
 
 KEY = "#010203"          # transparent colour key
 BG = "#1d1f24"
@@ -79,11 +100,26 @@ def listening_look(level: float, clipping: bool) -> tuple[str, str, str, float]:
     return "Listening", FG, FG if v > 0.05 else MUTED, v
 
 
+def fit_text(texts, measure, room: float) -> str:
+    """The first of `texts` whose measured width fits in `room` (else the last, shortest one)."""
+    for t in texts:
+        if measure(t) <= room:
+            return t
+    return texts[-1]
+
+
 class Overlay:
-    def __init__(self, position: str = "bottom", wide: bool = False):
+    def __init__(self, position: str = "bottom", wide: bool = False, pos_file: Path | None = None):
         self.position = position
         self.wide = wide            # live streaming: room for the words heard but not typed yet
         self.margin = -1            # pixels from the screen edge (at 100% scaling); -1 = 24 at the top, 56 at the bottom
+        self.pos_file = pos_file    # pill_position.json (None = never moved by the user)
+        self._saved: pillpos.SavedPosition | None = None
+        self._saved_loaded = False
+        self._on_move_end = None    # move mode: called (in its own thread) with True when saved
+        self._prev_fg = None        # move mode: the window in front before it, given the focus back after
+        self._grab: tuple[int, int] | None = None
+        self.hwnd = 0
         self._preview_fn = lambda: ""
         self._ready = threading.Event()
         self._root: tk.Tk | None = None
@@ -120,14 +156,38 @@ class Overlay:
     def close(self) -> None:
         self._call(lambda: self._root.destroy())
 
+    @property
+    def moving(self) -> bool:
+        return self._mode == "move"
+
+    def start_move(self, on_end) -> bool:
+        """Show the pill in move mode. on_end(saved: bool) is called once it ends, in a thread of its own
+        (never on the Tk thread, so it may take locks that other threads hold while calling into here).
+        False when the pill's window isn't running."""
+        return self._call(self._begin_move, on_end)
+
+    def end_move(self, save: bool) -> bool:
+        """End move mode (save = keep the new spot). False when the pill's window isn't running."""
+        return self._call(self._end_move, save)
+
+    def forget_position(self) -> None:
+        """The saved position was deleted: use the usual place from the next time the pill shows."""
+        self._saved, self._saved_loaded = None, True
+
+    def is_foreground(self) -> bool:
+        """True when the pill's window has the focus (it never should outside move mode)."""
+        return bool(self.hwnd) and user32.GetForegroundWindow() == self.hwnd
+
     # --- Tk thread ------------------------------------------------------------------------------
 
-    def _call(self, fn, *a, **kw) -> None:
+    def _call(self, fn, *a, **kw) -> bool:
         if self._root is not None:
             try:
                 self._root.after(0, lambda: fn(*a, **kw))
+                return True
             except (RuntimeError, tk.TclError):
                 pass
+        return False
 
     def _run(self) -> None:
         s = _dpi_scale()
@@ -143,17 +203,41 @@ class Overlay:
         root.geometry(f"{self.w}x{self.h}+-4000+-4000")
         self.canvas = tk.Canvas(root, width=self.w, height=self.h, bg=KEY, highlightthickness=0, bd=0)
         self.canvas.pack()
+        # Move mode only: with WS_EX_TRANSPARENT / WS_EX_NOACTIVATE set these never fire.
+        self.canvas.bind("<ButtonPress-1>", self._on_press)
+        self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_release)
+        self.canvas.bind("<Double-Button-1>", lambda e: self._end_move(True))
+        for key in ("<Return>", "<KP_Enter>"):
+            root.bind(key, lambda e: self._end_move(True))
+        root.bind("<Escape>", lambda e: self._end_move(False))
         root.update_idletasks()
         self.hwnd = user32.GetParent(root.winfo_id()) or root.winfo_id()
         ex = user32.GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE)
-        user32.SetWindowLongPtrW(self.hwnd, GWL_EXSTYLE,
-                                 ex | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TOPMOST)
+        self._ex = ex | PILL_EX              # the pill's styles: restored exactly after move mode
+        user32.SetWindowLongPtrW(self.hwnd, GWL_EXSTYLE, self._ex)
         root.deiconify()                     # shown once, invisible and off-screen; never re-activated
         self._root = root
         self._ready.set()
         root.mainloop()
 
+    def _saved_position(self) -> pillpos.SavedPosition | None:
+        if not self._saved_loaded:
+            self._saved = pillpos.load(self.pos_file) if self.pos_file else None
+            self._saved_loaded = True
+        return self._saved
+
     def _place(self) -> None:
+        try:
+            saved = self._saved_position()
+            xy = pillpos.placement(saved, pillpos.monitors(), self.w, self.h) if saved else None
+        except Exception:                    # never let a position problem keep the pill from showing
+            log.exception("saved pill position")
+            xy = None
+        if xy is not None:                   # where the user put it (stays on that monitor)
+            user32.SetWindowPos(self.hwnd, HWND_TOPMOST, xy[0], xy[1], 0, 0,
+                                SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW)
+            return
         mon = user32.MonitorFromWindow(user32.GetForegroundWindow(), MONITOR_DEFAULTTONEAREST)
         mi = MONITORINFO()
         mi.cbSize = ctypes.sizeof(mi)
@@ -164,6 +248,8 @@ class Overlay:
         user32.SetWindowPos(self.hwnd, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW)
 
     def _show(self, mode: str, **kw) -> None:
+        if self._mode == "move":             # move mode owns the pill until it ends
+            return
         if self._hide_job:
             self._root.after_cancel(self._hide_job)
             self._hide_job = None
@@ -181,7 +267,9 @@ class Overlay:
         elif self._anim_job is None:
             self._animate()
 
-    def _hide(self) -> None:
+    def _hide(self, force: bool = False) -> None:
+        if self._mode == "move" and not force:
+            return
         self._mode = "hidden"
         self._hide_job = None
         if self._anim_job:
@@ -189,6 +277,89 @@ class Overlay:
             self._anim_job = None
         self._root.attributes("-alpha", 0.0)
         user32.SetWindowPos(self.hwnd, HWND_TOPMOST, -4000, -4000, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE)
+
+    # --- move mode (Tk thread) ------------------------------------------------------------------
+
+    def _set_styles(self, ex: int) -> None:
+        user32.SetWindowLongPtrW(self.hwnd, GWL_EXSTYLE, ex)
+        user32.SetWindowPos(self.hwnd, None, 0, 0, 0, 0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED)
+
+    def _begin_move(self, on_end) -> None:
+        if self._mode == "move":
+            return
+        for job in (self._hide_job, self._anim_job):
+            if job:
+                self._root.after_cancel(job)
+        self._hide_job = self._anim_job = None
+        self._prev_fg = user32.GetForegroundWindow()
+        if self._mode == "hidden":
+            self._place()
+        self._mode = "move"
+        self._on_move_end = on_end
+        self._grab = None
+        self._set_styles(self._ex & ~MOVE_CLEARS)
+        self._root.attributes("-alpha", 0.96)
+        self._draw()
+        try:
+            self._root.focus_force()         # so Enter / Esc reach it; clicking it works too
+        except tk.TclError:
+            pass
+
+    def _end_move(self, save: bool) -> None:
+        if self._mode != "move":
+            return
+        saved = False
+        if save:
+            try:
+                saved = self._save_position()
+            except Exception:
+                log.exception("saving the pill position")
+        self._set_styles(self._ex)           # click-through and never-focused again, exactly as before
+        self._grab = None
+        prev = self._prev_fg
+        if user32.GetForegroundWindow() == self.hwnd and prev and prev != self.hwnd and user32.IsWindow(prev):
+            user32.SetForegroundWindow(prev)  # give the focus back to the window that had it
+        self._prev_fg = None
+        self._hide(force=True)
+        on_end, self._on_move_end = self._on_move_end, None
+        if on_end is not None:
+            threading.Thread(target=on_end, args=(saved,), daemon=True, name="pill-moved").start()
+        if saved:
+            self._show("flash", text="Position saved", color=GREEN, ms=900)   # shown at the new place
+
+    def _save_position(self) -> bool:
+        if not self.pos_file:
+            return False
+        left, top, _, _ = pillpos.window_rect(self.hwnd)
+        mon = pillpos.monitor_of_window(self.hwnd)
+        if mon is None:
+            return False
+        pos = pillpos.to_relative(mon.device, left, top, self.w, self.h, mon.work)
+        pillpos.save(self.pos_file, pos, mon.work)
+        self._saved, self._saved_loaded = pos, True
+        return True
+
+    def _on_press(self, _event=None) -> None:
+        if self._mode != "move":
+            return
+        cx, cy = pillpos.cursor_pos()
+        left, top, _, _ = pillpos.window_rect(self.hwnd)
+        self._grab = (cx - left, cy - top)
+        try:
+            self.canvas.focus_set()
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _on_drag(self, _event=None) -> None:
+        if self._mode != "move" or self._grab is None:
+            return
+        cx, cy = pillpos.cursor_pos()
+        user32.SetWindowPos(self.hwnd, HWND_TOPMOST, cx - self._grab[0], cy - self._grab[1], 0, 0,
+                            SWP_NOSIZE | SWP_NOACTIVATE)
+
+    def _on_release(self, _event=None) -> None:
+        self._grab = None
 
     def _animate(self) -> None:
         if self._mode not in ("listening", "working"):
@@ -255,6 +426,16 @@ class Overlay:
                 col = AMBER if on else "#6b5a35"
                 c.create_oval(x - rr, cy - rr, x + rr, cy + rr, fill=col, outline=col)
             c.create_text(46 * s, cy, text=self._kw.get("text", "Transcribing…"), fill=FG, font=font, anchor="w")
+        elif self._mode == "move":
+            c.create_text(22 * s, cy, text="✥", fill=AMBER, font=("Segoe UI Symbol", 12), anchor="center")
+            room = self.w - (38 + 16) * s
+            try:
+                import tkinter.font as tkfont
+                f = tkfont.Font(root=self._root, family="Segoe UI", size=9)
+                hint = fit_text(MOVE_HINTS, f.measure, room)
+            except (tk.TclError, AttributeError):
+                hint = MOVE_HINTS[-1]
+            c.create_text(38 * s, cy, text=hint, fill=FG, font=small, anchor="w")
         elif self._mode == "flash":
             col = self._kw.get("color", GREEN)
             c.create_oval(14 * s, cy - 7 * s, 28 * s, cy + 7 * s, fill=col, outline=col)

@@ -19,6 +19,12 @@ esc_cancels = true
 # Or put a .gguf file or folder here, e.g. "%APPDATA%\\orca\\speech-models\\parakeet-tdt-0.6b-v2-int8".
 # Models are only ever read, never changed.
 dir = "auto"
+# More places with speech models of your own: .gguf files or folders (searched two folder levels deep).
+# Their models are listed under "Model" in the tray menu as "your folder", next to the ones found
+# automatically (also when dir above is a fixed file or folder). Tray menu → "Add a model file…" adds a
+# file here for you. A folder that is gone is simply skipped. For example:
+# folders = ["D:\\models", "%USERPROFILE%\\Downloads\\whisper-small-Q8_0.gguf"]
+folders = []
 # Where the model runs. "auto" = graphics card if there is one (NVIDIA RTX 2050 here: 16 s of speech in
 # 0.3 s), else the CPU (~4.5 s). "gpu" = discrete card, "igpu" = built-in Intel graphics, "cpu" = CPU.
 # If the chosen device fails, the CPU is used instead.
@@ -134,6 +140,8 @@ log_transcripts = false
 [overlay]
 # Small "Listening / Transcribing / Typed" pill on top of all windows, on the screen you're working on.
 # It never takes focus and clicks pass through it.
+# Tray menu → "Move the pill…" lets you drag it anywhere, on any monitor; it then stays there (and on that
+# monitor) and position / margin below are only used again after tray menu → "Reset pill position".
 enabled = true
 # "bottom" or "top" of the screen.
 position = "bottom"

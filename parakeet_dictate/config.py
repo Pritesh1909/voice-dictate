@@ -74,6 +74,7 @@ class Config:
     hold_threshold: float
     esc_cancels: bool
     model_dir: str          # "auto", a .gguf file or a folder holding one (environment variables expanded)
+    model_folders: tuple[str, ...]   # [model] folders: more .gguf files / folders to list (variables expanded)
     device: str             # auto | gpu | igpu | cpu
     threads: int
     unload_after_seconds: int
@@ -161,6 +162,7 @@ def parse(text: str, defaults_text: str | None = None) -> Config:
         hold_threshold=_get(d, "hotkey", "hold_threshold", float, lambda v: 0 <= v <= 5),
         esc_cancels=_get(d, "hotkey", "esc_cancels", bool),
         model_dir=_model_dir(_get(d, "model", "dir", str)),
+        model_folders=_model_folders(_str_list(d, "model", "folders")),
         device=_get(d, "model", "device", str, lambda v: v in ("auto", "gpu", "igpu", "cpu")),
         threads=_get(d, "model", "threads", int, lambda v: 1 <= v <= 32),
         unload_after_seconds=_get(d, "model", "unload_after_seconds", int, lambda v: v >= -1),
@@ -285,6 +287,20 @@ def load(paths: Paths) -> Config:
 def _model_dir(v: str) -> str:
     v = v.strip()
     return "auto" if v.lower() in ("", "auto") else os.path.expandvars(v)
+
+
+def _model_folders(v: tuple[str, ...]) -> tuple[str, ...]:
+    """[model] folders with environment variables and ~ expanded, each once (capitals don't matter)."""
+    seen, out = set(), []
+    for x in v:
+        p = os.path.expanduser(os.path.expandvars(x))
+        if "\n" in p or "\0" in p:
+            raise ConfigError(f"[model] folders has an invalid path: {x!r}")
+        key = os.path.normcase(os.path.normpath(p))
+        if key not in seen:
+            seen.add(key)
+            out.append(p)
+    return tuple(out)
 
 
 def _language(v: str) -> str:

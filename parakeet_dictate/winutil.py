@@ -184,3 +184,73 @@ def window_title(hwnd: int) -> str:
     buf = ctypes.create_unicode_buffer(n + 1)
     user32.GetWindowTextW(hwnd, buf, n + 1)
     return buf.value
+
+
+# --- open-file dialog (no Tk: the tray thread has no Tk root) -------------------------------------
+
+class OPENFILENAMEW(ctypes.Structure):
+    _fields_ = [("lStructSize", wt.DWORD), ("hwndOwner", wt.HWND), ("hInstance", wt.HINSTANCE),
+                ("lpstrFilter", ctypes.c_void_p), ("lpstrCustomFilter", ctypes.c_void_p),
+                ("nMaxCustFilter", wt.DWORD), ("nFilterIndex", wt.DWORD),
+                ("lpstrFile", ctypes.c_void_p), ("nMaxFile", wt.DWORD),
+                ("lpstrFileTitle", ctypes.c_void_p), ("nMaxFileTitle", wt.DWORD),
+                ("lpstrInitialDir", ctypes.c_void_p), ("lpstrTitle", ctypes.c_void_p),
+                ("Flags", wt.DWORD), ("nFileOffset", wt.WORD), ("nFileExtension", wt.WORD),
+                ("lpstrDefExt", ctypes.c_void_p), ("lCustData", wt.LPARAM), ("lpfnHook", ctypes.c_void_p),
+                ("lpTemplateName", ctypes.c_void_p), ("pvReserved", ctypes.c_void_p),
+                ("dwReserved", wt.DWORD), ("FlagsEx", wt.DWORD)]
+
+
+OFN_HIDEREADONLY, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST = 0x4, 0x8, 0x800
+OFN_FILEMUSTEXIST, OFN_EXPLORER, OFN_DONTADDTORECENT = 0x1000, 0x80000, 0x2000000
+OPEN_FLAGS = (OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER | OFN_NOCHANGEDIR | OFN_HIDEREADONLY
+              | OFN_DONTADDTORECENT)
+_MAX_PATH_CHARS = 32768
+
+
+def _get_open_file_name(pofn) -> int:
+    comdlg32 = ctypes.WinDLL("comdlg32")
+    comdlg32.GetOpenFileNameW.argtypes = [ctypes.POINTER(OPENFILENAMEW)]
+    comdlg32.GetOpenFileNameW.restype = wt.BOOL
+    ole32 = ctypes.WinDLL("ole32")
+    hr = ole32.CoInitializeEx(None, 0x2)      # the Explorer-style dialog wants a single-threaded COM apartment
+    try:
+        if comdlg32.GetOpenFileNameW(pofn):
+            return 0
+        return comdlg32.CommDlgExtendedError() or -1   # 0 there means cancelled
+    finally:
+        if hr in (0, 1):                        # S_OK / S_FALSE: this call initialised it
+            ole32.CoUninitialize()
+
+
+def open_file_dialog(title: str, filters: list[tuple[str, str]], initial_dir: str | None = None,
+                     call=_get_open_file_name) -> str | None:
+    """The Windows "Open" dialog for one existing file; its path, or None when cancelled. Blocks until the
+    dialog closes, so call it from a worker thread. `filters`: [("Speech models (*.gguf)", "*.gguf"), ...].
+    `call` runs GetOpenFileNameW (replaced in tests): 0 = a file was picked, -1 = cancelled, else the
+    CommDlgExtendedError code. Raises OSError on a dialog error."""
+    flt = ctypes.create_unicode_buffer("".join(f"{label}\0{pattern}\0" for label, pattern in filters) + "\0")
+    buf = ctypes.create_unicode_buffer(_MAX_PATH_CHARS)
+    ttl = ctypes.create_unicode_buffer(title)
+    init = ctypes.create_unicode_buffer(initial_dir) if initial_dir else None
+    ofn = OPENFILENAMEW()
+    ofn.lStructSize = ctypes.sizeof(OPENFILENAMEW)
+    ofn.lpstrFilter = ctypes.addressof(flt)
+    ofn.nFilterIndex = 1
+    ofn.lpstrFile = ctypes.addressof(buf)
+    ofn.nMaxFile = _MAX_PATH_CHARS
+    ofn.lpstrTitle = ctypes.addressof(ttl)
+    ofn.lpstrInitialDir = ctypes.addressof(init) if init is not None else None
+    ofn.Flags = OPEN_FLAGS
+    rc = call(ctypes.pointer(ofn))
+    if rc == -1:
+        return None
+    if rc != 0:
+        raise OSError(f"the file dialog failed (error {rc:#x})")
+    return buf.value or None
+
+
+def downloads_folder() -> str | None:
+    home = os.environ.get("USERPROFILE")
+    d = Path(home) / "Downloads" if home else None
+    return str(d) if d is not None and d.is_dir() else None

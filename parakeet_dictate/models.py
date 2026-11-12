@@ -294,6 +294,38 @@ def _unique(c: list[Place]) -> list[Place]:
     return out
 
 
+def _is_wsl_path(p: Path) -> bool:
+    return str(p).lower().startswith(("\\\\wsl.localhost\\", "\\\\wsl$\\"))
+
+
+def user_source(p: Path) -> str:
+    """Source label of a model from [model] folders: "your folder (<name>)", the entry's own folder name
+    (for a .gguf file entry, the folder it is in)."""
+    p = Path(p)
+    folder = p.parent if p.suffix.lower() == ".gguf" else p
+    return f"your folder ({folder.name or str(folder)})"
+
+
+def user_places(entries: Iterable[str | Path]) -> list[Place]:
+    """[model] folders: .gguf files or folders (searched two folder levels deep, like the app folders)."""
+    out: list[Place] = []
+    for e in entries:
+        p = Path(os.path.expandvars(str(e))).expanduser()
+        out.append((p, user_source(p), 2))
+    return _unique(out)
+
+
+def _files_at(p: Path, depth: int) -> list[Path]:
+    """A place's *.gguf files: the place itself when it is a .gguf file, else the files in the folder.
+    A file or folder that isn't there (any more) just gives nothing."""
+    try:
+        if p.is_file():
+            return [p] if p.suffix.lower() == ".gguf" else []
+    except OSError:
+        return []
+    return _gguf_files(p, depth)
+
+
 def linux_home_places(home: Path, label: str) -> list[Place]:
     c: list[Place] = [(home / ".config" / n / "speech-models", f"Orca ({label})", 2) for n in ("orca", "Orca")]
     c += [(d, f"{app} ({label})", 2) for d, app in _subdirs(home / ".config", "speech-models")]
@@ -355,19 +387,24 @@ def _rank(m: Model):
 
 
 def find(include_wsl: bool = True, distros: Iterable[str] | None = None,
-         share_root: str = r"\\wsl.localhost", env: dict | None = None) -> list[Model]:
+         share_root: str = r"\\wsl.localhost", env: dict | None = None,
+         extra: Iterable[str | Path] = ()) -> list[Model]:
     """Every speech-to-text model found, best first. The same model found in two places (e.g. Orca's
-    folder and a copy) is listed once, keeping the copy on this PC."""
+    folder and a copy) is listed once, keeping the copy on this PC. `extra`: the [model] folders
+    (files or folders), searched first; a model there is listed under "your folder" even when an
+    identical copy is somewhere else too."""
+    places = [(p, s, d, _is_wsl_path(p)) for p, s, d in user_places(extra)]
+    n_user = len(places)
     if sys.platform == "win32" or env is not None:
-        places = [(p, s, d, False) for p, s, d in windows_places(env)]
+        places += [(p, s, d, False) for p, s, d in windows_places(env)]
         if include_wsl:
             ds = wsl_distros() if distros is None else list(distros)
             places += [(p, s, d, True) for p, s, d in wsl_places(ds, share_root)]
     else:
-        places = [(p, s, d, False) for p, s, d in linux_places()]
-    seen, found = set(), []
-    for base, src, depth, wsl in places:
-        for f in _gguf_files(base, depth):
+        places += [(p, s, d, False) for p, s, d in linux_places()]
+    seen, found, mine = set(), [], set()
+    for i, (base, src, depth, wsl) in enumerate(places):
+        for f in _files_at(base, depth):
             key = str(f).lower()
             if key in seen:
                 continue
@@ -375,14 +412,68 @@ def find(include_wsl: bool = True, distros: Iterable[str] | None = None,
             m = inspect(f, src, wsl)
             if m:
                 found.append(m)
-    found.sort(key=_rank)
-    same, out = set(), []
-    for m in found:
+                if i < n_user:
+                    mine.add(key)
+    return _dedupe(found, mine)
+
+
+def _dedupe(found: list[Model], mine: set[str] = frozenset()) -> list[Model]:
+    """Best first, each model once (same name, file name and size = the same model). Of identical
+    copies, one from the user's own folders wins, then the best-ranked one."""
+    found = sorted(found, key=_rank)
+    same, keep = set(), set()
+    for m in sorted(found, key=lambda m: (str(m.path).lower() not in mine, m.in_wsl)):
         ident = (m.name, m.path.name.lower(), m.size)
         if ident not in same:
             same.add(ident)
-            out.append(m)
+            keep.add(id(m))
+    return [m for m in found if id(m) in keep]
+
+
+def find_in(entries: Iterable[str | Path]) -> list[Model]:
+    """Only the models in [model] folders (files or folders), best first."""
+    seen, found = set(), []
+    for base, src, depth in user_places(entries):
+        for f in _files_at(base, depth):
+            key = str(f).lower()
+            if key not in seen:
+                seen.add(key)
+                m = inspect(f, src, _is_wsl_path(base))
+                if m:
+                    found.append(m)
+    return _dedupe(found, seen)
+
+
+def merge(*lists: Iterable[Model]) -> list[Model]:
+    """The models of several lists in order, each file once."""
+    seen, out = set(), []
+    for lst in lists:
+        for m in lst:
+            key = str(m.path).lower()
+            if key not in seen:
+                seen.add(key)
+                out.append(m)
     return out
+
+
+def why_not_speech(p: Path) -> str:
+    """Why `p` can't be used as the speech model, as the end of a sentence starting with its name."""
+    p = Path(p)
+    try:
+        if not p.is_file():
+            return "isn't there"
+    except OSError:
+        return "can't be read"
+    if p.suffix.lower() != ".gguf":
+        return "isn't a .gguf model file"
+    meta = read_header(p)
+    if meta is None:
+        return "isn't a GGUF model file (or is damaged)"
+    if is_vad(meta):
+        return "is a voice detector (VAD), not a speech-to-text model"
+    if not any(k.startswith("stt.") for k in meta.get("_keys", [])):
+        return "isn't a speech-to-text model (it looks like a language model, LLM)"
+    return "isn't a speech-to-text model (a diarization or language-ID model)"
 
 
 def is_vad(meta: dict) -> bool:

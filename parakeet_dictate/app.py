@@ -305,6 +305,7 @@ class App:
         self.found: list[models.Model] = []   # every model found, for the tray "Model" menu
         self.model_job = ""          # "searching" / "copying 40%" / "downloading 12%"
         self.cfg_model_dir = self.cfg.model_dir
+        self.cfg_model_folders = self.cfg.model_folders
         self.engine = Engine(None, self.cfg.unload_after_seconds, on_change=self._refresh)
         self.vad_path = self._find_vad(self.cfg)
         self._resolve_model(self.cfg)
@@ -317,9 +318,17 @@ class App:
         self._lock = threading.Lock()
         self._session = 0
         self.current: Session | None = None
-        self.overlay: Overlay | None = Overlay(self.cfg.overlay_position, wide=self.cfg.stream_while_speaking) if self.cfg.overlay else None
+        self._adding_model = False   # the "Add a model file…" dialog is open
+        self.overlay: Overlay | None = self._new_overlay(self.cfg) if self.cfg.overlay else None
         if self.overlay:
             self.overlay.margin = self.cfg.overlay_margin
+
+    @property
+    def _pill_file(self):
+        return self.paths.data_dir / "pill_position.json"
+
+    def _new_overlay(self, c: cfgmod.Config) -> Overlay:
+        return Overlay(c.overlay_position, wide=c.stream_while_speaking, pos_file=self._pill_file)
 
     # --- model ------------------------------------------------------------------------------------
 
@@ -327,17 +336,26 @@ class App:
     def _model_cache(self):
         return self.paths.data_dir / "model_path.txt"
 
-    def _resolve_model(self, c: cfgmod.Config) -> None:
+    def _resolve_model(self, c: cfgmod.Config, keep: "models.Model | None" = None) -> None:
         """Pick the model quickly (settings path, else the one picked last time, else the best one a
-        Windows-only scan finds). If that finds nothing, search WSL too in the background."""
+        Windows-only scan finds). If that finds nothing, search WSL too in the background.
+        [model] folders are searched as well, either way. `keep`: the model in use stays picked when it
+        is still found (only the list of folders changed)."""
         from pathlib import Path
         if c.model_dir != "auto":
-            self.model = models.inspect_path(Path(c.model_dir), "your settings")
-            self.found = [self.model] if self.model else []
+            fixed = models.inspect_path(Path(c.model_dir), "your settings")
+            self.found = models.merge([fixed] if fixed else [], models.find_in(c.model_folders))
+            if keep is not None and any(x.path == keep.path for x in self.found):
+                self._use_model(keep, apply=False)
+                return
+            self.model = fixed
             self.problem = None if self.model else (
                 f"No speech model (.gguf) at {c.model_dir}. Fix [model] dir in Settings, or set it to \"auto\".")
             return
-        self.found = models.find(include_wsl=False)
+        self.found = models.find(include_wsl=False, extra=c.model_folders)
+        if keep is not None and any(x.path == keep.path for x in self.found):
+            self._use_model(keep, apply=False)
+            return
         try:
             # Older versions stored a folder here; inspect_path takes a folder or a file.
             cached = Path(self._model_cache.read_text("utf-8").strip())
@@ -400,7 +418,7 @@ class App:
         def job():
             self.model_job = "searching Windows and WSL"
             self._refresh()
-            found = models.find(include_wsl=True)
+            found = models.find(include_wsl=True, extra=self.cfg.model_folders)
             self.found = found
             if not found:
                 self.model = None
@@ -442,6 +460,63 @@ class App:
             self._use_model(m)
             self._notify(f"Parakeet v2 downloaded. Press {self.cfg.hotkey} to dictate.")
         self._model_thread(job)
+
+    def add_model_file(self) -> None:
+        """Tray → Add a model file…: a Windows open-file dialog for a .gguf, in a thread of its own (the
+        tray thread has to keep answering the menu)."""
+        if self._adding_model:
+            return
+        self._adding_model = True
+
+        def run():
+            try:
+                path = winutil.open_file_dialog(
+                    "Add a speech model (.gguf)",
+                    [("Speech models (*.gguf)", "*.gguf"), ("All files (*.*)", "*.*")],
+                    initial_dir=winutil.downloads_folder())
+            except OSError as e:
+                log.exception("open-file dialog")
+                self._notify(f"Couldn't open the file dialog: {e}")
+                return
+            finally:
+                self._adding_model = False
+                self._refresh()
+            if path:
+                self.add_model(path)
+        threading.Thread(target=run, daemon=True, name="add-model").start()
+
+    def add_model(self, path) -> bool:
+        """Check that `path` is a speech-to-text .gguf, add it to [model] folders in config.toml (comments
+        kept) and switch to it. True when it was added (or was already listed)."""
+        from pathlib import Path
+        from . import cfgedit
+        p = Path(path)
+        m = models.inspect(p, models.user_source(p))
+        if m is None:
+            self._notify(f"{p.name} {models.why_not_speech(p)}. Pick a speech-to-text model "
+                         "(Parakeet, Whisper, …) .gguf file.")
+            return False
+        try:
+            cfgedit.add_model_folder(self.paths.config_file, str(p))
+        except (cfgmod.ConfigError, OSError) as e:
+            self._notify(f"Couldn't add {p.name} to your settings: {e}")
+            return False
+        with self._lock:
+            idle = self.state == "idle" and not self.model_job
+        if not idle:   # picked up (and listed under Model) at the next dictation
+            self._notify(f"Added {m.name}. Pick it under Model in the tray menu once this dictation is done.")
+            return True
+        if m.in_wsl:
+            err = self.reload_if_changed(force=True)
+            if err:
+                self._notify(err)
+            self._model_thread(lambda: self._switch_to(m, announce=True))
+            return True
+        self._use_model(m, apply=False)      # remembered, so the reload below keeps it picked
+        err = self.reload_if_changed(force=True)
+        self._notify(err or f"Now using {m.name} ({m.languages_label()}).")
+        self._refresh()
+        return True
 
     # --- setup ------------------------------------------------------------------------------------
 
@@ -541,15 +616,18 @@ class App:
         self.recorder.device_hint = c.input_device
         self.sounds.enabled = c.sounds
         if c.overlay and self.overlay is None:
-            self.overlay = Overlay(c.overlay_position, wide=c.stream_while_speaking)
+            self.overlay = self._new_overlay(c)
         elif self.overlay is not None and (not c.overlay or self.overlay.wide != c.stream_while_speaking):
+            if self.state == "moving":     # the pill being moved goes away: move mode ends with it
+                self.state = "idle"
             self.overlay.close()
-            self.overlay = Overlay(c.overlay_position, wide=c.stream_while_speaking) if c.overlay else None
+            self.overlay = self._new_overlay(c) if c.overlay else None
         if self.overlay:
             self.overlay.position, self.overlay.margin = c.overlay_position, c.overlay_margin
-        if c.model_dir != self.cfg_model_dir:
-            self.cfg_model_dir = c.model_dir
-            self._resolve_model(c)
+        if c.model_dir != self.cfg_model_dir or c.model_folders != self.cfg_model_folders:
+            keep = self.model if c.model_dir == self.cfg_model_dir else None   # only the folders changed
+            self.cfg_model_dir, self.cfg_model_folders = c.model_dir, c.model_folders
+            self._resolve_model(c, keep=keep)
         self.engine.set_spec(self._engine_spec(c), c.unload_after_seconds)
         return err or self.problem
 
@@ -577,6 +655,14 @@ class App:
                 self._finish_locked()
                 return
             if self.state == "busy":
+                self.sounds.play("error")
+                return
+            if self.state == "moving":       # never dictate while the pill can take the focus
+                self._end_move_locked(save=True)
+                self._notify(f"Pill position saved. Press {self.cfg.hotkey} again to dictate.")
+                return
+            if self.overlay is not None and self.overlay.is_foreground():
+                self._notify("Click the window you want to type into, then press the hotkey again.")
                 self.sounds.play("error")
                 return
             problem = self.reload_if_changed()
@@ -856,6 +942,52 @@ class App:
                 self.failed = None
         self._refresh()
 
+    # --- moving the pill ----------------------------------------------------------------------------
+
+    def move_pill(self) -> None:
+        """Tray → Move the pill… (state idle -> moving), or Done moving the pill (saves). While moving,
+        no dictation or retry starts: they need state idle, and the hotkey ends move mode instead."""
+        with self._lock:
+            if self.state == "moving":
+                self._end_move_locked(save=True)
+                return
+            ov = self.overlay
+            if self.state != "idle" or ov is None:
+                self.sounds.play("error")
+                return
+            self.state = "moving"
+        if not ov.start_move(self._move_ended):
+            with self._lock:
+                if self.state == "moving":
+                    self.state = "idle"
+            self._notify("The pill isn't running, so it can't be moved. Check [overlay] enabled in Settings.")
+        self._refresh()
+
+    def _end_move_locked(self, save: bool) -> None:
+        """Ask the pill to end move mode; _move_ended sets the state back to idle once its styles are back."""
+        if self.overlay is None or not self.overlay.end_move(save):
+            self.state = "idle"      # no pill window (any more): nothing can hold the focus
+
+    def _move_ended(self, saved: bool) -> None:  # the overlay's "pill-moved" thread
+        with self._lock:
+            if self.state == "moving":
+                self.state = "idle"
+        log.info("pill move %s", "saved" if saved else "cancelled")
+        self._refresh()
+
+    def reset_pill_position(self) -> None:
+        """Tray → Reset pill position: back to [overlay] position / margin on the screen you're working on."""
+        from . import pillpos
+        try:
+            pillpos.reset(self._pill_file)
+        except OSError as e:
+            self._notify(f"Couldn't reset the pill position: {e}")
+            return
+        if self.overlay is not None:
+            self.overlay.forget_position()
+        self._notify("The pill is back at its usual place.")
+        self._refresh()
+
     # --- tray -------------------------------------------------------------------------------------
 
     def _visual_state(self) -> str:
@@ -874,7 +1006,8 @@ class App:
             return f"Model: {self.model_job}…"
         if self.problem:
             return self.problem[:90]
-        return {"recording": "Listening… (hotkey again to stop, Esc cancels)", "busy": "Transcribing…"}.get(
+        return {"recording": "Listening… (hotkey again to stop, Esc cancels)", "busy": "Transcribing…",
+                "moving": "Moving the pill (Enter saves, Esc cancels)"}.get(
             self.state, {"ready": "Ready (model loaded)", "loading": "Loading model…"}.get(
                 self.engine.state, "Ready (model loads on first use)"))
 
@@ -980,6 +1113,8 @@ class App:
             I("Correct last dictation…", correct_last, enabled=lambda _: bool(self.last_text)),
             I("Retry last recording", lambda i, it: self.retry_failed(), enabled=lambda _: self._can_retry()),
             I("Discard last recording", lambda i, it: self.discard_failed(), enabled=lambda _: self._can_retry()),
+            I("Add a model file…", lambda i, it: self.add_model_file(),
+              enabled=lambda _: not self.model_job and not self._adding_model),
             I("Find models again (Windows + WSL)", lambda i, it: self.search_model(),
               enabled=lambda _: not self.model_job),
             I("Download Parakeet v2 model (about 730 MB)", lambda i, it: self.download_model(),
@@ -988,6 +1123,11 @@ class App:
             I("Reload settings", reload),
             I("Free model memory now", unload, enabled=lambda _: self.engine.state != "unloaded"),
             I("Start with Windows", toggle_autostart, checked=lambda _: winutil.startup_shortcut().exists()),
+            I(lambda _: "Done moving the pill" if self.state == "moving" else "Move the pill…",
+              lambda i, it: self.move_pill(),
+              enabled=lambda _: self.overlay is not None and self.state in ("idle", "moving")),
+            I("Reset pill position", lambda i, it: self.reset_pill_position(),
+              enabled=lambda _: self.state != "moving" and self._pill_file.exists()),
             I("Open log", open_log),
             S,
             I(f"Quit {APP_NAME} {__version__}", quit_app),
