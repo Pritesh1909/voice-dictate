@@ -395,52 +395,108 @@ class SettingsWindow:
 
         right = ttk.Frame(body)
         right.pack(side="left", fill="both", expand=True)
-        self.canvas = tk.Canvas(right, highlightthickness=0, borderwidth=0, background=self.bg,
-                                yscrollincrement=self.px(48))     # one wheel notch = about one row
-        sb = self.sb = ttk.Scrollbar(right, orient="vertical", command=self.canvas.yview)
-        self.canvas.configure(yscrollcommand=sb.set)
-        self.canvas.pack(side="left", fill="both", expand=True)
+        # Scrolling moves the page (a frame) inside a fixed viewport frame. A Tk canvas scrolled by
+        # copying screen pixels and repainting only the edges, which on Windows could leave stale bits
+        # of controls on screen while scrolling ("half-drawn rows"); moving a frame repaints properly.
+        self.viewport = ttk.Frame(right)
+        self.viewport.pack(side="left", fill="both", expand=True)
+        sb = self.sb = ttk.Scrollbar(right, orient="vertical", command=self.sb_command)
         # The scrollbar lies over the page's right margin (place, not pack), so showing or hiding it
         # never changes the page's width: that used to lay the whole page out again several times.
-        self.holder = ttk.Frame(self.canvas, padding=(self.px(20), self.px(14), self.px(22), self.px(16)))
-        self._win = self.canvas.create_window(0, 0, window=self.holder, anchor="nw")
-        self._canvas_w = 0
-
-        def holder_resized(_e=None):
-            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-            self._scrollbar_when_needed()
-
-        def canvas_resized(e):
-            if e.width != self._canvas_w:        # only a real width change re-lays the page out
-                self._canvas_w = e.width
-                self.canvas.itemconfigure(self._win, width=e.width)
-            self._scrollbar_when_needed()
-        self.holder.bind("<Configure>", holder_resized)
-        self.canvas.bind("<Configure>", canvas_resized)
+        self.holder = ttk.Frame(self.viewport, padding=(self.px(20), self.px(14), self.px(22), self.px(16)))
+        self.holder.place(x=0, y=0, relwidth=1.0)
+        self._offset = 0                 # how far the page is scrolled, in pixels
+        self._target = 0                 # where the next frame will scroll it to
+        self._scroll_job = None
+        self._wheel_delta = 0
+        self._wheel_job = None
+        self.holder.bind("<Configure>", lambda _e: self._scrolled())
+        self.viewport.bind("<Configure>", lambda _e: self._scrolled())
         self.root.bind_all("<MouseWheel>", self._wheel)
+        self._no_wheel_on_values()
 
-    def _scrollbar_when_needed(self) -> None:
-        """Only show the scrollbar on a page that doesn't fit."""
-        need = self.holder.winfo_reqheight() > self.canvas.winfo_height() > 1
-        shown = bool(self.sb.winfo_ismapped())
-        if need and not shown:
-            self.sb.place(relx=1.0, rely=0.0, relheight=1.0, anchor="ne")
-        elif not need and shown:
+    def _no_wheel_on_values(self) -> None:
+        """Turning the wheel over a dropdown or a number box changed its value (Tk's default), which
+        made scrolling the page change settings by accident. Values now only change by clicking or
+        typing; the wheel scrolls the page (see _wheel)."""
+        for cls in ("TCombobox", "TSpinbox", "Spinbox"):
+            for seq in ("<MouseWheel>", "<Shift-MouseWheel>"):
+                try:
+                    self.root.unbind_class(cls, seq)
+                except self.tk.TclError:
+                    pass
+
+    # scrolling ---------------------------------------------------------------------------------------
+    def _room(self) -> int:
+        """How far the page can scroll (0 when it fits)."""
+        return max(0, self.holder.winfo_reqheight() - self.viewport.winfo_height())
+
+    def scroll_to(self, y: float) -> None:
+        """Scroll the page to `y` px from its top, at most once per frame (a dragged scrollbar or a fast
+        wheel asks many times per frame; moving the page each time would repaint it each time)."""
+        self._target = max(0, min(int(y), self._room()))
+        if self._scroll_job is None:
+            self._scroll_job = self.root.after(16, self._apply_scroll)
+
+    def _apply_scroll(self) -> None:
+        self._scroll_job = None
+        if self._target != self._offset:
+            self._offset = self._target
+            self.holder.place_configure(y=-self._offset)    # moving the frame repaints what is visible
+        self._update_scrollbar()
+
+    def _scrolled(self) -> None:
+        """The page or the window changed size: keep the scroll position valid and the scrollbar right."""
+        room = self._room()
+        if self._offset > room:
+            self._offset = self._target = room
+            self.holder.place_configure(y=-room)
+        self._update_scrollbar()
+
+    def _update_scrollbar(self) -> None:
+        """Only show the scrollbar on a page that doesn't fit, and keep its thumb in place."""
+        total = self.holder.winfo_reqheight()
+        view = self.viewport.winfo_height()
+        need = total > view > 1
+        if need:
+            self.sb.set(self._offset / total, min(1.0, (self._offset + view) / total))
+            if not self.sb.winfo_ismapped():
+                self.sb.place(relx=1.0, rely=0.0, relheight=1.0, anchor="ne")
+        elif self.sb.winfo_ismapped():
             self.sb.place_forget()
-            self.canvas.yview_moveto(0)
+
+    def sb_command(self, *args) -> None:
+        """The scrollbar: ("moveto", fraction) while dragging, ("scroll", n, "units"/"pages") for its arrows."""
+        if not args:
+            return
+        if args[0] == "moveto":
+            self.scroll_to(float(args[1]) * self.holder.winfo_reqheight())
+        elif args[0] == "scroll":
+            n, what = int(args[1]), args[2]
+            step = self.viewport.winfo_height() * 0.9 if what == "pages" else self.px(48)
+            self.scroll_to(self._target + n * step)
 
     def _wheel(self, e) -> None:
+        """The wheel scrolls the page wherever the mouse is: over a dropdown, a number box or a button
+        too (their own wheel behaviour, changing the value, is switched off in _no_wheel_on_values).
+        Only a list that has more lines than it shows scrolls itself, until it reaches its end."""
         try:
-            if e.widget.winfo_class() in ("Treeview", "TCombobox", "Listbox"):
+            w = e.widget
+            cls = w.winfo_class()
+            if ".popdown" in str(w):          # an open dropdown's list scrolls itself
                 return
-        except (AttributeError, self.tk.TclError):
+            if cls in ("Treeview", "Listbox"):
+                first, last = (float(v) for v in w.yview())
+                up = e.delta > 0
+                if (up and first > 0.0) or (not up and last < 1.0):
+                    return                    # the list itself scrolls (its own binding does it)
+        except (AttributeError, ValueError, self.tk.TclError):
+            pass
+        if self._room() <= 0:
             return
-        if self.holder.winfo_height() <= self.canvas.winfo_height():
-            return
-        # A fast wheel sends many events per frame; scrolling for each one redraws the page each time.
-        # Add them up and scroll once per frame instead.
-        self._wheel_delta = getattr(self, "_wheel_delta", 0) + e.delta
-        if not getattr(self, "_wheel_job", None):
+        # A fast wheel sends many events per frame: add them up and scroll once per frame.
+        self._wheel_delta += e.delta
+        if self._wheel_job is None:
             self._wheel_job = self.root.after(16, self._apply_wheel)
 
     def _apply_wheel(self) -> None:
@@ -448,7 +504,7 @@ class SettingsWindow:
         delta, self._wheel_delta = self._wheel_delta, 0
         steps = round(-delta / 120) or (-1 if delta > 0 else 1 if delta < 0 else 0)
         if steps:
-            self.canvas.yview_scroll(steps, "units")
+            self.scroll_to(self._target + steps * self.px(48))      # one notch = about one row
 
     def show(self, name: str) -> None:
         self._ensure_page(name)
@@ -456,7 +512,12 @@ class SettingsWindow:
             if n != name:
                 f.pack_forget()
         self.pages[name].pack(fill="both", expand=True)
-        self.canvas.yview_moveto(0)
+        if self._scroll_job is not None:          # a new page starts at its top
+            self.root.after_cancel(self._scroll_job)
+            self._scroll_job = None
+        self._offset = self._target = 0
+        self.holder.place_configure(y=0)
+        self._update_scrollbar()
 
     def _build_page(self, name: str, groups: list[tuple[str, list[Spec]]]) -> None:
         """A page: its title, then one outlined box per group, rows inside split by thin lines."""
@@ -485,7 +546,7 @@ class SettingsWindow:
         ttk.Label(text, text=spec.label, style="Strong.TLabel").pack(anchor="w")
         if spec.help:
             ttk.Label(text, text=spec.help, style="Help.TLabel", justify="left",
-                      wraplength=self.px(540 if spec.kind in BELOW else 320)).pack(anchor="w")
+                      wraplength=self.px(540 if spec.kind in BELOW else 290)).pack(anchor="w")
         if spec.kind == "action":
             buttons = ttk.Frame(card, style="Row.TFrame")
             buttons.grid(row=0, column=1, sticky="e", padx=(self.px(12), 0))

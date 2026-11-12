@@ -487,17 +487,53 @@ def test_microphones_arrive_in_the_background(paths, hidden_root):
         win.outer.destroy()
 
 
-def test_wheel_events_are_combined(window):
+def test_wheel_events_are_combined_into_one_move(window):
     window.show("Improvements")
     window.root.update_idletasks()
-    calls = []
-    window.canvas.yview_scroll = lambda n, what: calls.append(n)
-    window.holder.winfo_height = lambda: 5000                     # pretend the page is long
+    window._room = lambda: 5000                                    # pretend the page is long
+    moves = []
+    window.holder.place_configure = lambda **kw: moves.append(kw["y"])
     ev = type("E", (), {"widget": window.holder, "delta": -120})
     for _ in range(5):
         window._wheel(ev)
+    window.root.after_cancel(window._wheel_job)
     window._apply_wheel()
-    assert calls == [5]                                            # one scroll of 5 rows, not five
+    window.root.after_cancel(window._scroll_job)
+    window._apply_scroll()
+    assert moves == [-5 * window.px(48)]                           # one move of 5 rows, not five
+
+
+def test_wheel_never_changes_dropdowns_or_number_boxes(window):
+    for cls in ("TCombobox", "TSpinbox"):
+        assert window.root.bind_class(cls, "<MouseWheel>") == ""        # their value-changing binding is gone
+
+
+def test_wheel_over_a_dropdown_scrolls_the_page(window):
+    window.show("General")
+    window.root.update_idletasks()
+    window._room = lambda: 5000
+    box = window.field(("model", "device")).control.box
+    ev = type("E", (), {"widget": box, "delta": -120})
+    window._wheel(ev)
+    assert window._wheel_job is not None                                 # the page will scroll
+    window.root.after_cancel(window._wheel_job)
+    window._wheel_job, window._wheel_delta = None, 0
+
+
+def test_scrollbar_drag_moves_once_per_frame_and_stays_in_range(window):
+    window.show("Improvements")
+    window.root.update_idletasks()
+    window._room = lambda: 1000
+    window.holder.winfo_reqheight = lambda: 1600
+    moves = []
+    window.holder.place_configure = lambda **kw: moves.append(kw["y"])
+    for f in (0.1, 0.2, 0.3, 0.9):                                 # a drag: many moves before a frame
+        window.sb_command("moveto", str(f))
+    window.root.after_cancel(window._scroll_job)
+    window._apply_scroll()
+    assert moves == [-1000]                                        # 0.9 * 1600 clamped to the end
+    window.show("General")                                         # a new page starts at its top
+    assert window._offset == 0
 
 
 def test_open_settings_file_button(window, paths):
