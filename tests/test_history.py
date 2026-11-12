@@ -253,8 +253,8 @@ def test_opening_when_off_or_empty_says_so(tmp_path):
     app.open_history_window()
     app.history.configure("session", 200)
     app.open_history_window()
-    assert app.notes == ["History is off (Settings → Extras → Privacy and files).",
-                         "No dictations in the history yet."]
+    assert app.notes == ["History is off (Settings → Extras → Privacy and files)."]   # needs a setting
+    assert app.quiet == ["No dictations in the history yet."] and app.sounds_played == ["error"]
 
 
 def test_tray_opens_one_window_and_forgets_what_it_deleted(tmp_path, monkeypatch):

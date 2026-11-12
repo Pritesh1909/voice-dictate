@@ -295,9 +295,9 @@ def test_tray_opens_one_window_and_reloads_when_it_closes(paths, monkeypatch):
             os.utime(paths.config_file, ns=(st.st_atime_ns, st.st_mtime_ns + 10_000_000))
             return 0
 
-    launched, notes, reloads = [], [], []
+    launched, notes, reloads, quiet = [], [], [], []
     monkeypatch.setattr(settings_ui, "launch", lambda: launched.append(1) or Proc())
-    fake = types.SimpleNamespace(paths=paths, _settings_proc=None, _notify=notes.append,
+    fake = types.SimpleNamespace(paths=paths, _settings_proc=None, _notify=notes.append, _note=quiet.append,
                                  reload_if_changed=lambda force=False: reloads.append(force),
                                  _refresh=lambda: done.set(), _settings_actions=lambda: [],
                                  _run_settings_action=lambda a: None)
@@ -306,7 +306,7 @@ def test_tray_opens_one_window_and_reloads_when_it_closes(paths, monkeypatch):
     assert len(launched) == 1
     gate.set()
     assert done.wait(5)
-    assert reloads == [True] and notes == ["Settings saved."]
+    assert reloads == [True] and notes == [] and quiet == ["Settings saved."]   # saved: no pop-up
 
 
 # --- the window, built on a hidden root (never shown) -----------------------------------------------
