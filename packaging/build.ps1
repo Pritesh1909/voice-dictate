@@ -33,6 +33,7 @@ VSVersionInfo(
 & $py -m PyInstaller --noconfirm --clean --log-level WARN --windowed --name ParakeetDictate `
     --icon (Join-Path $build 'icon.ico') --version-file (Join-Path $build 'version.txt') `
     --add-data "$root\parakeet_dictate\config.default.toml;parakeet_dictate" `
+    --add-data "$root\parakeet_dictate\fonts;parakeet_dictate\fonts" `
     --collect-all transcribe_cpp --collect-all transcribe_cpp_native --collect-all _sounddevice_data `
     --collect-all sv_ttk --collect-submodules tomlkit --hidden-import parakeet_dictate.settings_ui `
     --exclude-module pytest --exclude-module PyInstaller `

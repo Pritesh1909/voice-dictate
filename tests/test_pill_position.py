@@ -155,7 +155,19 @@ class FakeCanvas:
         return lambda *a, **k: None
 
 
+class FakeSurface:
+    """The layered window's picture: records the opacity and each frame the real Painter drew."""
+    def __init__(self):
+        self.alpha, self.frames = 0, []
+
+    def present(self, frame, alpha, top=0):
+        self.alpha = alpha
+        if frame is not None:
+            self.frames.append(frame)
+
+
 START_EX = 0x100 | ov.PILL_EX               # the pill's styles, plus whatever Tk had set
+PAINTER = ov.Painter(1.0, False)
 
 
 @pytest.fixture
@@ -170,6 +182,7 @@ def pill(tmp_path, monkeypatch):
     o._saved, o._saved_loaded, o._on_move_end, o._prev_fg, o._grab = None, False, None, None, None
     o.hwnd, o._ex, o.s, o.w, o.h = HWND, START_EX, 1.0, 236, 44
     o._root, o.canvas = FakeRoot(), FakeCanvas()
+    o._painter, o._surface = PAINTER, FakeSurface()
     o._mode, o._hide_job, o._anim_job, o._tick, o._kw = "hidden", None, None, 0, {}
     o.u = u
     return o
@@ -188,7 +201,8 @@ def _ended(o):
 def test_move_mode_takes_the_mouse_and_gives_the_exact_styles_back(pill, monkeypatch):
     on_end, got, done = _ended(pill)
     pill._begin_move(on_end)
-    assert pill.moving and pill._root.alpha > 0.9 and pill._root.focus_forced == 1
+    assert pill.moving and pill._surface.alpha == ov.SHOWN_ALPHA and pill._root.focus_forced == 1
+    assert pill._surface.frames[-1].size == PAINTER.size        # the move-mode picture was drawn
     assert pill.u.styles[-1] == START_EX & ~(ov.WS_EX_TRANSPARENT | ov.WS_EX_NOACTIVATE)
     assert pill.u.styles[-1] & ov.WS_EX_TOOLWINDOW and pill.u.styles[-1] & ov.WS_EX_LAYERED
     pill._show("listening")                 # nothing else may take the pill over meanwhile
@@ -223,7 +237,7 @@ def test_esc_cancels_without_saving(pill):
     pill._end_move(False)
     assert done.wait(2) and got == [False]
     assert pill.u.styles[-1] == START_EX and not pill.pos_file.exists()
-    assert pill._mode == "hidden" and pill._root.alpha == 0.0
+    assert pill._mode == "hidden" and pill._surface.alpha == 0
     assert pill.u.focused == []              # the pill never had the focus: nothing to give back
     pill._end_move(True)                     # a second Enter / double-click does nothing
     assert got == [False]
@@ -237,6 +251,20 @@ def test_shown_at_the_saved_place_else_the_usual_one(pill):
     pill.forget_position()                   # tray → Reset pill position
     pill._show("working", text="x")
     assert pill.u.moves[-1][:2] != (3000, 700)
+
+
+def test_shadow_room_is_not_part_of_the_position(pill, monkeypatch):
+    pill._pad = (40, 22, 40, 58)             # the window is bigger than the pill: room for its shadow
+    pillpos.save(pill.pos_file, pillpos.to_relative("\\\\.\\DISPLAY2", 3000, 700, 236, 44, RIGHT))
+    pill._show("working", text="x")
+    assert pill.u.moves[-1][:2] == (3000 - 40, 700 - 22)     # the pill itself lands on the saved spot
+    pill._hide()
+    pill._begin_move(lambda saved: None)
+    monkeypatch.setattr(pillpos, "window_rect", lambda h: (2030, 38, 2030 + 316, 38 + 124))
+    monkeypatch.setattr(pillpos, "monitor_of_window", lambda h: pillpos.Monitor("\\\\.\\DISPLAY2", RIGHT))
+    pill._end_move(True)
+    saved = pillpos.load(pill.pos_file)
+    assert (saved.x, saved.y) == (2070 - 1920, 60)
 
 
 def test_saved_monitor_gone_falls_back(pill, monkeypatch):
