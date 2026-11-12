@@ -16,6 +16,8 @@ import sys  # noqa: E402
 
 def main() -> int:
     multiprocessing.freeze_support()
+    if len(sys.argv) >= 2 and sys.argv[1] == "--list-devices":
+        return list_devices()  # before anything else: no settings, log or folders are touched
     from . import APP_NAME, winutil
     from .config import ConfigError, Paths
 
@@ -61,6 +63,18 @@ def main() -> int:
     except Exception:
         log.exception("fatal")
         raise
+    return 0
+
+
+def list_devices() -> int:
+    """ParakeetDictate.exe --list-devices : print the speech engine's devices as JSON, [[type, name], ...]
+    (type is "gpu" for a discrete card, "igpu", or "cpu"). The tray app never loads the engine itself, so it
+    asks a short-lived process like this one (teacher.has_discrete_gpu)."""
+    import json
+
+    import transcribe_cpp as tc
+    tc.set_log_callback(None)  # native logging must not end up in the output
+    print(json.dumps([[d.device_type, d.name] for d in tc.backends()]))
     return 0
 
 

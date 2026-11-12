@@ -27,8 +27,14 @@ KNOWN = {
     "parakeet-tdt-0.6b-v3-int8": ("handy-computer/parakeet-tdt-0.6b-v3-gguf", "85ac09ea12fc4b1112fa76810059364bc6adc9de",
                                   "parakeet-tdt-0.6b-v3-Q8_0.gguf", 739508576,
                                   "5859f77944efcd8eafa23a6350731960b2b55b2203df51f319665c807d802cc7"),
+    # The "teacher": a bigger model that re-listens to dictations in the background (teacher.py). It is never
+    # offered as a dictation model; it lives in its own folder, outside the folders searched for models.
+    "whisper-large-v3-turbo": ("handy-computer/whisper-large-v3-turbo-gguf", "5eaf945c7978e564bae5b28a5b1639dd93c2bfb1",
+                               "whisper-large-v3-turbo-Q8_0.gguf", 886381760,
+                               "b2e30cc286bc9f3aba4db9099fc7403543497c05ce7100d0d83091ddfd25a183"),
 }
 DEFAULT_DOWNLOAD = "parakeet-tdt-0.6b-v2-int8"
+HF_URL = "https://huggingface.co"
 SKIP_DISTROS = ("docker-desktop", "rancher-desktop", "podman-machine")
 
 # Not speech-to-text, even though transcribe.cpp can load them.
@@ -532,8 +538,11 @@ def import_copy(m: Model, dest_root: Path, progress: Progress = lambda done, tot
 
 
 def download(dest_root: Path, progress: Progress = lambda done, total: None,
-             base_url: str = "https://huggingface.co", key: str = DEFAULT_DOWNLOAD) -> Model:
-    """Download one of Orca's models (default Parakeet v2, ~730 MB) and verify its SHA-256."""
+             base_url: str = HF_URL, key: str = DEFAULT_DOWNLOAD, resume: bool = False) -> Model:
+    """Download one of Orca's models (default Parakeet v2, ~730 MB) and verify its SHA-256.
+    resume: carry on from a `.part` file left by an interrupted download. The server is asked for the rest
+    (`Range`); if it sends only that (206) the bytes already there are hashed again and the rest appended,
+    if it sends the whole file (200) the download starts over. A wrong result is caught by the SHA-256."""
     repo, rev, name, size, sha = KNOWN[key]
     dest = dest_root / key
     dest.mkdir(parents=True, exist_ok=True)
@@ -541,15 +550,28 @@ def download(dest_root: Path, progress: Progress = lambda done, total: None,
     if not (final.is_file() and final.stat().st_size == size and _sha256(final) == sha):
         url = f"{base_url}/{repo}/resolve/{rev}/{name}?download=true"
         tmp = dest / (name + ".part")
+        headers = {"User-Agent": "parakeet-dictate"}
+        have = tmp.stat().st_size if resume and tmp.is_file() else 0
+        if 0 < have < size:                     # a .part that is already as big as the file cannot be a prefix
+            headers["Range"] = f"bytes={have}-"
+        else:
+            have = 0
         h = hashlib.sha256()
         done = 0
-        req = urllib.request.Request(url, headers={"User-Agent": "parakeet-dictate"})
-        with urllib.request.urlopen(req, timeout=60) as r, tmp.open("wb") as out:
-            while chunk := r.read(1 << 20):
-                out.write(chunk)
-                h.update(chunk)
-                done += len(chunk)
-                progress(done, size)
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=60) as r:
+            if have and r.status == 206:
+                with tmp.open("rb") as old:
+                    while chunk := old.read(4 << 20):
+                        h.update(chunk)
+                done, mode = have, "ab"
+            else:
+                mode = "wb"
+            with tmp.open(mode) as out:
+                while chunk := r.read(1 << 20):
+                    out.write(chunk)
+                    h.update(chunk)
+                    done += len(chunk)
+                    progress(done, size)
         if h.hexdigest() != sha:
             tmp.unlink(missing_ok=True)
             raise OSError(f"{name}: checksum mismatch, download discarded")
