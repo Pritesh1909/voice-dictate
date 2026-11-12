@@ -6,14 +6,16 @@ import os
 import queue
 import threading
 import time
+from dataclasses import dataclass
 
+import numpy as np
 import pystray
 
 from . import APP_NAME, __version__
 from . import config as cfgmod
 from . import models, output, winutil
 from .audio import SR, Recorder, preprocess, resample, silence_stop_due, silence_stop_message
-from .engine import Engine, EngineError, EngineSpec
+from .engine import GPU_MARKER, Engine, EngineError, EngineSpec
 from .hotkey import HotkeyError, HotkeyThread, key_down
 from .overlay import GREEN, MUTED, RED, Overlay
 from .segmenter import Segmenter, VadSegmenter
@@ -23,6 +25,19 @@ from .tray import icon_image, write_ico
 log = logging.getLogger(__name__)
 
 MIC_LOST = "Microphone disconnected. Dictation stopped."
+
+FAILED_NOTE = "Couldn't transcribe. The recording was kept: tray menu → Retry last recording."
+DOUBLED_NOTE = ("Retry couldn't tell which words were already typed, so it inserted them all. "
+                "Some words may now be doubled.")
+
+
+@dataclass(frozen=True, eq=False)
+class FailedRecording:
+    """A dictation whose recognition failed. Held in memory only, never written to disk: dictation can be
+    sensitive. partly_typed: live typing had already typed some of it before the failure."""
+    audio: np.ndarray
+    rate: int
+    partly_typed: bool
 
 
 class Session:
@@ -45,7 +60,8 @@ class Session:
         self.segmenter = Segmenter(self.rate, self.pause)
         self.seg_rate = self.rate
         self.normalize = app.cfg.normalize_audio
-        self.typer = (output.PhraseTyper(app.cleaner.clean, app.cfg.output_method, app.cfg.add_trailing_space)
+        self.cleaner = app.cleaner_for(app.target_exe)   # the program dictated into: its terms come first
+        self.typer = (output.PhraseTyper(self.cleaner.clean, app.cfg.output_method, app.cfg.add_trailing_space)
                       if self.parallel and app.cfg.type_while_speaking else None)
         self.total_samples = 0
         self.parts = 0
@@ -72,9 +88,9 @@ class Session:
     def _take(self, final: bool = False) -> None:
         x = self.app.recorder.drain()
         self.total_samples += x.size
+        if x.size:
+            self._buffer.append(x)  # the whole recording: kept if recognition fails
         if not self.parallel:
-            if x.size:
-                self._buffer.append(x)
             return
         if self.vad_mode:
             x16 = resample(x, self.rate, SR)
@@ -164,6 +180,10 @@ class Session:
             self.typer.pump(wait=True)
         return " ".join(t for _, t in sorted(self._results.items()) if t)
 
+    def recording(self) -> np.ndarray:
+        """Everything recorded so far, at the microphone's rate."""
+        return np.concatenate(self._buffer) if self._buffer else np.zeros(0, np.float32)
+
     def cancel(self) -> None:
         self._cancelled = True
         if self.typer:
@@ -179,6 +199,7 @@ class App:
         self.ico = write_ico(paths.data_dir / "icon.ico")
         self.cleaner = self._make_cleaner(self.cfg)
         self.recorder = Recorder(self.cfg.input_device)
+        self.target_exe = ""         # the program in front when the current dictation started
         self.icon: pystray.Icon | None = None
         self.problem: str | None = None
         self.model: models.Model | None = None
@@ -193,6 +214,7 @@ class App:
         self.state = "idle"          # idle | recording | busy
         self.last_text = ""
         self.last_stats = ""
+        self.failed: FailedRecording | None = None   # the last dictation that couldn't be transcribed
         self._lock = threading.Lock()
         self._session = 0
         self.current: Session | None = None
@@ -322,9 +344,22 @@ class App:
 
     # --- setup ------------------------------------------------------------------------------------
 
-    @staticmethod
-    def _make_cleaner(c: cfgmod.Config) -> Cleaner:
+    def _make_cleaner(self, c: cfgmod.Config) -> Cleaner:
+        self._cleaners: dict[tuple, Cleaner] = {}   # (program, languages) -> Cleaner, for these settings
         return Cleaner.from_config(c)
+
+    def cleaner_for(self, exe: str) -> Cleaner:
+        """The clean-up for dictating into `exe` ("Code.exe"; "" = unknown): that program's
+        [dictionary.apps] terms before your own, and the filler words of the dictation language."""
+        langs = models.dictated_languages(self.model.languages if self.model else (), self.cfg.language)
+        key = (cfgmod.app_key(exe), langs)
+        cleaner = self._cleaners.get(key)
+        if cleaner is None:
+            terms = [t for name, entry in self.cfg.app_dictionaries if name == key[0] for t in entry]
+            log.info("clean-up for %s: %d program term(s), fillers for %s", exe or "an unknown program",
+                     len(terms), "/".join(langs) or "an unknown language")
+            cleaner = self._cleaners[key] = Cleaner.from_config(self.cfg, languages=langs, app_terms=terms)
+        return cleaner
 
     @staticmethod
     def _find_vad(c: cfgmod.Config):
@@ -340,7 +375,8 @@ class App:
         if m is None:
             return None
         return EngineSpec.for_model(m, c.threads, device=c.device, vocabulary=c.hotwords,
-                                    vad=str(self.vad_path or ""))
+                                    vad=str(self.vad_path or ""), language=c.language,
+                                    gpu_marker=str(self.paths.data_dir / GPU_MARKER))
 
     def apply_config(self, c: cfgmod.Config) -> str | None:
         """Switch to new settings. Returns a problem to show, or None."""
@@ -410,6 +446,7 @@ class App:
             log.info("recording started at %d Hz", self.recorder.rate)
             self._session += 1
             session = self._session
+            self.target_exe = winutil.foreground_exe()   # for its [dictionary.apps] terms
             self.current = Session(self, session, use_vad=self.vad_path is not None)
             self.sounds.play("start")
             if self.cfg.esc_cancels:
@@ -498,7 +535,12 @@ class App:
     def _complete(self, session: "Session") -> None:
         t_stop = time.monotonic()
         try:
-            raw = session.finish()
+            try:
+                raw = session.finish()
+            except Exception as e:
+                self._recognition_failed(e, session.recording(), session.rate,
+                                         bool(session.typer and session.typer.text))
+                return
             waited = time.monotonic() - t_stop
             spoken = session.total_samples / max(1, session.rate)
             if not raw:
@@ -507,30 +549,34 @@ class App:
                 if self.overlay:
                     self.overlay.flash("No speech heard", MUTED, 1200)
                 return
-            live = session.typer is not None
-            text = session.typer.text if live else self.cleaner.clean(raw)   # live: already typed
+            typer = session.typer
+            # Live: the phrases are already typed, apart from any that couldn't be (they go to the clipboard).
+            text = (" ".join(t for t in (typer.text, typer.untyped) if t) if typer
+                    else session.cleaner.clean(raw))
             self.last_stats = (f"{spoken:.1f}s speech in {session.parts} part(s), "
                                f"{'voice detector' if session.vad_mode else 'loudness'} cuts; "
                                f"text done {waited:.1f}s after you stopped")
             log.info("dictation: %s (model time %.1fs)", self.last_stats, session.decode_seconds)
             if self.cfg.log_transcripts:
                 log.info("raw: %r | clean: %r", raw, text)
-            if text:
-                self.last_text = text
-                if not live:
-                    output.deliver(text + (" " if self.cfg.add_trailing_space else ""), self.cfg.output_method)
+            if not text:
                 if self.overlay:
-                    self.overlay.flash("Typed", GREEN, 700)
-            elif self.overlay:
-                self.overlay.flash("Only filler words heard", MUTED, 1200)
-        except EngineError as e:
-            log.error("engine: %s", e)
-            self._notify(f"Transcription failed: {e}")
-            self.sounds.play("error")
+                    self.overlay.flash("Only filler words heard", MUTED, 1200)
+                return
+            self.last_text = text
+            if typer is None:
+                typed = self._land(text)
+            elif typer.failed is not None:
+                self._notify(output.copy_instead(typer.untyped, typer.failed))
+                typed = False
+            else:
+                typed = True
+            if typed:
+                self._press_enter()
             if self.overlay:
-                self.overlay.flash("Transcription failed", RED, 2000)
+                self.overlay.flash("Typed" if typed else "Copied to clipboard", GREEN, 700)
         except Exception as e:
-            log.exception("transcribe")
+            log.exception("deliver")
             self._notify(f"Something went wrong: {e}")
             self.sounds.play("error")
             if self.overlay:
@@ -541,6 +587,103 @@ class App:
                 self.state = "idle"
             self._refresh()
             winutil.trim_working_set()
+
+    def _land(self, text: str) -> bool:
+        """Type the text where the cursor is. If it can't be typed, put it on the clipboard and say so.
+        True when it was typed."""
+        try:
+            output.deliver(text + (" " if self.cfg.add_trailing_space else ""), self.cfg.output_method)
+            return True
+        except output.DeliveryError as e:
+            log.warning("could not type: %s", e)
+            self._notify(output.copy_instead(text, e))
+            return False
+
+    def _press_enter(self) -> None:
+        if self.cfg.press_enter:
+            try:
+                output.press_enter()
+            except OSError as e:
+                log.warning("could not press Enter: %s", e)
+
+    def _recognition_failed(self, e: Exception, audio: np.ndarray, rate: int, partly_typed: bool) -> None:
+        """Keep the recording (replacing an older failed one) so tray → Retry can transcribe it again."""
+        if isinstance(e, EngineError):
+            log.error("engine: %s", e)
+        else:
+            log.error("transcribe", exc_info=e)
+        if audio.size:
+            self.failed = FailedRecording(audio, rate, partly_typed)
+            self._notify(FAILED_NOTE)
+        else:
+            self._notify(f"Transcription failed: {e}")
+        self.sounds.play("error")
+        if self.overlay:
+            self.overlay.flash("Transcription failed", RED, 2000)
+
+    def retry_failed(self) -> None:
+        """Tray → Retry last recording: transcribe the kept recording in one go and type it."""
+        with self._lock:
+            kept = self.failed
+            if kept is None or self.state != "idle":
+                if kept is not None:
+                    self.sounds.play("error")   # a dictation is running; retry once it's done
+                return
+            self.state = "busy"
+        if self.overlay:
+            self.overlay.working()
+        self._refresh()
+        threading.Thread(target=self._retry, args=(kept,), daemon=True, name="retry").start()
+
+    def _retry(self, kept: FailedRecording) -> None:
+        try:
+            try:
+                audio = preprocess(resample(kept.audio, kept.rate, SR), normalize=self.cfg.normalize_audio)
+                raw = self.engine.transcribe(audio)[0].strip() if audio.size else ""
+            except Exception as e:
+                self._recognition_failed(e, kept.audio, kept.rate, kept.partly_typed)
+                return
+            if self.failed is kept:
+                self.failed = None
+            text = self.cleaner.clean(raw)
+            if self.cfg.log_transcripts:
+                log.info("retry raw: %r | clean: %r", raw, text)
+            if not text:
+                self._notify("Retried: no speech heard in the kept recording.")
+                if self.overlay:
+                    self.overlay.flash("No speech heard", MUTED, 1200)
+                return
+            self.last_text = text
+            if not output.has_typing_target():
+                # Picking the tray menu item leaves focus on the tray; let the user click back into a window.
+                if self.overlay:
+                    self.overlay.working("Click where the text should go…")
+                output.wait_for_target(5.0)
+            typed = self._land(text)
+            if kept.partly_typed:
+                self._notify(DOUBLED_NOTE)
+            elif typed:
+                self._press_enter()
+            if self.overlay:
+                self.overlay.flash("Typed" if typed else "Copied to clipboard", GREEN, 700)
+        except Exception as e:
+            log.exception("retry")
+            self._notify(f"Something went wrong: {e}")
+            self.sounds.play("error")
+            if self.overlay:
+                self.overlay.flash("Something went wrong", RED, 2000)
+        finally:
+            self.engine.done()
+            with self._lock:
+                self.state = "idle"
+            self._refresh()
+            winutil.trim_working_set()
+
+    def discard_failed(self) -> None:
+        with self._lock:
+            if self.state == "idle":
+                self.failed = None
+        self._refresh()
 
     # --- tray -------------------------------------------------------------------------------------
 
@@ -604,6 +747,9 @@ class App:
             yield pystray.MenuItem(m.label(), pick(m), checked=is_current(m), radio=True,
                                    enabled=lambda item: not self.model_job)
 
+    def _can_retry(self) -> bool:
+        return self.failed is not None and self.state == "idle"
+
     def _menu(self) -> pystray.Menu:
         I, S = pystray.MenuItem, pystray.Menu.SEPARATOR
 
@@ -652,6 +798,8 @@ class App:
               None, enabled=False),
             S,
             I("Copy last dictation", copy_last, enabled=lambda _: bool(self.last_text)),
+            I("Retry last recording", lambda i, it: self.retry_failed(), enabled=lambda _: self._can_retry()),
+            I("Discard last recording", lambda i, it: self.discard_failed(), enabled=lambda _: self._can_retry()),
             I("Find models again (Windows + WSL)", lambda i, it: self.search_model(),
               enabled=lambda _: not self.model_job),
             I("Download Parakeet v2 model (about 730 MB)", lambda i, it: self.download_model(),

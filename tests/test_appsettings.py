@@ -41,7 +41,7 @@ def test_context_settings():
 def test_settings_for_app_overrides():
     c = config.parse(APPS)
     term = settings_for("windowsterminal.EXE", c)
-    assert (term.method, term.add_trailing_space, term.commands, term.app) == ("type", False, False, "windowsterminal")
+    assert (term.method, term.add_trailing_space, term.commands, term.app) == ("type", False, False, "windowsterminal.exe")
     assert term.type_while_speaking == c.type_while_speaking
     idea = settings_for("IDEA64.exe", c)
     assert (idea.method, idea.type_while_speaking, idea.press_enter, idea.commands) == ("paste", False, True, True)

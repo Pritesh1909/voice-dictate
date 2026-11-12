@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import tomllib
 from dataclasses import dataclass, field
@@ -79,16 +80,20 @@ class Config:
     process_while_speaking: bool
     pause_seconds: float
     vad: str                # "auto", "off", or a .gguf path (environment variables expanded)
+    language: str           # "auto" or an ISO-639-1 code ("de"); passed to models that take one
     hotwords: tuple[str, ...]
     normalize_audio: bool
     fillers: tuple[str, ...]
+    language_fillers: bool
     remove_repeated_words: bool
     repeated_words_allowed: tuple[str, ...]
     replacements: tuple[tuple[str, str], ...]
     dictionary: tuple[tuple[str, str], ...]   # (term, heard_as or "")
+    app_dictionaries: tuple[tuple[str, tuple[tuple[str, str], ...]], ...]   # (exe in lower case, terms)
     output_method: str
     type_while_speaking: bool
     add_trailing_space: bool
+    press_enter: bool
     sounds: bool
     max_seconds: int
     log_transcripts: bool
@@ -159,16 +164,20 @@ def parse(text: str, defaults_text: str | None = None) -> Config:
         process_while_speaking=_get(d, "model", "process_while_speaking", bool),
         pause_seconds=_get(d, "model", "pause_seconds", float, lambda v: 0.3 <= v <= 5),
         vad=_vad(_get(d, "model", "vad", str)),
+        language=_language(_get(d, "model", "language", str)),
         hotwords=_str_list(d, "accuracy", "hotwords"),
         normalize_audio=_get(d, "accuracy", "normalize_audio", bool),
         fillers=_str_list(d, "cleanup", "fillers"),
+        language_fillers=_get(d, "cleanup", "language_fillers", bool),
         remove_repeated_words=_get(d, "cleanup", "remove_repeated_words", bool),
         repeated_words_allowed=_str_list(d, "cleanup", "repeated_words_allowed"),
         replacements=tuple((k, v) for k, v in repl.items()),
-        dictionary=_dictionary(d),
+        dictionary=_dictionary(d.get("dictionary", {}), "dictionary"),
+        app_dictionaries=_app_dictionaries(d),
         output_method=_get(d, "output", "method", str, lambda v: v in ("type", "paste")),
         type_while_speaking=_get(d, "output", "type_while_speaking", bool),
         add_trailing_space=_get(d, "output", "add_trailing_space", bool),
+        press_enter=_get(d, "output", "press_enter", bool),
         sounds=_get(d, "output", "sounds", bool),
         max_seconds=_get(d, "output", "max_seconds", int, lambda v: 5 <= v <= 1800),
         log_transcripts=_get(d, "output", "log_transcripts", bool),
@@ -187,16 +196,16 @@ def parse(text: str, defaults_text: str | None = None) -> Config:
     )
 
 
-def _dictionary(d: dict) -> tuple[tuple[str, str], ...]:
-    terms = _str_list(d, "dictionary", "terms")
-    heard = d.get("dictionary", {}).get("heard_as", {})
+def _dictionary(table: dict, where: str) -> tuple[tuple[str, str], ...]:
+    terms = _str_list({where: table}, where, "terms") if "terms" in table else ()
+    heard = table.get("heard_as", {})
     if not isinstance(heard, dict):
-        raise ConfigError("[dictionary.heard_as] entries must look like  \"Term\" = [\"heard\", ...]")
+        raise ConfigError(f"[{where}.heard_as] entries must look like  \"Term\" = [\"heard\", ...]")
     out = [(t, "") for t in terms]
     for term, v in heard.items():
         spellings = [v] if isinstance(v, str) else v
         if not isinstance(spellings, list) or not all(isinstance(x, str) for x in spellings):
-            raise ConfigError(f"[dictionary.heard_as] {term!r} must be text or a list of text values")
+            raise ConfigError(f"[{where}.heard_as] {term!r} must be text or a list of text values")
         out.append((term, ""))
         out += [(term, x.strip()) for x in spellings if x.strip()]
     return tuple(out)
@@ -216,10 +225,27 @@ def _commands(d: dict) -> tuple[tuple[str, str], ...]:
     return tuple(out)
 
 
+def _app_dictionaries(d: dict) -> tuple[tuple[str, tuple[tuple[str, str], ...]], ...]:
+    """[dictionary.apps."code.exe"] tables: terms that apply only while dictating into that program."""
+    apps = d.get("dictionary", {}).get("apps", {})
+    if not isinstance(apps, dict):
+        raise ConfigError('[dictionary.apps] must hold tables like  [dictionary.apps."code.exe"]')
+    out = []
+    for exe, table in apps.items():
+        where = f'dictionary.apps."{exe}"'
+        if not isinstance(table, dict):
+            raise ConfigError(f"[{where}] must be a table with terms = [...] and/or a heard_as table")
+        name = app_key(exe)
+        if not name:
+            raise ConfigError(f"[{where}] needs a program name such as \"code.exe\"")
+        out.append((name, _dictionary(table, where)))
+    return tuple(out)
+
+
 def app_key(exe: str) -> str:
-    """How [apps] names are matched: case-insensitive, with or without ".exe"."""
-    exe = exe.strip().lower()
-    return exe[:-4] if exe.endswith(".exe") else exe
+    """How a program is matched: its file name in lower case, ".exe" added when left out ("Code" = "code.exe")."""
+    name = exe.strip().replace("/", "\\").rsplit("\\", 1)[-1].lower()
+    return name if not name or "." in name else name + ".exe"
 
 
 def _apps(d: dict) -> tuple[tuple[str, AppOverride], ...]:
@@ -253,6 +279,15 @@ def load(paths: Paths) -> Config:
 def _model_dir(v: str) -> str:
     v = v.strip()
     return "auto" if v.lower() in ("", "auto") else os.path.expandvars(v)
+
+
+def _language(v: str) -> str:
+    v = v.strip().lower()
+    if v in ("", "auto"):
+        return "auto"
+    if not re.fullmatch(r"[a-z]{2,3}", v):
+        raise ConfigError(f'[model] language must be "auto" or a language code such as "en" or "de", got {v!r}')
+    return v
 
 
 def _vad(v: str) -> str:

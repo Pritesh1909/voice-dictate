@@ -35,6 +35,14 @@ def test_heard_as_beats_another_term_with_the_same_key():
     assert spell("a male c thing") == "a Mailzzy thing"
 
 
+def test_terms_ahead_win_over_all_others():
+    personal = [("Mailzzy", "mail c"), ("Keycloak", "")]
+    assert build(personal)("the mail c file") == "the Mailzzy file"
+    spell = build(personal, ahead=[("Mail C", ""), ("KeyCloak", "")])
+    assert spell("the mail c file in key cloak") == "the Mail C file in KeyCloak"
+    assert build([], ahead=[("pnpm", "")])("run p n p m") == "run pnpm"
+
+
 def test_longest_run_wins():
     spell = build([("Spring", ""), ("Spring Boot", "")])
     assert spell("a spring boot app in spring") == "a Spring Boot app in Spring"

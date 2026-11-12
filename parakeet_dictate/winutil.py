@@ -120,27 +120,67 @@ def trim_working_set() -> None:
         pass
 
 
-# --- foreground window ----------------------------------------------------------------------------
+# --- foreground program ---------------------------------------------------------------------------
 
-_user32 = ctypes.WinDLL("user32", use_last_error=True)
-_user32.GetForegroundWindow.restype = wt.HWND
-_user32.GetWindowTextLengthW.argtypes = [wt.HWND]
-_user32.GetWindowTextW.argtypes = [wt.HWND, wt.LPWSTR, ctypes.c_int]
+user32 = ctypes.WinDLL("user32", use_last_error=True)   # own instance: argtypes here don't affect other modules
+user32.GetForegroundWindow.argtypes = []
+user32.GetForegroundWindow.restype = wt.HWND
+user32.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
+user32.GetWindowThreadProcessId.restype = wt.DWORD
+kernel32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+kernel32.OpenProcess.restype = wt.HANDLE
+kernel32.QueryFullProcessImageNameW.argtypes = [wt.HANDLE, wt.DWORD, wt.LPWSTR, ctypes.POINTER(wt.DWORD)]
+kernel32.QueryFullProcessImageNameW.restype = wt.BOOL
+kernel32.CloseHandle.argtypes = [wt.HANDLE]
+kernel32.CloseHandle.restype = wt.BOOL
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+
+def foreground_exe() -> str:
+    """File name of the program whose window is in front ("Code.exe"), or "" if it can't be told
+    (no window, or a program running as administrator)."""
+    try:
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return ""
+        pid = wt.DWORD(0)
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if not pid.value:
+            return ""
+        h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+        if not h:
+            return ""
+        try:
+            size = wt.DWORD(32768)
+            buf = ctypes.create_unicode_buffer(size.value)
+            if not kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                return ""
+        finally:
+            kernel32.CloseHandle(h)
+        return buf.value.rsplit("\\", 1)[-1]
+    except (OSError, ctypes.ArgumentError):
+        return ""
+
+
+# --- foreground window title ---------------------------------------------------------------------
+
+user32.GetWindowTextLengthW.argtypes = [wt.HWND]
+user32.GetWindowTextW.argtypes = [wt.HWND, wt.LPWSTR, ctypes.c_int]
 
 
 def foreground_window() -> int:
     """The window the user is typing into (0 = none). Kept at dictation start so "scratch that" only
     sends Backspace if that same window is still in front."""
-    return _user32.GetForegroundWindow() or 0
+    return user32.GetForegroundWindow() or 0
 
 
 def window_title(hwnd: int) -> str:
     """A window's title bar text ("McpAuthFilter.java - ss-core-service - IntelliJ IDEA"), "" if none."""
     if not hwnd:
         return ""
-    n = _user32.GetWindowTextLengthW(hwnd)
+    n = user32.GetWindowTextLengthW(hwnd)
     if n <= 0:
         return ""
     buf = ctypes.create_unicode_buffer(n + 1)
-    _user32.GetWindowTextW(hwnd, buf, n + 1)
+    user32.GetWindowTextW(hwnd, buf, n + 1)
     return buf.value

@@ -54,7 +54,8 @@ def run_session(engine, audio, monkeypatch, use_vad=True, **cfg_over):
     cfg = config.parse("")
     cfg = config.Config(**{**cfg.__dict__, **cfg_over})
     app = types.SimpleNamespace(cfg=cfg, recorder=FakeRecorder(audio), engine=engine,
-                                cleaner=Cleaner.from_config(cfg), _session=1, state="recording")
+                                cleaner_for=lambda exe: Cleaner.from_config(cfg), target_exe="",
+                                _session=1, state="recording")
     s = Session(app, 1, use_vad=use_vad)
     while not app.recorder.done:
         time.sleep(0.05)

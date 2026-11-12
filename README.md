@@ -13,6 +13,8 @@ Nothing leaves the laptop, and no admin rights are needed.
 | Dictate (hold mode) | Hold **Ctrl+Q** while speaking, then let go |
 | Cancel a recording | **Esc** (nothing is typed) |
 | Retype the last result | Tray icon → *Copy last dictation*, then paste |
+| Recognition failed | Tray icon → *Retry last recording* (or *Discard last recording*). The audio is kept in memory only, never on disk |
+| Send it straight away | `[output] press_enter = true` presses Enter after the text is typed |
 | Change settings | Tray icon → *Settings…* (applied on the next dictation) |
 
 A small pill at the bottom of the screen you're working on shows **● Listening** (with a live mic
@@ -32,6 +34,9 @@ the split result is word-for-word the same as transcribing everything at once. T
 The tray icon colour shows the state: **grey** idle (model not loaded) · **blue** idle (model loaded) ·
 **red** listening · **amber** loading/transcribing · **dark red with !** problem (see the notification or *Open log*).
 
+If the text can't be typed (no window has focus, or the window runs as administrator), it is put on the
+clipboard instead and a notification says so; with typing while you talk, what was already typed stays.
+
 Ctrl+Q is taken over system-wide while the app runs, so other apps no longer receive it
 (for example "quit" in some apps, or XON in terminals).
 
@@ -44,6 +49,8 @@ Ctrl+Q is taken over system-wide while the app runs, so other apps no longer rec
   the spacing, hyphens and capitals it is heard with ("Keycloak" fixes "key cloak" and "Key-Cloak",
   "useAudioCapture" fixes "use audio capture"), and `[dictionary.heard_as]` covers real mishearings
   ("mail sey" → **Mailzzy**). `[accuracy] hotwords` is passed to models that do support boosting.
+  `[dictionary.apps."code.exe"]` adds terms for one program only (the window in front when you start
+  dictating); they win over your own.
 - **Phrases found by a voice detector**: Silero VAD (the 1 MB file Orca downloads, run on the CPU in the engine
   process) decides where each phrase starts and ends, keeping 0.4 s before it so first words aren't clipped.
   Same thresholds as Orca. Without it (`[model] vad = "off"`, not found, or it fails) a loudness detector is used.
@@ -54,7 +61,11 @@ Ctrl+Q is taken over system-wide while the app runs, so other apps no longer rec
   and padding at the end so the last word isn't cut.
 - **Deterministic text clean-up** with no AI rewriting: fillers removed as whole words (stretched spellings
   too, but "uh-huh", "umbrella" and a lone "M" are left alone), stutters like "the the" collapsed, then your exact
-  replacements and the dictionary applied.
+  replacements and the dictionary applied. The filler sounds follow the dictation language (Orca's lists for
+  English, German, Spanish, French, Italian, Portuguese, Dutch, Russian, Japanese, Korean and Chinese); your
+  `[cleanup] fillers` are removed on top.
+- **Dictation language**: `[model] language` ("auto" or a code like "de") is passed to models that can be told
+  the language, and picks the filler words.
 
 ## Resource use (measured on this laptop)
 
@@ -65,7 +76,9 @@ Ctrl+Q is taken over system-wide while the app runs, so other apps no longer rec
 | 30 seconds after a dictation ends (typed or cancelled) | the model process exits, so all of that memory goes back to Windows | 0 |
 
 `[model] device = "auto"` uses the NVIDIA card, then the built-in Intel graphics, then the CPU; whichever
-fails falls back to the CPU. The very first GPU run on a PC compiles shaders once (~20 s); after that the
+fails falls back to the CPU. If the graphics card ever crashes the engine, `auto` remembers it
+(`%LOCALAPPDATA%\ParakeetDictate\gpu-failed.json`) and uses the CPU from then on; delete that file, or set
+`device = "gpu"`, to try the card again. Loading and each transcription give up after a minute. The very first GPU run on a PC compiles shaders once (~20 s); after that the
 driver's cache makes it ~2 s to load. The model starts loading the moment you press the hotkey, so the load overlaps your speaking.
 A new dictation within the 30 s reuses the loaded model and starts instantly. Change it with
 `[model] unload_after_seconds` (0 = free right after each dictation, -1 = keep loaded).

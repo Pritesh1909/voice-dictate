@@ -2,10 +2,13 @@
 
 Everything here is deterministic word-list logic: it only removes fillers, collapses stutters and applies
 the user's exact replacements and dictionary spellings. It never rewords anything else (no AI rewrite step).
+Filler removal is ported from Orca 1.4.256 (shared/dictation-filler-words.js): each language has its own
+thinking sounds, and the user's [cleanup] fillers are added on top.
 """
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Iterable
 
@@ -13,8 +16,6 @@ from . import dictionary
 
 # token = leading openers + core word + trailing punctuation
 _SPLIT = re.compile(r"^([\"'(\[{“‘]*)(.*?)([.,!?;:…\"')\]}”’\-]*)$", re.S)
-_ENDS_SENTENCE = re.compile(r"[.!?…][\"')\]}”’]*$")
-_TERMINAL = re.compile(r"[.!?…]")
 _WORD = re.compile(r"^[A-Za-z]+(?:'[A-Za-z]+)?$")
 
 
@@ -23,12 +24,8 @@ def _split(tok: str) -> tuple[str, str, str]:
     return (m.group(1), m.group(2), m.group(3)) if m else ("", tok, "")
 
 
-def filler_regex(words: Iterable[str]) -> re.Pattern | None:
-    """Build one case-insensitive full-word pattern from base filler spellings.
-
-    Each run of letters may be stretched but not shortened: "uh" matches uh/uhh/uuhh, "ah" matches AHH,
-    "mm" matches mm/mmm but never a lone "M", "hm" matches hm/hmm.
-    """
+def _stretchable(words: Iterable[str]) -> str | None:
+    """Regex alternatives for base filler spellings, each run of letters stretched but not shortened."""
     alts = set()
     for w in words:
         w = w.strip().lower()
@@ -36,9 +33,104 @@ def filler_regex(words: Iterable[str]) -> re.Pattern | None:
             continue
         alts.add("".join(f"{re.escape(run[0])}{{{len(run)},}}" for run in
                          (m.group(0) for m in re.finditer(r"(.)\1*", w))))
-    if not alts:
+    return "|".join(sorted(alts, key=len, reverse=True)) if alts else None
+
+
+def filler_regex(words: Iterable[str]) -> re.Pattern | None:
+    """Build one case-insensitive full-word pattern from base filler spellings.
+
+    Each run of letters may be stretched but not shortened: "uh" matches uh/uhh/uuhh, "ah" matches AHH,
+    "mm" matches mm/mmm but never a lone "M", "hm" matches hm/hmm.
+    """
+    alts = _stretchable(words)
+    return re.compile(f"(?:{alts})", re.I) if alts else None
+
+
+# Sounds people make while thinking, per language. Never words with meaning ("like", "so", "well", "那个", "그").
+FILLERS_BY_LANGUAGE = {
+    "en": r"u+m+|u+h+m*|er|e+r+m+|h+m+|m{3,}",
+    "de": r"ä+h+m*|ö+h+m*|e+h+m+|h+m+|m{3,}",
+    "es": r"e+h{2,}|e+h+m+|e+m+|h+m+|m{3,}",
+    "fr": r"e+u+h+|h+e+u+|h+u+m+|h+m+|m{3,}",
+    "it": r"e+h{2,}|e+h+m+|u+h+m+|h+m+|m{3,}",
+    "pt": r"h+ã+|ã+h+|h+u+m+|h+m+|m{3,}",
+    "nl": r"e+h+m*|u+h+m*|h+m+|m{3,}",
+    "ru": r"э+м*|х+м+|м{3,}",
+    "ja": r"え[ーえっ]*と|えー+|あのー+|うー+ん|んー+",
+    "ko": r"으*음+|흠+",
+    # 嗯 alone is also "yes", so only the one a pause follows goes.
+    "zh": r"嗯+(?=\s*[，,、])|呃+|[额額]+",
+}
+FILLERS_BY_LANGUAGE["yue"] = FILLERS_BY_LANGUAGE["zh"]
+# For an unknown language: English fillers that are no word elsewhere ("um" is German and Portuguese, "er" German).
+LANGUAGE_NEUTRAL_FILLERS = r"u+h+m*|u+m{2,}|e+r+m+|h+m+|m{3,}"
+
+# What joins a filler to a word. Orca's [\p{L}\p{N}\p{M}_/'’-]: Python's \w has the letters, digits and "_",
+# and the common combining-mark blocks stand in for \p{M}.
+_WORD_CHAR = r"[\w/'’\-̀-ͯ᪰-᫿᷀-᷿⃐-⃿︠-゙゚︯]"
+# The comma or ellipsis after a filler goes with it.
+_TRAILING_PAUSE = r"(?:\s*(?P<pause>[,，、…]|\.{3}))?\s*"
+_SENTENCE_END_CHARS = ".!?。！？"
+_SENTENCE_END_RE = re.compile(r"[.!?。！？]+\s*")
+_QUESTION_OR_CALL_RE = re.compile(r"\s*[?？!！]")
+# A comma left in front of a removed filler that ended the sentence or the text.
+_TRAILING_SOFT_PUNCTUATION_RE = re.compile(r"[\s,，、]+$")
+# The comma before a filler that a pause also follows, keeping the space after it.
+_COMMA_BEFORE_PAUSED_FILLER_RE = re.compile(r"[,，、](\s*)$")
+_LEADING_LETTERS_RE = re.compile(r"[^\W\d_]+")
+
+
+def _standalone(alternatives: list[str]) -> re.Pattern:
+    """A filler stands alone: nothing joins it to a word (a dot only does inside a name like "um.txt")."""
+    return re.compile(rf"(?<!{_WORD_CHAR})(?<!{_WORD_CHAR}\.)({'|'.join(alternatives)})"
+                      rf"(?!{_WORD_CHAR}|\.{_WORD_CHAR}){_TRAILING_PAUSE}", re.I)
+
+
+@dataclass(frozen=True)
+class Fillers:
+    """Compiled filler rules for one set of dictation languages."""
+    pattern: re.Pattern            # the language's sounds (or the language-neutral set) + the user's own
+    plain: re.Pattern | None       # only the user's own: for non-Latin text when the language is unknown
+    neutral: bool                  # no list for the language, so `plain` applies to non-Latin text
+
+
+def filler_rules(languages: Iterable[str] = (), extra: Iterable[str] = (),
+                 language_fillers: bool = True) -> Fillers | None:
+    """What to remove from text in `languages` (ISO-639-1 codes; "zh-CN" counts as "zh"; none = unknown),
+    plus the user's `extra` base spellings. None when there is nothing to remove."""
+    user = _stretchable(extra)
+    lists: list[str] = []
+    if language_fillers:
+        for code in languages:
+            f = FILLERS_BY_LANGUAGE.get(code.lower().split("-")[0])
+            if f and f not in lists:
+                lists.append(f)
+    neutral = language_fillers and not lists
+    if neutral:
+        lists.append(LANGUAGE_NEUTRAL_FILLERS)
+    if user:
+        lists.append(user)
+    if not lists:
         return None
-    return re.compile("(?:" + "|".join(sorted(alts, key=len, reverse=True)) + ")", re.I)
+    return Fillers(_standalone(lists), _standalone([user]) if neutral and user else None, neutral)
+
+
+def _has_non_latin_letter(text: str) -> bool:
+    return any(ch.isalpha() and "LATIN" not in unicodedata.name(ch, "") for ch in text if ord(ch) > 0x7F)
+
+
+def _all_caps_word(word: str) -> bool:
+    """In mixed-case text an all-caps "UM" or "ER" is more likely a name or acronym than a sound. A stretched
+    one ("AHH", "HMM", "UMM": a letter doubled) is still a sound."""
+    return (len(word) > 1 and word == word.upper() and word != word.lower()
+            and not re.search(r"(.)\1", word.lower()))
+
+
+def _capitalize_lowercase_word(text: str) -> str:
+    m = _LEADING_LETTERS_RE.match(text)
+    if not m or m.group(0) != m.group(0).lower():
+        return text
+    return text[:1].upper() + text[1:]
 
 
 def _cap_first(tok: str) -> str:
@@ -48,33 +140,52 @@ def _cap_first(tok: str) -> str:
     return tok
 
 
-def remove_fillers(text: str, pattern: re.Pattern | None) -> str:
+def remove_fillers(text: str, rules: Fillers | None) -> str:
+    """Drop standalone filler sounds and the pause punctuation after them; text with none comes back unchanged."""
+    if rules is None:
+        return text
+    pattern = rules.plain if rules.neutral and _has_non_latin_letter(text) else rules.pattern
     if pattern is None:
         return text
-    out: list[str] = []
-    cap_next = False
-    for tok in text.split():
-        lead, core, trail = _split(tok)
-        if core and pattern.fullmatch(core):
-            at_start = not out or bool(_ENDS_SENTENCE.search(out[-1]))
-            terms = _TERMINAL.findall(trail)
-            if terms:
-                # "and then, uh." -> "and then."
-                if out and not at_start:
-                    out[-1] = out[-1].rstrip(",;:-") + terms[-1]
-                cap_next = True
-            else:
-                # "we should, um, deploy" -> "we should deploy" (the commas only marked the pause)
-                if out and not at_start and "," in trail and out[-1].endswith(","):
-                    out[-1] = out[-1][:-1]
-                if at_start:
-                    cap_next = True
-            continue
-        if cap_next:
-            tok = _cap_first(tok)
+    out, cursor, cap_next = "", 0, False
+    # Some models write everything in capitals, where "UM" is still a sound.
+    caseless = text == text.upper()
+
+    def keep(segment: str) -> None:
+        nonlocal out, cap_next
+        if segment:
+            out += _capitalize_lowercase_word(segment) if cap_next else segment
             cap_next = False
-        out.append(tok)
-    return " ".join(out)
+
+    for m in pattern.finditer(text):
+        filler = m.group(1)
+        if not caseless and _all_caps_word(filler):
+            continue
+        before = (out + text[cursor:m.start()]).rstrip()
+        at_start = before == "" or before[-1] in _SENTENCE_END_CHARS
+        # "Hm?" or "Eh!" on its own is a question or a call, so it stays; "Is it ready, uh?" loses the "uh".
+        if at_start and _QUESTION_OR_CALL_RE.match(text, m.end(1)):
+            continue
+        keep(text[cursor:m.start()])
+        cursor = m.end()
+        end = _SENTENCE_END_RE.match(text, cursor)
+        if end and at_start:
+            cursor = end.end()                                   # "Um." on its own goes entirely
+        elif end:
+            out = _TRAILING_SOFT_PUNCTUATION_RE.sub("", out)     # "we should, um." keeps its full stop
+        elif m.group("pause"):
+            # "we should, uh, ship" set the filler off on both sides; neither comma belongs to the sentence.
+            out = _COMMA_BEFORE_PAUSED_FILLER_RE.sub(r"\1", out)
+        # The next word begins the sentence when a capitalised "Um" began it, or when the text began with the
+        # filler (Orca only does the first; a lower-case "um, deploy it" also becomes "Deploy it" here).
+        cap_next = cap_next or (at_start and (filler[:1] != filler[:1].lower() or before == ""))
+    if cursor == 0:
+        return text
+    if cursor == len(text):
+        out = _TRAILING_SOFT_PUNCTUATION_RE.sub("", out)     # a filler at the very end leaves the comma dangling
+    else:
+        keep(text[cursor:])
+    return out.strip()
 
 
 def remove_repeats(text: str, allowed: Iterable[str] = ()) -> str:
@@ -121,22 +232,28 @@ def tidy(text: str) -> str:
 
 @dataclass
 class Cleaner:
-    fillers: list[str] = field(default_factory=list)
+    fillers: list[str] = field(default_factory=list)                  # the user's own, on top of the language's
     remove_repeated_words: bool = True
     repeated_words_allowed: list[str] = field(default_factory=list)
     replacements: list[tuple[str, str]] = field(default_factory=list)
     dictionary: list[tuple[str, str]] = field(default_factory=list)   # (term, heard_as or "")
+    app_dictionary: list[tuple[str, str]] = field(default_factory=list)  # one program's terms: win over yours
+    languages: tuple[str, ...] = ()                                   # what is dictated; () = unknown
+    language_fillers: bool = True                                     # remove that language's filler sounds
 
     def __post_init__(self) -> None:
-        self._fillers = filler_regex(self.fillers)
+        self._fillers = filler_rules(self.languages, self.fillers, self.language_fillers)
         self._repl = compile_replacements(self.replacements)
-        self._spell = dictionary.build(self.dictionary)
+        self._spell = dictionary.build(self.dictionary, ahead=self.app_dictionary)
 
     @classmethod
-    def from_config(cls, c) -> "Cleaner":
+    def from_config(cls, c, languages: Iterable[str] = (),
+                    app_terms: Iterable[tuple[str, str]] = ()) -> "Cleaner":
+        """`app_terms` (one program's [dictionary.apps] entry) come first, so they win over your own."""
         return cls(fillers=list(c.fillers), remove_repeated_words=c.remove_repeated_words,
                    repeated_words_allowed=list(c.repeated_words_allowed), replacements=list(c.replacements),
-                   dictionary=list(c.dictionary))
+                   dictionary=list(c.dictionary), app_dictionary=list(app_terms), languages=tuple(languages),
+                   language_fillers=c.language_fillers)
 
     def clean(self, raw: str) -> str:
         text = remove_fillers(raw.replace("\n", " "), self._fillers)

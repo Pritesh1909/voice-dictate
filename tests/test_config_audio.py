@@ -80,3 +80,10 @@ def test_silence_stop_setting():
     for bad in ("2", "-1", "5000", "1.5", '"60"'):
         with pytest.raises(config.ConfigError):
             config.parse(f"[audio]\nsilence_stop_seconds = {bad}")
+
+
+def test_press_enter_setting():
+    assert config.parse("").press_enter is False
+    assert config.parse("[output]\npress_enter = true").press_enter is True
+    with pytest.raises(config.ConfigError):
+        config.parse("[output]\npress_enter = 'yes'")
