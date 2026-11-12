@@ -71,3 +71,10 @@ def test_resample_48k():
     up = np.repeat(x, 3)  # crude 48 kHz signal
     y = resample(up, 48000, SR)
     assert abs(y.size - SR) <= 1
+
+
+def test_press_enter_setting():
+    assert config.parse("").press_enter is False
+    assert config.parse("[output]\npress_enter = true").press_enter is True
+    with pytest.raises(config.ConfigError):
+        config.parse("[output]\npress_enter = 'yes'")

@@ -13,6 +13,8 @@ Nothing leaves the laptop, and no admin rights are needed.
 | Dictate (hold mode) | Hold **Ctrl+Q** while speaking, then let go |
 | Cancel a recording | **Esc** (nothing is typed) |
 | Retype the last result | Tray icon → *Copy last dictation*, then paste |
+| Recognition failed | Tray icon → *Retry last recording* (or *Discard last recording*). The audio is kept in memory only, never on disk |
+| Send it straight away | `[output] press_enter = true` presses Enter after the text is typed |
 | Change settings | Tray icon → *Settings…* (applied on the next dictation) |
 
 A small pill at the bottom of the screen you're working on shows **● Listening** (with a live mic
@@ -27,6 +29,9 @@ the split result is word-for-word the same as transcribing everything at once. T
 
 The tray icon colour shows the state: **grey** idle (model not loaded) · **blue** idle (model loaded) ·
 **red** listening · **amber** loading/transcribing · **dark red with !** problem (see the notification or *Open log*).
+
+If the text can't be typed (no window has focus, or the window runs as administrator), it is put on the
+clipboard instead and a notification says so; with typing while you talk, what was already typed stays.
 
 Ctrl+Q is taken over system-wide while the app runs, so other apps no longer receive it
 (for example "quit" in some apps, or XON in terminals).

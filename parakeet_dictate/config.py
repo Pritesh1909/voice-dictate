@@ -64,6 +64,7 @@ class Config:
     output_method: str
     type_while_speaking: bool
     add_trailing_space: bool
+    press_enter: bool
     sounds: bool
     max_seconds: int
     log_transcripts: bool
@@ -135,6 +136,7 @@ def parse(text: str, defaults_text: str | None = None) -> Config:
         output_method=_get(d, "output", "method", str, lambda v: v in ("type", "paste")),
         type_while_speaking=_get(d, "output", "type_while_speaking", bool),
         add_trailing_space=_get(d, "output", "add_trailing_space", bool),
+        press_enter=_get(d, "output", "press_enter", bool),
         sounds=_get(d, "output", "sounds", bool),
         max_seconds=_get(d, "output", "max_seconds", int, lambda v: 5 <= v <= 1800),
         log_transcripts=_get(d, "output", "log_transcripts", bool),

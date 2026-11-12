@@ -1,10 +1,16 @@
-"""Deliver text to the window that has focus: Unicode keystrokes (default) or clipboard paste."""
+"""Deliver text to the window that has focus: Unicode keystrokes (default) or clipboard paste.
+When it can't be typed (no window has focus, or Windows blocks the keystrokes) the caller is told,
+so it can put the text on the clipboard instead of losing it."""
 from __future__ import annotations
 
 import ctypes
 import ctypes.wintypes as wt
+import logging
+import os
 import threading
 import time
+
+log = logging.getLogger(__name__)
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -12,6 +18,7 @@ kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP, KEYEVENTF_UNICODE = 0x2, 0x4
 VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN, VK_V = 0x11, 0x12, 0x10, 0x5B, 0x5C, 0x56
+VK_RETURN = 0x0D
 CF_UNICODETEXT, GMEM_MOVEABLE = 13, 0x2
 
 
@@ -43,12 +50,58 @@ user32.GetClipboardData.restype = ctypes.c_void_p
 user32.SetClipboardData.argtypes = [wt.UINT, ctypes.c_void_p]
 user32.SetClipboardData.restype = ctypes.c_void_p
 user32.IsClipboardFormatAvailable.argtypes = [wt.UINT]
+user32.GetForegroundWindow.restype = wt.HWND
+user32.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
+user32.GetClassNameW.argtypes = [wt.HWND, wt.LPWSTR, ctypes.c_int]
 kernel32.GlobalAlloc.argtypes = [wt.UINT, ctypes.c_size_t]
 kernel32.GlobalAlloc.restype = ctypes.c_void_p
 kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
 kernel32.GlobalLock.restype = ctypes.c_void_p
 kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
 kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
+
+
+# The desktop and the taskbar: focus sits there when no app window has it, and keystrokes sent there are lost.
+_NOT_TARGETS = ("Progman", "WorkerW", "Shell_TrayWnd")
+NO_TARGET_NOTE = "No window had focus, so the text was copied to the clipboard."
+BLOCKED_NOTE = "Couldn't type into that window, so the text was copied to the clipboard."
+
+
+class DeliveryError(OSError):
+    """The text didn't reach a window. no_target: nothing to type into (rather than typing being blocked)."""
+
+    def __init__(self, message: str, no_target: bool = False):
+        super().__init__(message)
+        self.no_target = no_target
+
+
+def _foreground() -> tuple[int, int, str]:
+    """(handle, owning process id, window class) of the window that has focus; handle 0 if none."""
+    hwnd = user32.GetForegroundWindow()
+    if not hwnd:
+        return 0, 0, ""
+    pid = wt.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    buf = ctypes.create_unicode_buffer(256)
+    user32.GetClassNameW(hwnd, buf, 256)
+    return hwnd, pid.value, buf.value
+
+
+def has_typing_target() -> bool:
+    """False only when typing surely goes nowhere: no focused window, the desktop or taskbar has focus,
+    or one of our own windows does (after a tray menu click the tray's hidden window is in front)."""
+    hwnd, pid, cls = _foreground()
+    return bool(hwnd) and pid != os.getpid() and cls not in _NOT_TARGETS
+
+
+def wait_for_target(timeout: float) -> bool:
+    """Give the user a moment to click back into a window (used after a tray menu click)."""
+    end = time.monotonic() + timeout
+    while not has_typing_target():
+        if time.monotonic() >= end:
+            return False
+        time.sleep(0.1)
+    return True
 
 
 def modifiers_down() -> bool:
@@ -140,8 +193,26 @@ def paste_text(text: str) -> None:
 
 
 def deliver(text: str, method: str) -> None:
+    """Type or paste text where the cursor is. Raises DeliveryError when it can't get there."""
     wait_modifiers_released()
-    (paste_text if method == "paste" else type_text)(text)
+    if not has_typing_target():
+        raise DeliveryError("no window to type into", no_target=True)
+    try:
+        (paste_text if method == "paste" else type_text)(text)
+    except OSError as e:
+        raise DeliveryError(str(e)) from e
+
+
+def copy_instead(text: str, err: OSError) -> str:
+    """Typing failed: put the text on the clipboard so it isn't lost. Returns the note to show the user."""
+    _set_clipboard_text(text)
+    return NO_TARGET_NOTE if getattr(err, "no_target", False) else BLOCKED_NOTE
+
+
+def press_enter() -> None:
+    """One Enter after the text (e.g. to send a chat message), with the same wait for Ctrl/Alt as the text."""
+    wait_modifiers_released()
+    _send([_key(VK_RETURN), _key(VK_RETURN, flags=KEYEVENTF_KEYUP)])
 
 
 def copy_to_clipboard(text: str) -> None:
@@ -154,6 +225,9 @@ class PhraseTyper:
     Nothing is typed while a modifier key is held (hold-to-talk keeps Ctrl down, and letters typed then
     would become shortcuts); those phrases wait and go out together once the keys are released.
     Phrases are joined with one space, and each delivery ends with a space when trailing_space is on.
+
+    If typing fails (no window to type into, or Windows blocks it), what was typed stays typed and this
+    phrase and every later one are collected in `untyped` instead, for the app to put on the clipboard.
     """
 
     def __init__(self, clean, method: str = "type", trailing_space: bool = True, send=None, mods=None):
@@ -165,6 +239,8 @@ class PhraseTyper:
         self._lock = threading.Lock()
         self._pending: list[str] = []
         self._typed: list[str] = []
+        self._untyped: list[str] = []
+        self.failed: OSError | None = None
         self.cancelled = False
 
     def add(self, raw: str) -> None:
@@ -182,16 +258,30 @@ class PhraseTyper:
         """Everything typed so far."""
         return " ".join(self._typed)
 
+    @property
+    def untyped(self) -> str:
+        """Phrases that couldn't be typed (empty unless typing failed)."""
+        return " ".join(self._untyped)
+
     def pump(self, wait: bool = False) -> None:
         """Type what is waiting. wait=False skips it while a modifier is held; wait=True (end of the
         dictation) gives the keys up to 2 s to come up, as a whole-dictation delivery does."""
         with self._lock:
-            if self.cancelled or not self._pending or (not wait and self._mods()):
+            if self.cancelled or not self._pending:
                 return
-            chunk = " ".join(self._pending)
-            lead = " " if self._typed and not self.trailing_space else ""
-            self._send(lead + chunk + (" " if self.trailing_space else ""), self.method)
-            self._typed += self._pending
+            if self.failed is None:
+                if not wait and self._mods():
+                    return
+                chunk = " ".join(self._pending)
+                lead = " " if self._typed and not self.trailing_space else ""
+                try:
+                    self._send(lead + chunk + (" " if self.trailing_space else ""), self.method)
+                    self._typed += self._pending
+                except OSError as e:
+                    log.warning("typing failed, the rest of this dictation goes to the clipboard: %s", e)
+                    self.failed = e
+            if self.failed is not None:
+                self._untyped += self._pending
             self._pending = []
 
     def cancel(self) -> None:

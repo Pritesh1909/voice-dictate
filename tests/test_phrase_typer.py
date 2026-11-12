@@ -64,3 +64,27 @@ def test_filler_only_phrase_types_nothing():
     t.add("um ")
     t.pump()
     assert sent == [] and t.text == ""
+
+
+def test_typing_failure_keeps_what_was_typed_and_collects_the_rest():
+    sent = []
+
+    def send(text, method):
+        if len(sent) == 1:
+            raise OSError("SendInput blocked")
+        sent.append(text)
+
+    t = PhraseTyper(lambda raw: raw, "type", True, send=send, mods=lambda: False)
+    for p in ("One.", "Two.", "Three."):
+        t.add(p)
+        t.pump()
+    t.pump(wait=True)
+    assert sent == ["One. "] and t.text == "One."
+    assert t.untyped == "Two. Three." and isinstance(t.failed, OSError) and not t.pending
+
+
+def test_no_failure_leaves_nothing_untyped():
+    t, sent, _ = make()
+    t.add("One.")
+    t.pump(wait=True)
+    assert t.failed is None and t.untyped == ""
