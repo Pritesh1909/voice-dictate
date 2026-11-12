@@ -51,6 +51,18 @@ def _dpi_scale() -> float:
         return 1.0
 
 
+def listening_look(level: float, clipping: bool) -> tuple[str, str, str, float]:
+    """(label, label colour, bar colour, bar fill 0..1) for the Listening pill.
+
+    `level` is the mic meter's 0..1 level (noise floor already removed). While the input clips the
+    pill says so in red, because clipped audio transcribes badly and the fix (move the mic, lower the
+    input volume) is the user's to make."""
+    v = min(1.0, max(0.0, level))
+    if clipping:
+        return "Too loud", RED, RED, max(v, 0.8)
+    return "Listening", FG, FG if v > 0.05 else MUTED, v
+
+
 class Overlay:
     def __init__(self, position: str = "bottom"):
         self.position = position
@@ -59,6 +71,7 @@ class Overlay:
         self._mode = "hidden"
         self._level_fn = lambda: 0.0
         self._writing_fn = lambda: False
+        self._clipping_fn = lambda: False
         self._started = 0.0
         self._tick = 0
         self._hide_job = None
@@ -68,10 +81,11 @@ class Overlay:
 
     # --- public, callable from any thread -------------------------------------------------------
 
-    def listening(self, level_fn, started_at: float, writing_fn=None) -> None:
-        """writing_fn() -> True while heard speech is still being turned into text (amber dot)."""
+    def listening(self, level_fn, started_at: float, writing_fn=None, clipping_fn=None) -> None:
+        """level_fn() -> mic meter level 0..1; writing_fn() -> True while heard speech is still being
+        turned into text (amber dot); clipping_fn() -> True while the input is too loud (red bars)."""
         self._call(self._show, "listening", level_fn=level_fn, started=started_at,
-                   writing_fn=writing_fn or (lambda: False))
+                   writing_fn=writing_fn or (lambda: False), clipping_fn=clipping_fn or (lambda: False))
 
     def working(self, text: str = "Transcribing…") -> None:
         self._call(self._show, "working", text=text)
@@ -138,6 +152,7 @@ class Overlay:
         self._kw = kw
         if mode == "listening":
             self._level_fn, self._started, self._writing_fn = kw["level_fn"], kw["started"], kw["writing_fn"]
+            self._clipping_fn = kw["clipping_fn"]
         self._root.attributes("-alpha", 0.96)
         self._draw()
         if mode == "flash":
@@ -182,15 +197,17 @@ class Overlay:
             pulse = 0.75 + 0.25 * math.sin(self._tick / 2.2)
             rr = 6 * s * pulse
             c.create_oval(22 * s - rr, cy - rr, 22 * s + rr, cy + rr, fill=RED, outline=RED)
-            c.create_text(36 * s, cy, text="Listening", fill=FG, font=font, anchor="w")
-            level = self._level_fn()
-            db = 20 * math.log10(max(level, 1e-6))
-            v = min(1.0, max(0.0, (db + 55) / 40))
+            try:
+                level, clipping = float(self._level_fn()), bool(self._clipping_fn())
+            except Exception:
+                level, clipping = 0.0, False
+            label, label_col, bar_col, v = listening_look(level, clipping)
+            c.create_text(36 * s, cy, text=label, fill=label_col, font=font, anchor="w")
             for i in range(7):
                 ph = abs(math.sin(self._tick / 1.6 + i * 0.9))
                 bh = (3 + 15 * v * (0.45 + 0.55 * ph)) * s
                 x = (120 + i * 7) * s
-                c.create_rectangle(x, cy - bh / 2, x + 4 * s, cy + bh / 2, fill=FG if v > 0.05 else MUTED, outline="")
+                c.create_rectangle(x, cy - bh / 2, x + 4 * s, cy + bh / 2, fill=bar_col, outline="")
             try:
                 writing = bool(self._writing_fn())
             except Exception:

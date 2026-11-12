@@ -12,7 +12,7 @@ import pystray
 from . import APP_NAME, __version__
 from . import config as cfgmod
 from . import models, output, winutil
-from .audio import SR, Recorder, preprocess, resample
+from .audio import SR, Recorder, preprocess, resample, silence_stop_due, silence_stop_message
 from .engine import Engine, EngineError, EngineSpec
 from .hotkey import HotkeyError, HotkeyThread, key_down
 from .overlay import GREEN, MUTED, RED, Overlay
@@ -21,6 +21,8 @@ from .textclean import Cleaner
 from .tray import icon_image, write_ico
 
 log = logging.getLogger(__name__)
+
+MIC_LOST = "Microphone disconnected. Dictation stopped."
 
 
 class Session:
@@ -402,6 +404,8 @@ class App:
                 self._notify(f"Microphone could not be opened: {e}")
                 self.sounds.play("error")
                 return
+            if self.recorder.warning:   # chosen microphone missing; recording from the default instead
+                self._notify(self.recorder.warning)
             self.state = "recording"
             log.info("recording started at %d Hz", self.recorder.rate)
             self._session += 1
@@ -412,33 +416,52 @@ class App:
                 self.hotkeys.escape_on()
             if self.overlay:
                 rec, cur = self.recorder, self.current
-                self.overlay.listening(lambda: rec.level, rec.started_at, lambda: cur.writing)
+                self.overlay.listening(lambda: rec.level, rec.started_at, lambda: cur.writing, lambda: rec.clipping)
         self.engine.warm()  # load the model while the user is talking
         self._refresh()
         threading.Thread(target=self._watch_release, args=(session,), daemon=True).start()
 
     def _watch_release(self, session: int) -> None:
-        """Hold-to-talk: if the key is held past the threshold, releasing it stops the recording."""
+        """Hold-to-talk: if the key is held past the threshold, releasing it stops the recording.
+
+        Also stops it, like pressing the hotkey, when the microphone goes away, at max_seconds, and in
+        tap mode after [audio] silence_stop_seconds without speech (holding the keys means you're
+        still dictating, so silence never stops a hold)."""
         t0 = time.monotonic()
         deadline = t0 + self.cfg.max_seconds
         vk = self.hotkeys.vk
+        rec = self.recorder
+        reason = ""
         while key_down(vk) and time.monotonic() < deadline:
             time.sleep(0.02)
             if self._session != session or self.state != "recording":
                 return
+            if rec.lost:
+                reason = MIC_LOST
+                break
         held = time.monotonic() - t0
-        with self._lock:
-            if held >= self.cfg.hold_threshold and self._session == session and self.state == "recording":
-                self._finish_locked()
-                return
-        # Toggle mode: enforce the maximum length.
-        while time.monotonic() < deadline:
-            time.sleep(0.25)
-            if self._session != session or self.state != "recording":
-                return
+        if not reason:
+            with self._lock:
+                if held >= self.cfg.hold_threshold and self._session == session and self.state == "recording":
+                    self._finish_locked()
+                    return
+        # Toggle mode: stop for a lost microphone, silence, or the maximum length.
+        while not reason:
+            now = time.monotonic()
+            if now >= deadline:
+                reason = f"Stopped after {self.cfg.max_seconds} s ([output] max_seconds)."
+            elif rec.lost:
+                reason = MIC_LOST
+            elif silence_stop_due(rec.meter.last_speech_at, rec.started_at, now, self.cfg.silence_stop_seconds):
+                reason = silence_stop_message(self.cfg.silence_stop_seconds)
+            else:
+                time.sleep(0.25)
+                if self._session != session or self.state != "recording":
+                    return
         with self._lock:
             if self._session == session and self.state == "recording":
-                self._notify(f"Stopped after {self.cfg.max_seconds} s ([output] max_seconds).")
+                log.info("auto stop: %s", reason)
+                self._notify(reason)
                 self._finish_locked()
 
     def _on_cancel(self) -> None:  # hotkey thread (Esc)

@@ -70,6 +70,7 @@ class Config:
     overlay: bool
     overlay_position: str
     input_device: str
+    silence_stop_seconds: int  # 0 = off
     source_mtime: float = field(default=0.0, compare=False)
 
 
@@ -141,6 +142,7 @@ def parse(text: str, defaults_text: str | None = None) -> Config:
         overlay=_get(d, "overlay", "enabled", bool),
         overlay_position=_get(d, "overlay", "position", str, lambda v: v in ("top", "bottom")),
         input_device=_get(d, "audio", "input_device", str),
+        silence_stop_seconds=_get(d, "audio", "silence_stop_seconds", int, lambda v: v == 0 or 5 <= v <= 3600),
     )
 
 

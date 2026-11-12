@@ -71,3 +71,12 @@ def test_resample_48k():
     up = np.repeat(x, 3)  # crude 48 kHz signal
     y = resample(up, 48000, SR)
     assert abs(y.size - SR) <= 1
+
+
+def test_silence_stop_setting():
+    assert config.parse("").silence_stop_seconds == 60
+    assert config.parse("[audio]\nsilence_stop_seconds = 0").silence_stop_seconds == 0
+    assert config.parse("[audio]\nsilence_stop_seconds = 300").silence_stop_seconds == 300
+    for bad in ("2", "-1", "5000", "1.5", '"60"'):
+        with pytest.raises(config.ConfigError):
+            config.parse(f"[audio]\nsilence_stop_seconds = {bad}")
