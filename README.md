@@ -181,6 +181,27 @@ press_enter = true
   was identical to phrase-at-a-time typing, with no corrections needed.
 - **Audio clean-up** before recognition: DC offset removed, silence trimmed, quiet speech raised (max 8×),
   and padding at the end so the last word isn't cut.
+- **Background-noise reduction** (`[accuracy] noise_reduction`, default `"auto"`): steady noise such as a fan,
+  mains hum or air conditioning is turned down before each phrase is read (`parakeet_dictate/denoise.py`: a
+  Wiener-style filter on the spectrum, noise estimated from the phrase itself, never more than 10 dB of
+  suppression, 50 Hz hum and rumble under ~80 Hz turned down; ~16 ms per 5 s of audio on an i7-1260P).
+  `"auto"` only cleans a phrase whose background is within 20 dB of the voice, so a normal microphone in a quiet
+  room is never touched. Measured on 20 Windows-TTS sentences of developer talk mixed with synthetic noise
+  (word error rate, lower is better):
+
+  | Noise | SNR | Off | Auto |
+  |---|---|---|---|
+  | none | – | 0.8% | 0.8% |
+  | fan + hum | 20 / 10 / 5 / 0 dB | 0.8 / 2.0 / 4.8 / **100%** | 0.8 / 1.6 / 2.0 / 1.6% |
+  | keyboard clicks | 20 / 10 / 5 / 0 dB | 0.8 / 0.8 / 0.8 / 0.8% | 0.8 / 0.8 / 0.8 / 0.8% |
+  | other voices (babble) | 20 / 10 / 5 / 0 dB | 1.2 / 0.0 / 4.8 / **98%** | 1.2 / 1.6 / 3.2 / 13% |
+
+  Parakeet itself copes well with steady noise; what failed was the silence trimming, which under loud noise
+  cut off the last words (5 dB) or threw the whole phrase away as "silence" (0 dB). Cleaning first fixes that.
+  Keyboard clicks don't bother the model or the voice detector, and are left alone. Stronger settings
+  (-15/-20 dB, over-subtraction) read worse, which is why the suppression is mild. The Silero voice detector
+  ignored fan noise and clicks completely (no phrase started early, none was missed), so its audio is not
+  cleaned; nearby voices are speech to it, with or without the clean-up.
 - **Deterministic text clean-up** with no AI rewriting: fillers removed as whole words (stretched spellings
   too, but "uh-huh", "umbrella" and a lone "M" are left alone), stutters like "the the" collapsed, then your exact
   replacements and the dictionary applied. The filler sounds follow the dictation language (Orca's lists for

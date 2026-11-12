@@ -77,6 +77,10 @@ language = "auto"
 hotwords = ["Keycloak", "Inkfree", "Mailzzy", "SoftSages", "CodeCommit"]
 # Clean the recording before transcribing: remove DC offset, trim silence, raise quiet speech.
 normalize_audio = true
+# Turn down steady background noise (a fan, mains hum, air conditioning) before transcribing.
+# "auto" = only for phrases where the noise is loud next to your voice, so clean recordings are untouched;
+# "on" = every phrase; "off" = never. Clicks (keyboard) and other people talking are not removed.
+noise_reduction = "auto"
 
 [cleanup]
 # Remove the thinking sounds of the dictation language (from Orca): English "um", "uh", "er", "hmm";
