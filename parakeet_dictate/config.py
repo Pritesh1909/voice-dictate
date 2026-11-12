@@ -14,6 +14,10 @@ from .commands import ACTIONS, normalize_phrase
 DEFAULT_FILE = Path(__file__).with_name("config.default.toml")
 
 
+# Where the indicator sits: centred at the top or bottom, or in a corner.
+POSITIONS = ("top", "bottom", "top-left", "top-right", "bottom-left", "bottom-right")
+
+
 class ConfigError(Exception):
     pass
 
@@ -113,6 +117,8 @@ class Config:
     overlay: bool
     overlay_position: str
     overlay_margin: int     # pixels from the screen edge; -1 = default
+    overlay_style: str      # "pill" (long, with live words) or "button" (round mic button)
+    overlay_always: bool    # button style: stay on screen when idle (click to start dictating)
     input_device: str
     silence_stop_seconds: int  # 0 = off
     commands_enabled: bool
@@ -214,8 +220,11 @@ def parse(text: str, defaults_text: str | None = None) -> Config:
         max_seconds=_get(d, "output", "max_seconds", int, lambda v: 5 <= v <= 1800),
         log_transcripts=_get(d, "output", "log_transcripts", bool),
         overlay=_get(d, "overlay", "enabled", bool),
-        overlay_position=_get(d, "overlay", "position", str, lambda v: v in ("top", "bottom")),
+        overlay_position=_get(d, "overlay", "position", str, lambda v: v in POSITIONS),
         overlay_margin=_get(d, "overlay", "margin", int, lambda v: -1 <= v <= 600),
+        overlay_style=_get(d, "overlay", "style", str, lambda v: v in ("pill", "button")),
+        overlay_always=_get(d, "overlay", "button_visible", str, lambda v: v in ("always", "dictating"))
+        == "always",
         input_device=_get(d, "audio", "input_device", str),
         silence_stop_seconds=_get(d, "audio", "silence_stop_seconds", int, lambda v: v == 0 or 5 <= v <= 3600),
         commands_enabled=_get(d, "commands", "enabled", bool),

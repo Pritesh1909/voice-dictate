@@ -164,10 +164,17 @@ log_transcripts = false
 # Tray menu → "Move the pill…" lets you drag it anywhere, on any monitor; it then stays there (and on that
 # monitor) and position / margin below are only used again after tray menu → "Reset pill position".
 enabled = true
-# "bottom" or "top" of the screen.
+# What it looks like: "pill" (long: Listening, level, the words as you speak, timer, stop button) or
+# "button" (a small round mic button: click it to start and stop dictating).
+style = "pill"
+# Button style only: "always" = the button stays on screen, ready to click; "dictating" = it only shows
+# while you dictate, like the pill.
+button_visible = "always"
+# Where it sits: "bottom" or "top" (centred), or a corner: "top-left", "top-right", "bottom-left",
+# "bottom-right". Dragging it with "Move" overrides this until you reset it.
 position = "bottom"
-# How far from that edge of the screen, in pixels (at 100% display scaling). -1 = 24 at the top, 56 at
-# the bottom. At the top, 60-80 puts it just below most window title bars and tab strips.
+# How far from the edge(s) of the screen, in pixels (at 100% display scaling). -1 = the default (24 at
+# the top, 56 at the bottom). At the top, 60-80 puts it just below most window title bars and tab strips.
 margin = -1
 
 [audio]

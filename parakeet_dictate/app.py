@@ -332,11 +332,31 @@ class App:
 
     @property
     def _pill_file(self):
-        return self.paths.data_dir / "pill_position.json"
+        """Where the indicator was dragged to: one file per style, as the pill and the button differ in size."""
+        style = getattr(getattr(self, "cfg", None), "overlay_style", "pill")
+        return self.paths.data_dir / ("button_position.json" if style == "button" else "pill_position.json")
 
     def _new_overlay(self, c: cfgmod.Config) -> Overlay:
-        return Overlay(c.overlay_position, wide=c.stream_while_speaking, pos_file=self._pill_file,
-                       on_stop=self.stop_from_pill)
+        o = Overlay(c.overlay_position, wide=c.stream_while_speaking, pos_file=self._pill_file,
+                    on_stop=self.stop_from_pill, style=c.overlay_style, always_visible=c.overlay_always,
+                    on_click=self.click_from_button)
+        o.margin = c.overlay_margin
+        o.shape = self._overlay_shape(c)
+        return o
+
+    @staticmethod
+    def _overlay_shape(c: cfgmod.Config) -> tuple:
+        """What can only change by making a new indicator window."""
+        return (c.overlay_style, c.overlay_always, c.stream_while_speaking)
+
+    def click_from_button(self) -> None:
+        """The round button was clicked: start dictating when idle, stop when recording (like the hotkey).
+        The button never takes focus, so the dictation goes to the window the user is typing in."""
+        if self.state == "recording":
+            self.stop_from_pill()
+        elif self.state == "idle":
+            log.info("started from the button")
+            self._on_hotkey()
 
     def stop_from_pill(self) -> None:
         """The pill's stop button: end the recording exactly like pressing the hotkey again."""
@@ -635,7 +655,8 @@ class App:
             self.history.configure(c.history_keep, c.history_max_items)
         if c.overlay and self.overlay is None:
             self.overlay = self._new_overlay(c)
-        elif self.overlay is not None and (not c.overlay or self.overlay.wide != c.stream_while_speaking):
+        elif self.overlay is not None and (not c.overlay
+                                           or getattr(self.overlay, "shape", None) != self._overlay_shape(c)):
             if self.state == "moving":     # the pill being moved goes away: move mode ends with it
                 self.state = "idle"
             self.overlay.close()

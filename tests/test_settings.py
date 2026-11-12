@@ -426,7 +426,9 @@ def test_pages_are_grouped(window):
     from parakeet_dictate import settings_ui
     assert [name for name, _ in settings_ui.PAGES] == ["General", "Shortcuts", "Improvements", "Extras"]
     general = dict(settings_ui.PAGES)["General"]
-    assert [g for g, _ in general] == ["Start-up", "Microphone", "Speech model", "Typing", "Pill"]
+    assert [g for g, _ in general] == ["Start-up", "Microphone", "Speech model", "Typing", "On-screen indicator"]
+    assert window.field(("overlay", "style")).control.get() == "pill"
+    assert window.field(("overlay", "button_visible")).control.get() == "always"
 
 
 def test_optional_shortcut_recorder(window):
