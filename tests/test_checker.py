@@ -208,7 +208,7 @@ def test_real_engine_teacher_crash_on_the_card_writes_no_marker(env, monkeypatch
 def test_claude_unavailable_uses_known_terms(env):
     env["add"]("Send the MailT campaign now.")
     env["add"]("Open MailT settings please.")
-    ask = Judge(error=judge.JudgeUnavailable("The `claude` command isn't on PATH"))
+    ask = Judge(error=judge.JudgeUnavailable("The `claude` command isn't on PATH", ran=False))
     checker = env["make"](whisper=["Send the Mailzzy campaign now.", "Open Mailzzy settings please."],
                           terms=["Mailzzy"], ask=ask)
     assert not checker.run(never_stop).startswith("error")
@@ -413,6 +413,25 @@ def test_claude_that_ran_and_failed_is_counted(env):
     ask = Judge(error=judge.JudgeUnavailable("Claude exited with code 1: Not logged in", ran=True))
     env["make"](whisper="Send the Mailzzy campaign now.", terms=["Mailzzy"], ask=ask).run(never_stop)
     assert env["store"].claude_calls_today(TODAY) == 1
+
+
+@pytest.mark.parametrize("message", ["Claude exited with code 1: usage limit reached",
+                                     "Claude didn't answer within 120 seconds"])
+def test_claude_that_ran_and_failed_leaves_the_pairs_for_later(env, monkeypatch, message):
+    """Usage limit, offline, a time-out: like the daily cap, the pairs wait for Claude (until tomorrow or an
+    app restart) instead of being settled by known terms and marked checked."""
+    monkeypatch.setattr(judge, "BATCH_SIZE", 1)
+    a = env["add"]("Send the MailT campaign now.")
+    b = env["add"]("Open MailT settings please.")
+    ask = Judge(error=judge.JudgeUnavailable(message, ran=True))
+    checker = env["make"](whisper=["Send the Mailzzy campaign now.", "Open Mailzzy settings please."],
+                          terms=["Mailzzy"], ask=ask)
+    checker.run(never_stop)
+    assert len(ask.calls) == 1 and env["store"].claude_calls_today(TODAY) == 1   # not tried again in this run
+    assert env["rows"]() == [] and {a, b}.isdisjoint(env["store"].checked_ids())
+    assert env["store"].pending_count() == 0 and env["store"].active() == []    # known terms not used
+    assert checker.run(never_stop) == "nothing to check"                        # same day: not heard again
+    assert len(ask.calls) == 1 and len(env["engines"]) == 1
 
 
 def test_each_run_first_resyncs_learned_auto_toml(env, monkeypatch):

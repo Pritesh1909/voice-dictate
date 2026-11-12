@@ -5,8 +5,10 @@ typed, the pair goes to the locally installed Claude Code (`claude -p`, on the u
 API key). Only text is sent: the two transcripts and the user's own terms, never audio. Claude returns
 the correct text per pair, or null when it can't tell.
 
-Without Claude (not installed, not logged in, offline, over the daily limit) `known_term_fixes` still
-accepts a disagreement when it is a fix to a term the user already has in their dictionary.
+Without Claude (turned off, or not installed: JudgeUnavailable with ran=False) `known_term_fixes` still
+accepts a disagreement when it is a fix to a term the user already has in their dictionary. When Claude
+ran but failed (not logged in, a usage limit, offline, a time-out) the checker leaves the pairs for a
+later run instead, as it does when the day's calls are used up.
 """
 from __future__ import annotations
 
@@ -62,10 +64,11 @@ USER_PROMPT = "Judge the pairs in the JSON on stdin."
 
 
 class JudgeUnavailable(Exception):
-    """Claude could not be asked or did not give a usable answer; the caller falls back to known terms.
+    """Claude could not be asked or did not give a usable answer.
 
     `ran` is False when `claude` never started (not on PATH, could not be launched): no call was made,
-    so it doesn't count toward [learning] claude_calls_per_day."""
+    so it doesn't count toward [learning] claude_calls_per_day, and the caller falls back to known terms.
+    With `ran` True the call counts, and the caller leaves the pairs for a later run."""
 
     def __init__(self, message: str, ran: bool = True):
         super().__init__(message)

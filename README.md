@@ -162,10 +162,11 @@ the next dictation on. It is on by default, never shows a pop-up and never gets 
   that can go out is **text**: when two transcripts disagree, both are sent to Claude (`claude -p`, the Claude
   Code you are already signed in to, no API key) to say which one is right. That is a few cents a day at most:
   one call settles up to 30 dictations, and there are at most **20 calls a day** (`claude_calls_per_day`).
-  If Claude isn't installed or isn't signed in (or *Ask Claude* is off), only fixes to names you already have
-  (your dictionary, your learned words and names from your notes) are learned, and the other disagreements
-  from that run are not looked at again. If the day's calls are used up, the dictations still waiting for
-  Claude are left for the next day.
+  If Claude isn't installed (or *Ask Claude* is off), only fixes to names you already have (your dictionary,
+  your learned words and names from your notes) are learned, and the other disagreements from that run are
+  not looked at again. If Claude runs but can't answer (not signed in, a usage limit, offline, too slow), or
+  the day's calls are used up, the dictations still waiting for Claude are left for later: the next day, or
+  the next time the app starts.
 - **When it runs.** Only when all of these are true: learning is on and Whisper is ready; no dictation is going
   on; there has been no keyboard or mouse input for **3 minutes** (`idle_minutes`); the PC is on mains power
   (not on battery); and the PC has a discrete graphics card (Whisper runs on it, never on the CPU, so

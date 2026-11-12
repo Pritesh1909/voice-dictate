@@ -3,14 +3,15 @@
 Whisper Large v3 Turbo (the "teacher", in its own engine process on the graphics card) listens to each
 recording again. Where its words and Parakeet's agree, the recording is done. Where they disagree a
 little, the pair is judged: by Claude (text only, a batch of pairs per `claude -p` call, at most
-[learning] claude_calls_per_day calls a day), or without Claude only for fixes to terms the user already
-has. The fixes in a judged text are counted by autolearn.Store, which activates one after two different
-recordings showed it. Where the two texts have little in common (Whisper making up words on noise, "I'm
-sorry. I'm sorry."), nothing is learned.
+[learning] claude_calls_per_day calls a day), or without Claude (turned off, or not installed) only for
+fixes to terms the user already has. The fixes in a judged text are counted by autolearn.Store, which
+activates one after two different recordings showed it. Where the two texts have little in common
+(Whisper making up words on noise, "I'm sorry. I'm sorry."), nothing is learned.
 
 Every checked recording gets a row in checked.jsonl, so it is never checked again. Two kinds are left
 for a later run instead: recordings not reached before should_stop() (the user came back), and pairs
-waiting for Claude when today's calls are used up (not transcribed again until tomorrow or an app restart).
+waiting for Claude when today's calls are used up or a call failed after Claude ran (usage limit,
+offline, a time-out); those are not transcribed again until tomorrow or an app restart.
 
 The teacher never writes gpu-failed.json: a Whisper crash must not move dictation to the CPU. It ends the
 run with an "error:" result, which pauses learning until the app restarts.
@@ -209,13 +210,19 @@ class Checker:
                     self._waiting_for_claude.update(p.rec.id for p in queue[start:])
                     return
                 pairs = [judge.Pair(start + i, p.parakeet, p.whisper) for i, p in enumerate(batch)]
-                ran = True
                 try:
                     answers = self._ask(pairs, terms)
                 except judge.JudgeUnavailable as e:
+                    if e.ran:   # usage limit, offline, a time-out: Claude may answer later, like after the cap
+                        log.warning("background check: Claude failed; %d left for a later run: %s",
+                                    len(queue) - start, e)
+                        self._store.count_claude_call(today)
+                        self._waiting_for_claude.update(p.rec.id for p in queue[start:])
+                        return
+                    # Never started (not installed): it uses up nothing, and known terms are all there is.
                     log.warning("background check: Claude unavailable, learning only fixes to known terms: %s", e)
-                    use_claude, ran = False, e.ran
-                if ran:   # a call that never started (claude not installed) uses up nothing
+                    use_claude = False
+                else:
                     self._store.count_claude_call(today)
             for i, p in enumerate(batch):
                 if answers is None:
