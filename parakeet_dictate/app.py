@@ -7,7 +7,7 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import numpy as np
 import pystray
@@ -290,7 +290,7 @@ class Session:
 
 class App:
     history: "hist.History | None" = None   # recent dictations ([history]); set in __init__
-    _pruned_at: datetime | None = None      # when old recordings were last cleared out (None: not this run)
+    PRUNE_EVERY_SECONDS = 24 * 3600         # how often old kept recordings are cleared out (tests shorten it)
 
     def __init__(self, paths: cfgmod.Paths):
         self.paths = paths
@@ -325,6 +325,7 @@ class App:
         self.last_stats = ""
         self.failed: FailedRecording | None = None   # the last dictation that couldn't be transcribed
         self._lock = threading.Lock()
+        self._quitting = threading.Event()   # set when the user quits: ends the daily clear-out of recordings
         self._session = 0
         self.current: Session | None = None
         self._adding_model = False   # the "Add a model file…" dialog is open
@@ -1103,23 +1104,30 @@ class App:
             log.exception("could not save the recording")
 
     def _write_recording(self, audio: np.ndarray, rate: int, rec: recordings.Record) -> None:
-        """Thread body: write the 16 kHz recording and its record, then clear out old ones if that is due."""
+        """Thread body: write the 16 kHz recording and its record."""
         try:
             recordings.save(self.paths.recordings_dir, resample(audio, rate), rec)
         except Exception:
             log.exception("could not save the recording")
-        if self._pruned_at is None or datetime.now() - self._pruned_at > timedelta(hours=24):
-            self._prune_recordings()
 
     def _start_prune(self) -> None:
-        threading.Thread(target=self._prune_recordings, daemon=True, name="prune-recordings").start()
+        """Clear out old recordings now, then every PRUNE_EVERY_SECONDS, in a daemon thread until the app quits.
+        It does not depend on saving: with keeping (or learning) turned off, recordings kept earlier still age
+        out, and an app left running for days still clears out as they age."""
+        threading.Thread(target=self._prune_loop, daemon=True, name="prune-recordings").start()
+
+    def _prune_loop(self) -> None:
+        while True:
+            self._prune_recordings()
+            if self._quitting.wait(self.PRUNE_EVERY_SECONDS):
+                return
 
     def _prune_recordings(self) -> None:
         """Delete recordings older than [learning] keep_days, then the oldest beyond max_recordings_mb.
-        Runs at start-up and, from the next save, once a day. Never raises."""
-        self._pruned_at = now = datetime.now()   # set first: a failing prune is not retried at every save
+        Never raises."""
         try:
-            deleted = recordings.prune(self.paths.recordings_dir, self.cfg.keep_days, self.cfg.max_recordings_mb, now)
+            deleted = recordings.prune(self.paths.recordings_dir, self.cfg.keep_days, self.cfg.max_recordings_mb,
+                                       datetime.now())
             if deleted:
                 log.info("cleared out %d old recording(s)", deleted)
         except Exception:
@@ -1343,6 +1351,7 @@ class App:
         I, S = pystray.MenuItem, pystray.Menu.SEPARATOR
 
         def quit_app(icon, item):
+            self._quitting.set()
             self.engine.unload()
             self.hotkeys.stop()
             if self.overlay:
@@ -1392,7 +1401,7 @@ class App:
             else:
                 self._note(f"Ready. Press {self.cfg.hotkey} to dictate.")   # no pop-up at every start
             self.context.refresh()   # first look at the [context] folders, in the background
-            self._start_prune()      # old kept recordings, in the background
+            self._start_prune()      # old kept recordings: now and then every day, in the background
             winutil.trim_working_set()
 
         self.icon.run(setup=setup)
