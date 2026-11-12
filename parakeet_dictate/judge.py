@@ -20,6 +20,8 @@ from . import learn
 
 BATCH_SIZE = 30         # pairs per `claude -p` call
 TIMEOUT_SECONDS = 120
+MODEL = "sonnet"
+EFFORT = "low"
 MAX_TERM_CHARS = 600    # how much of the user's term list goes into one call
 
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -119,7 +121,9 @@ def _ask_batch(batch: list[Pair], terms: str, run, claude: str) -> dict[int, str
         "--output-format", "json",
         "--json-schema", json.dumps(SCHEMA, separators=(",", ":")),
         "--system-prompt", SYSTEM_PROMPT,
-        "--tools", "",                 # nothing to run: the text is all it needs
+        "--model", MODEL,              # not the user's default, which may cost more per call
+        "--effort", EFFORT,
+        "--tools", "",               # nothing to run: the text is all it needs
         "--strict-mcp-config",         # leave connectors out: keeps each call small
         "--setting-sources", "local",  # skip user hooks; the Claude Code login still applies
         "--no-session-persistence",    # these calls don't clutter the session list

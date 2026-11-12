@@ -59,7 +59,9 @@ def test_ask_claude_builds_safe_command():
     assert args[args.index("--output-format") + 1] == "json"
     assert args[args.index("--setting-sources") + 1] == "local"
     assert args[args.index("--system-prompt") + 1].strip()
-    assert "--model" not in args and "--effort" not in args
+    # Pinned, so a judging call doesn't run on the user's default (possibly more expensive) model.
+    assert args[args.index("--model") + 1] == "sonnet"
+    assert args[args.index("--effort") + 1] == "low"
     assert json.loads(args[args.index("--json-schema") + 1]) == judge.SCHEMA
     assert kwargs["timeout"] == 120
     # An empty folder of its own, so no project CLAUDE.md or settings are picked up; gone again afterwards.
