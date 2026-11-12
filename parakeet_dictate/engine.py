@@ -42,6 +42,7 @@ class EngineSpec:
     vad: str = ""                       # path of the voice-activity detector .gguf ("" = none)
     language: str = "auto"              # [model] language: "auto" or an ISO-639-1 code
     gpu_marker: str = ""                # path of gpu-failed.json ("" = don't remember GPU crashes)
+    prompt: str = ""                    # initial prompt (Whisper: the user's terms); "" = none (Parakeet takes none)
 
     @classmethod
     def for_model(cls, m, threads: int, **kw) -> "EngineSpec":
@@ -186,7 +187,8 @@ def _worker(conn, spec: EngineSpec) -> None:  # runs in the child process
         if msg[0] == "decode":
             t = time.perf_counter()
             try:
-                r = session.run(msg[1], vocabulary=vocab, language=language)
+                extra = {"prompt": spec.prompt} if spec.prompt else {}
+                r = session.run(msg[1], vocabulary=vocab, language=language, **extra)
                 conn.send(("text", r.text, time.perf_counter() - t))
             except Exception as e:
                 conn.send(("error", f"{type(e).__name__}: {e}"))
@@ -194,6 +196,9 @@ def _worker(conn, spec: EngineSpec) -> None:  # runs in the child process
 
 class EngineError(Exception):
     pass
+
+
+STOPPED = "speech engine stopped"   # the error after kill()
 
 
 class Engine:
@@ -216,6 +221,7 @@ class Engine:
         self._loading: tuple[str, str] | None = None   # what the engine process is loading on right now
         self._why_cpu = ""          # why "auto" runs on the CPU this time (a recorded GPU crash)
         self._unsaved_crash: dict | None = None        # a GPU crash that could not be written to the marker
+        self._closed = False        # kill() was called: never load again
 
     @property
     def state(self) -> str:
@@ -236,6 +242,8 @@ class Engine:
         with self._lock:
             self._cancel_timer()
             self._release_token += 1  # a new dictation: any pending "free memory" no longer applies
+            if self._closed:
+                raise EngineError(STOPPED)
             if self._spec is None:
                 raise EngineError("no speech model selected yet")
             if self._proc is not None and self._proc.is_alive():
@@ -255,6 +263,8 @@ class Engine:
         parent, child = ctx.Pipe()
         self._proc = ctx.Process(target=_worker, args=(child, spec), daemon=True, name="parakeet-engine")
         self._proc.start()
+        if self._closed:            # kill() came while this was starting and saw no process yet
+            self._proc.terminate()
         child.close()
         self._conn = parent
         self._ready.clear()
@@ -277,7 +287,9 @@ class Engine:
         with self._lock:
             if gen != self._gen or self._conn is not conn:
                 return  # unloaded or restarted meanwhile: an ordinary unload, never a crash
-            if msg[0] == "ready":
+            if self._closed:
+                self._error = STOPPED   # killed on purpose: not a crash, nothing to retry
+            elif msg[0] == "ready":
                 self.load_seconds, note, self.vad_frame, self.device, lang_note = msg[1:6]
                 self.note = f"{note}; {self._why_cpu}" if self._why_cpu else note
                 log.info("model loaded in %.1fs %s", self.load_seconds, self.note)
@@ -320,6 +332,8 @@ class Engine:
             self.unload()
             raise EngineError("The speech model took longer than a minute to load.")
         with self._lock:
+            if self._closed:
+                raise EngineError(STOPPED)
             if self._error:
                 err = self._error
                 self.unload()
@@ -335,6 +349,8 @@ class Engine:
                     raise EngineError("Transcription took longer than a minute.")
                 msg = conn.recv()
             except (EOFError, OSError) as e:
+                if self._closed:
+                    raise EngineError(STOPPED) from None   # killed on purpose: not a GPU crash
                 on_gpu = self._gpu_crashed(self.device, "decoding")
                 self.unload()
                 if not (on_gpu and _retry and self._spec is not None and self._spec.device == "auto"):
@@ -347,9 +363,30 @@ class Engine:
             raise EngineError(msg[1])
         return msg[1], msg[2]
 
+    @property
+    def device_type(self) -> str | None:
+        """"gpu", "igpu" or "cpu": the kind of device the model loaded on, once wait_ready() is True."""
+        return self.device[0] if self.device else None
+
     def wait_ready(self, timeout: float = LOAD_TIMEOUT) -> bool:
         """Wait for the model (started by warm()). False if it failed, timed out or was unloaded."""
-        return self._ready.wait(timeout) and not self._error and self._proc is not None
+        return self._ready.wait(timeout) and not self._error and self._proc is not None and not self._closed
+
+    def kill(self) -> None:
+        """End the engine process now, from any thread, without waiting for a load or decode in progress
+        (it takes no lock, so it never waits for transcribe()). A transcribe() or wait_ready() waiting on
+        it returns at once (EngineError / False), and the engine stays closed: warm() and transcribe()
+        raise EngineError from then on instead of loading the model again. Never recorded as a GPU crash.
+        Safe to call more than once; unload() still tidies up afterwards. Used for the Whisper teacher,
+        which the hotkey must get off the graphics card before dictation starts."""
+        self._closed = True
+        proc = self._proc
+        if proc is not None:
+            try:
+                proc.terminate()   # the pipe breaks, which wakes a transcribe() waiting for its reply
+            except (OSError, ValueError, AttributeError):
+                pass               # already ended or closed
+        self._ready.set()          # wakes a wait for the model to load
 
     def vad(self, samples, new_stream: bool = False, flush: bool = False) -> list[float] | None:
         """Speech probabilities (one per vad_frame samples of 16 kHz audio) for the frames this audio
