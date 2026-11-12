@@ -240,6 +240,29 @@ keep = "session"
 # Keep at most this many dictations, the oldest dropped first (10..5000).
 max_items = 200
 
+[learning]
+# Learn your words in the background. While the PC is otherwise idle, the app listens to your kept
+# recordings again with a larger model (Whisper, downloaded once, used only for this) and compares what
+# it heard with what was typed. A fix seen in two different recordings is used from then on, and is
+# listed in Settings, where you can undo it. Your config.toml and learned.toml are never changed:
+# the fixes go to learned_auto.toml next to them, and your own entries win over them.
+enabled = true
+# Keep each dictation's audio in %LOCALAPPDATA%\ParakeetDictate\recordings\ (16 kHz mono WAV plus a small
+# .json record). Learning needs them: with false no audio is kept.
+keep_recordings = true
+# Delete kept recordings after this many days (1..365).
+keep_days = 14
+# Keep at most this many MB of recordings, the oldest deleted first (100..20000).
+max_recordings_mb = 1500
+# The checker starts only after this many minutes without keyboard or mouse input (1..120), only while
+# the PC is on mains power, and stops the moment you press the dictation shortcut.
+idle_minutes = 3
+# Ask Claude (the Claude Code you are signed in to) to confirm a fix. Only text is sent, never audio.
+# With false, fixes are still found, using only the two-recordings rule.
+use_claude = true
+# Ask Claude at most this many times a day (0..200). 0 = never.
+claude_calls_per_day = 20
+
 # Settings for one program, by its .exe name (capitals don't matter). Each may change any of:
 #   method, add_trailing_space, type_while_speaking, press_enter (see [output]) and commands (true/false).
 # Settings you leave out follow [output] and [commands]. To find a program's name: Task Manager ->
