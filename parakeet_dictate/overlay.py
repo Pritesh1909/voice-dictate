@@ -262,6 +262,16 @@ def listening_layout(label_w: float, wide: bool) -> Layout:
     return Layout(width, dot_cx, label_x, bars_x, mark_cx, mark_cx + 0.5 + GAP, stop_cx - STOP_D / 2 - GAP, stop_cx)
 
 
+def stop_hit(x: float, y: float, win_left: float, win_top: float, pad: tuple, stop_cx: float,
+             pill_h: float, s: float, slack: float = 2) -> bool:
+    """Is screen point (x, y) on the stop button? The window starts at (win_left, win_top); the pill
+    sits `pad` px inside it (room for the shadow); stop_cx is the button's centre in px at 100 %."""
+    cx = win_left + pad[0] + stop_cx * s
+    cy = win_top + pad[1] + pill_h / 2
+    r = (STOP_D / 2 + slack) * s
+    return (x - cx) ** 2 + (y - cy) ** 2 <= r * r
+
+
 def compact_width(text_x: float, text_w: float, max_w: float) -> float:
     """Width of a short pill (Transcribing / Typed / errors): its text plus the right padding, at most
     the full pill's width."""
@@ -445,9 +455,9 @@ class Painter:
         hole.paste(ImageChops.invert(mask), (x0, y0))
         shadow.putalpha(ImageChops.multiply(shadow.getchannel("A"), hole))
         shadow.alpha_composite(body, (x0, y0))
-        if stop:
+        if stop:        # True, or "hover" while the mouse is on it (a lighter circle)
             cx, cy = x0 + self.layout.stop_cx * s, y0 + h / 2
-            self._paste(shadow, self._circle(STOP_D * s, "#ffffff", .08), cx, cy)
+            self._paste(shadow, self._circle(STOP_D * s, "#ffffff", .18 if stop == "hover" else .08), cx, cy)
             m = STOP_MARK * s
             sq = self._shape(("stop", m), m, m, lambda dr, k, W, H: dr.rounded_rectangle(
                 (0, 0, m * k - 1, m * k - 1), radius=3 * s * k, fill=_rgb(FG) + (255,)))
@@ -460,9 +470,10 @@ class Painter:
 
     # --- frames ---
 
-    def listening(self, t: float, level: float, clipping: bool, writing: bool, preview: str, secs: float):
+    def listening(self, t: float, level: float, clipping: bool, writing: bool, preview: str, secs: float,
+                  hover: bool = False):
         s, L, cy = self.s, self.layout, self.cy
-        frame = self._start(self.w, True)
+        frame = self._start(self.w, "hover" if hover else True)
         x0 = self._left(self.w)
         X = lambda v: x0 + v * s                                            # noqa: E731
         label, label_col, bar_col, v = listening_look(level, clipping)
@@ -638,13 +649,21 @@ class _Surface:
 
 
 class Overlay:
+    on_stop = None              # the stop button's callback (see __init__)
+    _clickable = False          # the mouse is over the stop button, so the pill takes clicks
     _pad = (0, 0, 0, 0)         # shadow room around the pill in the window: left, top, right, bottom
     _surface: _Surface | None = None
     _painter: Painter | None = None
     _alpha = 0
     _shown_shell = None         # the Painter shell the window's picture was last fully drawn with
 
-    def __init__(self, position: str = "bottom", wide: bool = False, pos_file: Path | None = None):
+    def __init__(self, position: str = "bottom", wide: bool = False, pos_file: Path | None = None,
+                 on_stop=None):
+        # on_stop(): the stop button was clicked while listening (called in a thread of its own).
+        # The pill is click-through everywhere except over the stop button, and only while the mouse
+        # is on it (checked every frame); it never takes focus, so the text cursor stays where it was.
+        self.on_stop = on_stop
+        self._clickable = False
         self.position = position
         self.wide = wide            # live streaming: room for the words heard but not typed yet
         self.margin = -1            # pixels from the screen edge (at 100% scaling); -1 = 24 at the top, 56 at the bottom
@@ -812,6 +831,8 @@ class Overlay:
             self._hide_job = None
         if self._mode == "hidden":
             self._place()
+        if mode != "listening":
+            self._set_clickable(False)       # click-through everywhere again once listening ends
         self._mode = mode
         self._kw = kw
         if mode == "listening":
@@ -827,6 +848,7 @@ class Overlay:
     def _hide(self, force: bool = False) -> None:
         if self._mode == "move" and not force:
             return
+        self._set_clickable(False)
         self._mode = "hidden"
         self._hide_job = None
         if self._anim_job:
@@ -852,6 +874,7 @@ class Overlay:
         self._prev_fg = user32.GetForegroundWindow()
         if self._mode == "hidden":
             self._place()
+        self._set_clickable(False)
         self._mode = "move"
         self._on_move_end = on_end
         self._grab = None
@@ -898,7 +921,40 @@ class Overlay:
         self._saved, self._saved_loaded = pos, True
         return True
 
+    # --- the stop button (Tk thread) ---------------------------------------------------------------
+
+    def _over_stop(self) -> bool:
+        if self._mode != "listening" or self.on_stop is None:
+            return False
+        try:
+            cx, cy = pillpos.cursor_pos()
+            left, top, _, _ = pillpos.window_rect(self.hwnd)
+        except Exception:
+            return False
+        return stop_hit(cx, cy, left, top, self._pad, self._painter.layout.stop_cx, self.h, self.s)
+
+    def _set_clickable(self, on: bool) -> None:
+        """Take the mouse (never the focus) only while it is over the stop button."""
+        if on == self._clickable:
+            return
+        self._clickable = on
+        self._set_styles(self._ex & ~WS_EX_TRANSPARENT if on else self._ex)
+        try:
+            self.canvas.configure(cursor="hand2" if on else "")
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _stop_clicked(self) -> None:
+        self._set_clickable(False)
+        on_stop = self.on_stop
+        if on_stop is not None:
+            threading.Thread(target=on_stop, daemon=True, name="pill-stop").start()
+
     def _on_press(self, _event=None) -> None:
+        if self._mode == "listening":
+            if self._clickable and self._over_stop():
+                self._stop_clicked()
+            return
         if self._mode != "move":
             return
         cx, cy = pillpos.cursor_pos()
@@ -924,6 +980,7 @@ class Overlay:
             self._anim_job = None
             return
         self._tick += 1
+        self._set_clickable(self._over_stop())
         self._draw()
         self._anim_job = self._root.after(70, self._animate)
 
@@ -947,7 +1004,7 @@ class Overlay:
                     preview = str(self._preview_fn() or "")
                 except Exception:
                     preview = ""
-            return p.listening(now, level, clipping, writing, preview, now - self._started)
+            return p.listening(now, level, clipping, writing, preview, now - self._started, self._clickable)
         if self._mode == "working":
             return p.working(now, kw.get("text", "Transcribing…"))
         if self._mode == "flash":

@@ -329,7 +329,15 @@ class App:
         return self.paths.data_dir / "pill_position.json"
 
     def _new_overlay(self, c: cfgmod.Config) -> Overlay:
-        return Overlay(c.overlay_position, wide=c.stream_while_speaking, pos_file=self._pill_file)
+        return Overlay(c.overlay_position, wide=c.stream_while_speaking, pos_file=self._pill_file,
+                       on_stop=self.stop_from_pill)
+
+    def stop_from_pill(self) -> None:
+        """The pill's stop button: end the recording exactly like pressing the hotkey again."""
+        with self._lock:
+            if self.state == "recording":
+                log.info("stopped from the pill")
+                self._finish_locked()
 
     # --- model ------------------------------------------------------------------------------------
 
