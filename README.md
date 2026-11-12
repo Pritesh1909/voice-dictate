@@ -68,7 +68,7 @@ following Windows) with four pages, each made of titled groups:
 |---|---|
 | **General** | Start-up (start with Windows, sounds) · Microphone · Speech model (model, your model files and folders, runs on, language, *Find models*) · Typing · Pill (show, edge, distance, *Move the pill…*, *Reset*) |
 | **Shortcuts** | Dictate · Copy last dictation · Correct last dictation · hold time · Esc cancels |
-| **Improvements** | Dictionary (names and terms, "heard as", learned words) · Clean-up (fillers, repeated words) · Context words · Recognition (voice detector, audio clean-up, preferred words) |
+| **Improvements** | Dictionary (names and terms, "heard as", learned words) · Clean-up (fillers, repeated words, numbers, ticket prefixes) · Context words · Recognition (voice detector, audio clean-up, preferred words) |
 | **Extras** | Performance (memory, threads, pauses, longest dictation, *Free now*) · Spoken commands · Details · Privacy and files (*Open log*, *Open settings file*) |
 
 - **Change…** next to a shortcut listens for the next key combination: Ctrl/Alt/Shift/Win plus one key
@@ -186,6 +186,25 @@ press_enter = true
   replacements and the dictionary applied. The filler sounds follow the dictation language (Orca's lists for
   English, German, Spanish, French, Italian, Portuguese, Dutch, Russian, Japanese, Korean and Chinese); your
   `[cleanup] fillers` are removed on top.
+- **Numbers as digits** (`[cleanup] numbers`, English only). Measured with Windows text-to-speech through
+  Parakeet v2: it already writes most numbers as digits ("25%", "version 2.5", "port 6040", "512MB", "SEC-12"
+  from "SEC dash twelve"), but leaves some as words or writes them oddly. Only those clearly numeric cases
+  are changed:
+
+  | Said | Parakeet v2 wrote | Typed |
+  |---|---|---|
+  | three replicas / two instances | three replicas / two instances | 3 replicas / 2 instances |
+  | five minutes / three hours | five minutes / three hours | 5 minutes / 3 hours |
+  | Java twenty one | Java Twenty-One | Java 21 |
+  | at ten thirty / at three fifteen PM | at 10.30 / at 3.15 p.m. | at 10:30 / at 3:15 p.m. |
+  | minus five / negative ten | minus 5 / negative 10 | -5 / -10 |
+  | SEC twelve / NET zero three | SEC12 / Net 03 | SEC-12 / NET-03 (`[cleanup] id_prefixes`) |
+  | D one eight four | D one eight four | D-184 |
+
+  The same rules cover the words when the model leaves them ("port six oh three zero", "two point five",
+  "twenty five percent"). Prose stays: "one of the", "a couple", "for the four of us", "no one", "once",
+  "one-to-one", "Two things…", "one second", "three times". While streaming, a word that may still become
+  part of a number ("twenty" before "five", "SEC" before "twelve") waits for the next word.
 - **Dictation language**: `[model] language` ("auto" or a code like "de") is passed to models that can be told
   the language, and picks the filler words.
 

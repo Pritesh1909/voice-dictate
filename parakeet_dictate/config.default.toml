@@ -94,6 +94,16 @@ fillers = ["uh", "um", "uhm", "ah", "er", "erm", "eh", "hm", "mm"]
 remove_repeated_words = true
 # Words that can legitimately repeat ("he had had enough").
 repeated_words_allowed = ["that", "had"]
+# Write spoken numbers as digits where they are clearly numbers (English): next to a unit or percent
+# ("three replicas" -> "3 replicas", "twenty five percent" -> "25%"), after a keyword ("port six zero four
+# zero" -> "port 6040", "Java twenty one" -> "Java 21", "v two" -> "v2"), said digit by digit (three or more),
+# with "point" ("two point five" -> "2.5"), "minus five" -> "-5" and times ("at ten thirty" -> "at 10:30").
+# Prose stays: "one of the", "a couple", "for the", "no one", "Two things...". The model already writes
+# most numbers as digits; this catches the ones it leaves as words.
+numbers = true
+# Ticket prefixes (letters only): "SEC twelve", "SEC12" and "Net 03" become "SEC-12" and "NET-03".
+# A prefix in lower case ("net 30 days") is left alone, and so is one followed by a unit.
+id_prefixes = ["SEC", "NET", "D"]
 
 # Exact fixes applied after transcription. Whole words only, not case sensitive.
 # Usually [dictionary] below is the better place; use this only for fixes that aren't a name or term.
