@@ -95,6 +95,7 @@ def out(monkeypatch):
 def make_app(engine, audio=None, live=False, **cfg_over):
     cfg = config.parse("")
     cfg = config.Config(**{**cfg.__dict__, "process_while_speaking": live, "type_while_speaking": live,
+                           "keep_recordings": False,    # this app has no data folder to keep them in
                            **cfg_over})
     app = App.__new__(App)          # no tray, hotkey, microphone or model process
     app.cfg, app.cleaner = cfg, Cleaner.from_config(cfg)

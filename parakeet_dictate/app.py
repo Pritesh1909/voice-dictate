@@ -7,13 +7,14 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 
 import numpy as np
 import pystray
 
 from . import APP_NAME, __version__
 from . import config as cfgmod
-from . import commands, context, correct, learn, models, output, winutil
+from . import commands, context, correct, learn, models, output, recordings, winutil
 from . import history as hist
 from .appsettings import settings_for
 from .audio import SR, Recorder, preprocess, resample, silence_stop_due, silence_stop_message
@@ -289,6 +290,7 @@ class Session:
 
 class App:
     history: "hist.History | None" = None   # recent dictations ([history]); set in __init__
+    _pruned_at: datetime | None = None      # when old recordings were last cleared out (None: not this run)
 
     def __init__(self, paths: cfgmod.Paths):
         self.paths = paths
@@ -1041,6 +1043,7 @@ class App:
                 typed = True
             if typed:
                 self._press_enter(session.out)
+            self._save_recording(session, raw, text)   # last, and off this thread: the text is already there
             if self.overlay:
                 self.overlay.flash("Typed" if typed else "Copied to clipboard", GREEN, 700)
         except Exception as e:
@@ -1074,6 +1077,53 @@ class App:
                 output.press_enter()
             except OSError as e:
                 log.warning("could not press Enter: %s", e)
+
+    # --- kept recordings: the background learner listens to these again later -----------------------------
+    # Never a pop-up: a problem here is logged, and dictation carries on.
+
+    @property
+    def _keeps_recordings(self) -> bool:
+        return self.cfg.learning_enabled and self.cfg.keep_recordings
+
+    def _save_recording(self, session: "Session", raw: str, text: str) -> None:
+        """A dictation has landed (typed, or copied to the clipboard): keep its audio and a record of it.
+        Returns at once, the writing runs in its own daemon thread; never raises."""
+        if self._keeps_recordings:
+            self._start_save(session.recording(), session.rate, raw, session.phrases(), text, self.target_exe)
+
+    def _start_save(self, audio: np.ndarray, rate: int, raw: str, phrases: list[str], text: str, exe: str) -> None:
+        """Note what is known now (the program, the model and language can change later), then write in a thread."""
+        try:
+            now = datetime.now()   # local time, like the recording id
+            rec = recordings.Record(recordings.new_id(now), now.isoformat(timespec="seconds"), exe, raw, phrases,
+                                    text, self.model.path.name if self.model else "", self.cfg.language)
+            threading.Thread(target=self._write_recording, args=(audio, rate, rec), daemon=True,
+                             name="save-recording").start()
+        except Exception:
+            log.exception("could not save the recording")
+
+    def _write_recording(self, audio: np.ndarray, rate: int, rec: recordings.Record) -> None:
+        """Thread body: write the 16 kHz recording and its record, then clear out old ones if that is due."""
+        try:
+            recordings.save(self.paths.recordings_dir, resample(audio, rate), rec)
+        except Exception:
+            log.exception("could not save the recording")
+        if self._pruned_at is None or datetime.now() - self._pruned_at > timedelta(hours=24):
+            self._prune_recordings()
+
+    def _start_prune(self) -> None:
+        threading.Thread(target=self._prune_recordings, daemon=True, name="prune-recordings").start()
+
+    def _prune_recordings(self) -> None:
+        """Delete recordings older than [learning] keep_days, then the oldest beyond max_recordings_mb.
+        Runs at start-up and, from the next save, once a day. Never raises."""
+        self._pruned_at = now = datetime.now()   # set first: a failing prune is not retried at every save
+        try:
+            deleted = recordings.prune(self.paths.recordings_dir, self.cfg.keep_days, self.cfg.max_recordings_mb, now)
+            if deleted:
+                log.info("cleared out %d old recording(s)", deleted)
+        except Exception:
+            log.exception("could not clear out old recordings")
 
     def _recognition_failed(self, e: Exception, audio: np.ndarray, rate: int, partly_typed: bool) -> None:
         """Keep the recording (replacing an older failed one) so tray → Retry can transcribe it again."""
@@ -1137,6 +1187,8 @@ class App:
                 self._notify(DOUBLED_NOTE)
             elif typed:
                 self._press_enter()
+            if self._keeps_recordings:   # a retried dictation is a finished one: one piece of audio, one phrase
+                self._start_save(kept.audio, kept.rate, raw, [raw], text, winutil.foreground_exe())
             if self.overlay:
                 self.overlay.flash("Typed" if typed else "Copied to clipboard", GREEN, 700)
         except Exception as e:
@@ -1340,6 +1392,7 @@ class App:
             else:
                 self._note(f"Ready. Press {self.cfg.hotkey} to dictate.")   # no pop-up at every start
             self.context.refresh()   # first look at the [context] folders, in the background
+            self._start_prune()      # old kept recordings, in the background
             winutil.trim_working_set()
 
         self.icon.run(setup=setup)
