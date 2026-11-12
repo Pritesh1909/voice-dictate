@@ -341,7 +341,8 @@ class App:
     checker: Checker | None = None           # the background checker, made at its first run
     learning_paused: str | None = None       # the checker's "error: ..." result: no more checks until a restart
     _no_discrete_gpu = False                 # Whisper's set-up found no discrete graphics card: keep no recordings
-    PRUNE_EVERY_SECONDS = 24 * 3600         # how often old kept recordings are cleared out (tests shorten it)
+    PRUNE_EVERY_SECONDS = 3600              # how often old kept recordings are cleared out: hourly, so a laptop
+                                            # that sleeps at night still keeps none past keep_days (tests shorten it)
     IDLE_EVERY_SECONDS = 30                 # how often the background checker's conditions are looked at
 
     def __init__(self, paths: cfgmod.Paths):
@@ -378,7 +379,7 @@ class App:
         self.last_stats = ""
         self.failed: FailedRecording | None = None   # the last dictation that couldn't be transcribed
         self._lock = threading.Lock()
-        self._quitting = threading.Event()   # set when the user quits: ends the daily clear-out of recordings
+        self._quitting = threading.Event()   # set when the user quits: ends the hourly clear-out of recordings
         self._session = 0
         self.current: Session | None = None
         self._adding_model = False   # the "Add a model file…" dialog is open
@@ -1622,7 +1623,7 @@ class App:
             else:
                 self._note(f"Ready. Press {self.cfg.hotkey} to dictate.")   # no pop-up at every start
             self.context.refresh()   # first look at the [context] folders, in the background
-            self._start_prune()      # old kept recordings: now and then every day, in the background
+            self._start_prune()      # old kept recordings: now and then every hour, in the background
             self._start_learning()   # Whisper's download, then checks while the PC is idle, in the background
             winutil.trim_working_set()
 

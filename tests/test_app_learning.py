@@ -272,8 +272,10 @@ def test_prune_uses_the_settings_and_local_time(tmp_path, monkeypatch):
     assert now.tzinfo is None and abs(now - datetime.now()) < timedelta(seconds=5)
 
 
-def test_clear_out_runs_daily_by_default():
-    assert App.PRUNE_EVERY_SECONDS == 24 * 3600
+def test_clear_out_runs_hourly_by_default():
+    """Hourly, not daily: a laptop that sleeps at night (the timer doesn't run while it sleeps) would
+    otherwise keep recordings well past keep_days. The clear-out is cheap and goes by age."""
+    assert App.PRUNE_EVERY_SECONDS == 3600
 
 
 def test_clear_out_repeats_on_its_own_timer(tmp_path, monkeypatch, pruning):
@@ -300,7 +302,7 @@ def test_quitting_stops_the_clear_out(tmp_path, monkeypatch, pruning):
     monkeypatch.setattr(recordings, "prune", lambda *a: calls.append(a) or 0)
     app = learning_app(tmp_path, FakeEngine())
     pruning(app)
-    wait_for(lambda: len(calls) == 1)                # once at start, then it waits a day
+    wait_for(lambda: len(calls) == 1)                # once at start, then it waits an hour
     app._quitting.set()
     wait_for(lambda: not prune_threads())
     assert len(calls) == 1
