@@ -31,7 +31,7 @@ log = logging.getLogger(__name__)
 class Spec:
     key: Key | None          # None for things that aren't in config.toml (start with Windows, notes)
     kind: str                # switch | choice | combo | int | float | csv | list | pairs | commands |
-                             # hotkey | startup | model | mic | vad | note
+                             # hotkey | startup | model | mic | vad | learned_auto | note
     label: str
     help: str = ""
     choices: tuple[tuple[str, str], ...] = ()   # (value, label)
@@ -151,6 +151,13 @@ PAGES: list[tuple[str, list[tuple[str, list[Spec]]]]] = [
             S(("context", "code_apps"), "list", "Programs for code",
               "Where names made of ordinary words (userId) are used too."),
         ]),
+        ("Learning in the background", [
+            S(("learning", "enabled"), "switch", "Learn from my dictations",
+              "Whisper re-listens while the PC is idle; repeated name mistakes become fixes."),
+            S(("learning", "use_claude"), "switch", "Ask Claude to judge disagreements",
+              "Sends text only, never your voice. A few cents a day at most."),
+            S(None, "learned_auto", "Learned automatically", "Undo a fix and it is never learned again."),
+        ]),
         ("Recognition", [
             S(("model", "vad"), "vad", "Voice detector",
               "auto = Silero VAD (finds where phrases start and end), off = loudness only."),
@@ -201,6 +208,11 @@ PAGES: list[tuple[str, list[tuple[str, list[Spec]]]]] = [
               choices=(("off", "Off"), ("session", "Until the app quits"), ("disk", "On this PC"))),
             S(("history", "max_items"), "int", "History length (dictations)",
               "10-5000, the oldest dropped first.", lo=10, hi=5000, step=10),
+            S(("learning", "keep_recordings"), "switch", "Keep recordings for learning",
+              "On this PC only, deleted after the number of days below."),
+            S(("learning", "keep_days"), "int", "Keep recordings for (days)", "1-365.", lo=1, hi=365),
+            S(None, "action", "Recordings", "Saved dictations used for learning.",
+              choices=(("delete_recordings", "Delete all"), ("open_recordings", "Open folder"))),
             S(None, "action", "Files", "Per-program settings and exact replacements are in the settings file.",
               choices=(("open_log", "Open log"), ("open_file", "Open settings file"))),
         ]),
@@ -296,6 +308,7 @@ class SettingsWindow:
         self.saved = False
         self.ready = False          # all pages built (controls report edits from then on)
         self.fields: list[Field] = []
+        self.learned_auto: LearnedAuto | None = None    # not a setting (not in fields); set when its page is built
         self.pages: dict[str, Any] = {}
         self.current_hotkey = str(store.value(("hotkey", "keys"), store_mod.DEFAULT_HOTKEY))
         self.scale = max(1.0, root.winfo_fpixels("1i") / 96)
@@ -559,6 +572,9 @@ class SettingsWindow:
             ctl.frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(self.px(8), 0))
         else:
             ctl.frame.grid(row=0, column=1, sticky="e", padx=(self.px(12), 0))
+        if spec.kind == "learned_auto":     # not a setting: nothing to compare, nothing to save
+            self.learned_auto = ctl
+            return
         if spec.key is None:
             original = self.env.startup_on
         else:
@@ -602,9 +618,26 @@ class SettingsWindow:
                                 'No learned words yet. Use "Correct last dictation" to teach some.')
         elif action == "open_file":
             self.open_settings_file()
+        elif action == "delete_recordings":     # done here, in this process: the tray app isn't asked
+            self.delete_recordings()
+        elif action == "open_recordings":
+            self._open_if_there(paths.recordings_dir, "No recordings yet.")
+
+    def delete_recordings(self) -> None:
+        from . import recordings
+        try:
+            n = recordings.delete_all(self.store.paths.recordings_dir)
+        except OSError as e:
+            self.message(f"Couldn't delete the recordings: {e}", error=True)
+            return
+        self.message(f"Deleted {n} recording{'' if n == 1 else 's'}." if n else "No recordings to delete.")
 
     def _open_if_there(self, path: Path, missing: str) -> None:
-        if not path.exists():
+        try:
+            there = path.exists() and (not path.is_dir() or any(path.iterdir()))     # an empty folder is nothing
+        except OSError:
+            there = False
+        if not there:
             self.message(missing)
             return
         try:
@@ -723,7 +756,7 @@ class Field:
     original: Any
 
 
-BELOW = {"list", "pairs", "commands", "model", "vad"}   # control under the text, full width
+BELOW = {"list", "pairs", "commands", "model", "vad", "learned_auto"}   # control under the text, full width
 
 
 # --- controls: each has .frame, .get() and .set(value) ----------------------------------------------
@@ -1138,11 +1171,104 @@ class OptionalHotkeyRecorder(HotkeyRecorder):
     default = ""
 
 
+def _plural(n: int, one: str, many: str) -> str:
+    return f"{n} {one if n == 1 else many}"
+
+
+class LearnedAuto(Control):
+    """The fixes background learning made by itself: a status line, one row per fix with an Undo button,
+    and Reset all (asked again in the window first).
+
+    Not a setting. It reads and changes the learning files through autolearn.Store, the same files the
+    tray app's checker writes (every write re-reads them under a file lock), so it has no get/set, never
+    makes the window dirty, and nothing here is saved with the settings."""
+    BUSY = "Couldn't change the learned fixes right now. Try again."
+
+    def build(self):
+        from . import autolearn
+        px = self.win.px
+        paths = self.win.store.paths
+        self.auto = autolearn.Store(paths.learning_dir, paths.learned_auto_file)
+        self.status = self.ttk.Label(self.frame, wraplength=px(540), justify="left")
+        self.status.pack(anchor="w")
+        self.listing = self.ttk.Frame(self.frame, style="Row.TFrame")
+        self.listing.pack(fill="x", pady=(px(6), px(4)))
+        self.footer = self.ttk.Frame(self.frame, style="Row.TFrame")
+        self.footer.pack(fill="x")
+        self.refresh()
+
+    def refresh(self) -> None:
+        """Read the learning files again and redraw everything."""
+        ttk, px = self.ttk, self.win.px
+        fixes, waiting = self.auto.active(), self.auto.pending_count()
+        self.status.configure(text=" · ".join([
+            self.auto.status() or "Not started yet",
+            _plural(len(self.auto.checked_ids()), "dictation", "dictations") + " checked",
+            _plural(len(fixes), "fix", "fixes") + " learned",
+            f"{waiting} waiting for a second sighting"]))
+        for child in (*self.listing.winfo_children(), *self.footer.winfo_children()):
+            child.destroy()
+        if not fixes:
+            ttk.Label(self.listing, text="No fixes learned yet.", style="Help.TLabel").pack(anchor="w")
+        for fix in fixes:
+            self._row(fix)
+        reset = ttk.Button(self.footer, text="Reset all", command=self.ask_reset)
+        reset.pack(anchor="w", pady=(px(4), 0))
+        if not (fixes or waiting):
+            reset.state(["disabled"])       # nothing to clear
+
+    def _row(self, fix) -> None:
+        """heard → term, the day it was learned, how often it was seen, Undo."""
+        ttk, px = self.ttk, self.win.px
+        row = ttk.Frame(self.listing, style="Row.TFrame")
+        row.pack(fill="x", pady=px(2))
+        row.columnconfigure(0, weight=1)
+        row.columnconfigure(1, minsize=px(92))
+        row.columnconfigure(2, minsize=px(70))
+        ttk.Label(row, text=self.shown(fix), wraplength=px(290), justify="left").grid(row=0, column=0, sticky="w")
+        ttk.Label(row, text=fix.first_learned[:10], style="Help.TLabel").grid(row=0, column=1, sticky="w")
+        ttk.Label(row, text=f"seen ×{fix.seen}", style="Help.TLabel").grid(row=0, column=2, sticky="w")
+        ttk.Button(row, text="Undo", command=lambda: self.undo(fix)).grid(row=0, column=3, padx=(px(12), 0))
+
+    @staticmethod
+    def shown(fix) -> str:
+        return f"{fix.heard_as} → {fix.term}" if fix.heard_as else fix.term
+
+    def undo(self, fix) -> None:
+        self._change(lambda: self.auto.undo((fix.term, fix.heard_as)),
+                     f"Undone: {self.shown(fix)}. It won't be learned again.")
+
+    def ask_reset(self) -> None:
+        """Turn the Reset all button into the question, in the window (no pop-up)."""
+        ttk, px = self.ttk, self.win.px
+        for child in self.footer.winfo_children():
+            child.destroy()
+        row = ttk.Frame(self.footer, style="Row.TFrame")
+        row.pack(anchor="w", pady=(px(4), 0))
+        ttk.Label(row, text="Really reset all?", style="Strong.TLabel").pack(side="left")
+        ttk.Button(row, text="Yes", command=self.reset).pack(side="left", padx=(px(10), 0))
+        cancel = ttk.Button(row, text="Cancel", command=self.refresh)
+        cancel.pack(side="left", padx=(px(6), 0))
+        cancel.focus_set()                  # the safe answer is the one Enter gives
+
+    def reset(self) -> None:
+        self._change(self.auto.reset_all, "Every automatic fix was cleared. None will be learned again.")
+
+    def _change(self, change: Callable[[], None], done: str) -> None:
+        try:
+            change()
+        except OSError:     # the lock stayed busy (TimeoutError) or the disk refused; damage is Store's job
+            self.win.message(self.BUSY, error=True)
+        else:
+            self.win.message(done)
+        self.refresh()
+
+
 CONTROLS: dict[str, type[Control]] = {
     "hotkey_opt": OptionalHotkeyRecorder,
     "switch": Switch, "startup": Startup, "choice": Choice, "combo": Combo, "mic": Mic, "model": ModelChoice,
     "int": Number, "float": Decimal, "csv": Csv, "list": ListEditor, "pairs": PairsEditor,
-    "commands": CommandsEditor, "vad": VadChoice, "hotkey": HotkeyRecorder,
+    "commands": CommandsEditor, "vad": VadChoice, "hotkey": HotkeyRecorder, "learned_auto": LearnedAuto,
 }
 
 
