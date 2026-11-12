@@ -3,10 +3,12 @@ Nothing here touches the internet: a local HTTP server serves a small fake model
 import hashlib
 import http.server
 import json
+import logging
 import os
 import random
 import subprocess
 import sys
+import tempfile
 import threading
 import types
 from pathlib import Path
@@ -41,10 +43,11 @@ def known(body, monkeypatch):
 
 
 class Serve:
-    """HTTP server for one fake file. honour_range=False answers a Range request with the whole file (200)."""
+    """HTTP server for one fake file. honour_range=False answers a Range request with the whole file (200).
+    cut=N: the first answer announces its full length but closes the connection after N bytes."""
 
-    def __init__(self, body: bytes, honour_range: bool = True):
-        self.body, self.honour_range = body, honour_range
+    def __init__(self, body: bytes, honour_range: bool = True, cut: int | None = None):
+        self.body, self.honour_range, self.cut = body, honour_range, cut
         self.ranges: list[str | None] = []
         self.sent = 0
         outer = self
@@ -64,6 +67,8 @@ class Serve:
                 for k, v in extra.items():
                     self.send_header(k, v)
                 self.end_headers()
+                cut, outer.cut = outer.cut, None
+                data = data if cut is None else data[:cut]
                 self.wfile.write(data)
                 outer.sent += len(data)
 
@@ -83,8 +88,8 @@ class Serve:
 def serve(body):
     made: list[Serve] = []
 
-    def start(honour_range: bool = True) -> Serve:
-        made.append(Serve(body, honour_range))
+    def start(honour_range: bool = True, cut: int | None = None) -> Serve:
+        made.append(Serve(body, honour_range, cut))
         return made[-1]
 
     yield start
@@ -138,6 +143,31 @@ def test_resume_ignores_a_part_that_is_already_too_big(tmp_path, body, known, se
     m = models.download(tmp_path / "dl", base_url=s.url, key=teacher.KEY, resume=True)
     assert s.ranges == [None]
     assert hashlib.sha256(m.path.read_bytes()).hexdigest() == known[2]
+
+
+def test_truncated_download_keeps_the_part_and_the_next_call_completes_it(tmp_path, body, known, serve):
+    cut = 1_000_000
+    s = serve(cut=cut)                                    # announces everything, sends 1 MB, closes cleanly
+    part = tmp_path / "dl" / teacher.KEY / (NAME + ".part")
+    with pytest.raises(OSError, match="incomplete"):
+        models.download(tmp_path / "dl", base_url=s.url, key=teacher.KEY, resume=True)
+    assert part.is_file() and part.stat().st_size == cut and part.read_bytes() == body[:cut]
+    assert not (tmp_path / "dl" / teacher.KEY / NAME).exists()
+
+    m = models.download(tmp_path / "dl", base_url=s.url, key=teacher.KEY, resume=True)
+    assert s.ranges == [None, f"bytes={cut}-"] and s.sent == len(body)       # only the rest was fetched
+    assert m.path.read_bytes() == body and not part.exists()
+
+
+def test_truncated_resume_keeps_the_longer_part(tmp_path, body, known, serve):
+    s = serve(cut=500_000)                                # a resumed answer that stops early, too
+    part = tmp_path / "dl" / teacher.KEY / (NAME + ".part")
+    part.parent.mkdir(parents=True)
+    part.write_bytes(body[:1_000_000])
+    with pytest.raises(OSError, match="incomplete"):
+        models.download(tmp_path / "dl", base_url=s.url, key=teacher.KEY, resume=True)
+    assert part.read_bytes() == body[:1_500_000]
+    assert models.download(tmp_path / "dl", base_url=s.url, key=teacher.KEY, resume=True).path.read_bytes() == body
 
 
 def test_resumed_download_with_a_wrong_prefix_is_rejected(tmp_path, body, known, serve):
@@ -269,26 +299,32 @@ def py(code: str) -> list[str]:
     return [sys.executable, "-c", code]
 
 
+def writes(text: str) -> list[str]:
+    """A stand-in for `ParakeetDictate --list-devices <out.json>`: writes `text` to the file named last."""
+    return py(f"import sys; assert sys.argv[1] == '--list-devices'; open(sys.argv[2], 'w').write({text!r})")
+
+
 def test_has_discrete_gpu_parses_output():
-    assert teacher.has_discrete_gpu(py("print('[[\"gpu\",\"Vulkan1\"]]')")) is True
-    assert teacher.has_discrete_gpu(py("print('[[\"igpu\",\"Vulkan0\"],[\"cpu\",\"CPU\"],[\"gpu\",\"Vulkan1\"]]')")) is True
-    assert teacher.has_discrete_gpu(py("print('[[\"igpu\",\"Vulkan0\"],[\"cpu\",\"CPU\"]]')")) is False
-    assert teacher.has_discrete_gpu(py("print('[]')")) is False
-
-
-def test_has_discrete_gpu_passes_the_flag_to_the_command():
-    code = "import sys, json; print(json.dumps([['gpu', 'x']] if sys.argv[1:] == ['--list-devices'] else []))"
-    assert teacher.has_discrete_gpu(py(code)) is True
+    assert teacher.has_discrete_gpu(writes('[["gpu","Vulkan1"]]')) is True
+    assert teacher.has_discrete_gpu(writes('[["igpu","Vulkan0"],["cpu","CPU"],["gpu","Vulkan1"]]')) is True
+    assert teacher.has_discrete_gpu(writes('[["igpu","Vulkan0"],["cpu","CPU"]]')) is False
+    assert teacher.has_discrete_gpu(writes("[]")) is False
 
 
 def test_has_discrete_gpu_is_false_on_a_timeout():
     assert teacher.has_discrete_gpu(py("import time; time.sleep(30)"), timeout=0.5) is False
 
 
-@pytest.mark.parametrize("code", ["print('not json')", "", "import sys; sys.exit(3)",
-                                  "print('{\"gpu\": 1}')", "print('[null]')",
-                                  "import sys; print('[[\"gpu\",\"x\"]]'); sys.exit(1)"])
-def test_has_discrete_gpu_is_false_when_the_output_is_unusable(code):
+@pytest.mark.parametrize("code", [
+    "pass",                                                       # exits 0 but writes nothing
+    "import sys; sys.exit(3)",                                    # fails, writes nothing
+    "import sys; open(sys.argv[2], 'w').write('not json')",
+    "import sys; open(sys.argv[2], 'w').write('')",
+    "import sys; open(sys.argv[2], 'w').write('{\"gpu\": 1}')",
+    "import sys; open(sys.argv[2], 'w').write('[null]')",
+    "import sys; open(sys.argv[2], 'w').write('[[\"gpu\",\"x\"]]'); sys.exit(1)",   # file there but the child failed
+])
+def test_has_discrete_gpu_is_false_when_the_answer_is_unusable(code):
     assert teacher.has_discrete_gpu(py(code)) is False
 
 
@@ -296,17 +332,34 @@ def test_has_discrete_gpu_is_false_when_the_program_is_missing(tmp_path):
     assert teacher.has_discrete_gpu([str(tmp_path / "nope.exe")]) is False
 
 
+def test_has_discrete_gpu_logs_the_exit_code_and_stderr_tail_when_it_fails(caplog):
+    caplog.set_level(logging.INFO, logger="parakeet_dictate.teacher")
+    noise = "x" * 3000
+    assert teacher.has_discrete_gpu(py(f"import sys; sys.stderr.write('{noise}Vulkan exploded'); sys.exit(3)")) is False
+    msg = " ".join(r.getMessage() for r in caplog.records)
+    assert "3" in msg and "Vulkan exploded" in msg
+    assert len(msg) < 1500                                        # only the tail of stderr
+
+
+def test_has_discrete_gpu_leaves_no_temp_file_behind(monkeypatch, tmp_path):
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    assert teacher.has_discrete_gpu(writes('[["gpu","a"]]')) is True
+    assert teacher.has_discrete_gpu(py("import sys; sys.exit(1)")) is False
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_has_discrete_gpu_hides_the_console_window(monkeypatch):
     seen = {}
 
     def fake_run(cmd, **kw):
         seen.update(kw, cmd=cmd)
-        return subprocess.CompletedProcess(cmd, 0, stdout='[["gpu","a"]]', stderr="")
+        Path(cmd[-1]).write_text('[["gpu","a"]]')
+        return subprocess.CompletedProcess(cmd, 0, stdout=None, stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     assert teacher.has_discrete_gpu(["app.exe", "--x"]) is True
-    assert seen["cmd"] == ["app.exe", "--x", "--list-devices"] and seen["timeout"] == 30
-    assert seen["creationflags"] == subprocess.CREATE_NO_WINDOW
+    assert seen["cmd"][:3] == ["app.exe", "--x", "--list-devices"] and len(seen["cmd"]) == 4
+    assert seen["timeout"] == 30 and seen["creationflags"] == subprocess.CREATE_NO_WINDOW
 
 
 def test_teacher_module_does_not_load_the_engine():
@@ -317,11 +370,62 @@ def test_teacher_module_does_not_load_the_engine():
 
 # --- --list-devices ----------------------------------------------------------------------------------
 
-def test_list_devices_flag_prints_device_types_and_names(monkeypatch, capsys):
-    dev = lambda t, n: types.SimpleNamespace(device_type=t, name=n, description="ignored")   # noqa: E731
-    fake = types.SimpleNamespace(set_log_callback=lambda cb: None,
-                                 backends=lambda: [dev("igpu", "Vulkan0"), dev("gpu", "Vulkan1"), dev("cpu", "CPU")])
-    monkeypatch.setitem(sys.modules, "transcribe_cpp", fake)
-    monkeypatch.setattr(sys, "argv", ["ParakeetDictate", "--list-devices"])
+def dev(device_type: str, name: str):
+    return types.SimpleNamespace(device_type=device_type, name=name, description="ignored")
+
+
+def fake_engine(monkeypatch, devices):
+    """A stand-in for transcribe_cpp whose backends() gives `devices` (or raises if it is an exception)."""
+    def backends():
+        if isinstance(devices, Exception):
+            raise devices
+        return devices
+    monkeypatch.setitem(sys.modules, "transcribe_cpp", types.SimpleNamespace(set_log_callback=lambda cb: None,
+                                                                             backends=backends))
+
+
+def test_list_devices_flag_writes_device_types_and_names_to_the_file(monkeypatch, tmp_path, capsys):
+    fake_engine(monkeypatch, [dev("igpu", "Vulkan0"), dev("gpu", "Vulkan1"), dev("cpu", "CPU")])
+    out = tmp_path / "devices.json"
+    monkeypatch.setattr(sys, "argv", ["ParakeetDictate", "--list-devices", str(out)])
     assert entry.main() == 0
-    assert json.loads(capsys.readouterr().out) == [["igpu", "Vulkan0"], ["gpu", "Vulkan1"], ["cpu", "CPU"]]
+    assert json.loads(out.read_text(encoding="utf-8")) == [["igpu", "Vulkan0"], ["gpu", "Vulkan1"], ["cpu", "CPU"]]
+    assert capsys.readouterr().out == ""                      # nothing relies on stdout (the .exe has none)
+    assert [p.name for p in tmp_path.iterdir()] == ["devices.json"]     # the temporary file was renamed away
+
+
+def test_list_devices_runs_before_anything_else_is_set_up(monkeypatch, tmp_path):
+    """No settings file, log or data folder is created, and the tray app does not start."""
+    monkeypatch.setenv("APPDATA", str(tmp_path / "roaming"))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+    fake_engine(monkeypatch, [dev("cpu", "CPU")])
+    out = tmp_path / "devices.json"
+    monkeypatch.setattr(sys, "argv", ["ParakeetDictate", "--list-devices", str(out)])
+    assert entry.main() == 0 and out.is_file()
+    assert not (tmp_path / "roaming").exists() and not (tmp_path / "local").exists()
+
+
+def test_list_devices_writes_nothing_and_exits_1_on_any_error(monkeypatch, tmp_path):
+    fake_engine(monkeypatch, RuntimeError("no Vulkan"))
+    out = tmp_path / "devices.json"
+    monkeypatch.setattr(sys, "argv", ["ParakeetDictate", "--list-devices", str(out)])
+    assert entry.main() == 1
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_list_devices_exits_1_when_the_engine_cannot_be_imported(monkeypatch, tmp_path):
+    monkeypatch.setitem(sys.modules, "transcribe_cpp", None)             # makes `import transcribe_cpp` fail
+    out = tmp_path / "devices.json"
+    monkeypatch.setattr(sys, "argv", ["ParakeetDictate", "--list-devices", str(out)])
+    assert entry.main() == 1 and list(tmp_path.iterdir()) == []
+
+
+def test_list_devices_exits_1_when_the_file_cannot_be_written(monkeypatch, tmp_path):
+    fake_engine(monkeypatch, [dev("cpu", "CPU")])
+    monkeypatch.setattr(sys, "argv", ["ParakeetDictate", "--list-devices", str(tmp_path / "no" / "such" / "devices.json")])
+    assert entry.main() == 1
+
+
+def test_list_devices_without_a_file_name_is_a_usage_error_and_does_not_start_the_app(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["ParakeetDictate", "--list-devices"])
+    assert entry.main() == 2

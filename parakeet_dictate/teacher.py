@@ -6,7 +6,7 @@ never in the folder dictation models come from, so it never shows up in the Mode
 downloaded the same build, that copy is used instead (after its SHA-256 has been checked once).
 
 The tray process never loads the speech engine (transcribe_cpp), so whether this PC has a discrete graphics
-card is asked of a short-lived child process: the app itself run with --list-devices.
+card is asked of a short-lived child process: the app itself run with --list-devices <file>.
 """
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import subprocess
+import tempfile
 from pathlib import Path
 
 from . import models
@@ -93,15 +94,25 @@ def ensure(teacher_dir: Path, orca_dir: Path, progress: models.Progress = lambda
 
 
 def has_discrete_gpu(exe_cmd: list[str], timeout: float = LIST_DEVICES_TIMEOUT) -> bool:
-    """True if the speech engine sees a discrete graphics card. Runs `exe_cmd --list-devices` (the app's own
-    command line, see __main__.list_devices), which prints [[device_type, name], ...] as JSON. Any failure
-    (missing program, timeout, bad output) counts as no card: learning then simply waits."""
+    """True if the speech engine sees a discrete graphics card. Runs `exe_cmd --list-devices <out.json>` (the
+    app's own command line, see __main__.list_devices; a file because the windowed .exe has no stdout) and
+    reads [[device_type, name], ...] from that file once the child has exited. Any failure (missing program,
+    timeout, non-zero exit, no or bad file) counts as no card: learning then simply waits."""
     try:
-        done = subprocess.run([*exe_cmd, "--list-devices"], capture_output=True, text=True, timeout=timeout,
-                              creationflags=subprocess.CREATE_NO_WINDOW)
-        if done.returncode != 0:
-            return False
-        return any(isinstance(d, list) and d and d[0] == "gpu" for d in json.loads(done.stdout))
-    except (OSError, ValueError, TypeError, subprocess.SubprocessError) as e:
+        with tempfile.TemporaryDirectory(prefix="parakeet-devices-", ignore_cleanup_errors=True) as tmp:
+            out = Path(tmp) / "devices.json"
+            done = subprocess.run([*exe_cmd, "--list-devices", str(out)], stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.PIPE, text=True, errors="replace", timeout=timeout,
+                                  creationflags=subprocess.CREATE_NO_WINDOW)
+            try:
+                devices = json.loads(out.read_text(encoding="utf-8")) if done.returncode == 0 else None
+            except (OSError, ValueError):
+                devices = None
+            if not isinstance(devices, list):
+                log.info("--list-devices gave no usable answer (exit code %s): %s", done.returncode,
+                         (done.stderr or "").strip()[-500:])
+                return False
+            return any(isinstance(d, list) and d and d[0] == "gpu" for d in devices)
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
         log.info("could not list graphics devices: %s", e)
         return False

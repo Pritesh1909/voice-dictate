@@ -542,7 +542,8 @@ def download(dest_root: Path, progress: Progress = lambda done, total: None,
     """Download one of Orca's models (default Parakeet v2, ~730 MB) and verify its SHA-256.
     resume: carry on from a `.part` file left by an interrupted download. The server is asked for the rest
     (`Range`); if it sends only that (206) the bytes already there are hashed again and the rest appended,
-    if it sends the whole file (200) the download starts over. A wrong result is caught by the SHA-256."""
+    if it sends the whole file (200) the download starts over. A download that ends early (OSError "incomplete")
+    leaves its .part for the next resume; a full-size file with the wrong SHA-256 is thrown away."""
     repo, rev, name, size, sha = KNOWN[key]
     dest = dest_root / key
     dest.mkdir(parents=True, exist_ok=True)
@@ -572,6 +573,8 @@ def download(dest_root: Path, progress: Progress = lambda done, total: None,
                     h.update(chunk)
                     done += len(chunk)
                     progress(done, size)
+        if done < size:  # the server or a proxy closed the connection early: keep the .part so resume can finish it
+            raise OSError(f"{name}: incomplete download ({done} of {size} bytes), the partial file is kept")
         if h.hexdigest() != sha:
             tmp.unlink(missing_ok=True)
             raise OSError(f"{name}: checksum mismatch, download discarded")
