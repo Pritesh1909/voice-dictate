@@ -2,6 +2,8 @@
 No model is loaded and nothing is sent anywhere."""
 import dataclasses
 import json
+import threading
+import time
 from datetime import datetime
 
 import numpy as np
@@ -31,6 +33,7 @@ class FakeEngine:
         self.device_type = None
         self.transcribed = 0
         self.unloaded = False
+        self.killed = False
 
     def warm(self):
         pass
@@ -44,6 +47,8 @@ class FakeEngine:
         self.transcribed += 1
         if self._on_transcribe:
             self._on_transcribe()
+        if self.killed:                     # what the real Engine does after kill()
+            raise EngineError("speech engine stopped")
         if self._crash:
             raise EngineError("speech engine stopped: [WinError 109] The pipe has been ended")
         text = self._texts[0] if len(self._texts) == 1 else self._texts.pop(0)
@@ -51,6 +56,9 @@ class FakeEngine:
 
     def unload(self):
         self.unloaded = True
+
+    def kill(self):
+        self.killed = True
 
 
 class Judge:
@@ -313,22 +321,98 @@ def test_stop_ends_the_run(env):
     env["add"]("Send the campaign.")
     env["add"]("Open the settings.")
     holder = {}
-    checker = env["make"](whisper="send the campaign", on_transcribe=lambda: holder["c"].stop())
+
+    def stop_during_the_second():   # the hotkey, pressed while Whisper is on the second recording
+        if env["engines"][-1].transcribed == 2:
+            holder["c"].stop()
+
+    checker = env["make"](whisper="send the campaign", on_transcribe=stop_during_the_second)
     holder["c"] = checker
-    assert not checker.run(never_stop).startswith("error")
-    assert len(env["rows"]()) == 1 and env["engines"][0].unloaded
+    assert checker.run(never_stop) == "Checked 1 dictation (stopped)"
+    assert len(env["rows"]()) == 1 and env["engines"][0].killed and env["engines"][0].unloaded
     checker.run(never_stop)   # stop() applies to the run it interrupted, not the next one
     assert len(env["rows"]()) == 2
 
 
 def test_teacher_killed_by_stop_is_not_an_error(env):
-    """The hotkey stops the checker and unloads Whisper mid-call: that ends the run, it doesn't pause learning."""
+    """The hotkey stops the checker, which kills Whisper mid-call: that ends the run, it doesn't pause learning."""
     env["add"]("Send the campaign.")
     holder = {}
-    checker = env["make"](whisper="x", crash=True, on_transcribe=lambda: holder["c"].stop())
+    checker = env["make"](whisper="x", on_transcribe=lambda: holder["c"].stop())
     holder["c"] = checker
     assert not checker.run(never_stop).startswith("error")
-    assert env["rows"]() == []
+    assert env["rows"]() == [] and env["engines"][0].killed
+
+
+def _real_teacher(env, monkeypatch, hang):
+    """A Checker on the real Engine, its process faked by a thread that hangs while loading or decoding."""
+    from test_engine_crash import _KillCtx, killable_worker
+    from parakeet_dictate import engine as eng
+    monkeypatch.setattr(eng.mp, "get_context", lambda kind: _KillCtx)
+    monkeypatch.setattr(_KillCtx, "started", 0)
+    monkeypatch.setattr(eng, "_worker", killable_worker(hang))
+    env["add"]("Send the campaign.")
+    return env["make"](engine=lambda spec: eng.Engine(spec, unload_after=-1))
+
+
+def _run_and_stop_soon(checker):
+    threading.Timer(0.3, checker.stop).start()
+    t0 = time.monotonic()
+    summary = checker.run(never_stop)
+    return summary, time.monotonic() - t0
+
+
+def test_stop_kills_the_teacher_mid_whisper_at_once(env, monkeypatch):
+    from test_engine_crash import _KillCtx
+    summary, took = _run_and_stop_soon(_real_teacher(env, monkeypatch, hang="decode"))
+    assert took < 2 and not summary.startswith("error") and "stopped" in summary
+    assert env["rows"]() == [] and _KillCtx.started == 1
+    assert not list(env["tmp"].rglob("gpu-failed.json"))
+    assert env["engines"][0].state == "unloaded"
+
+
+def test_stop_while_the_teacher_loads_ends_the_wait(env, monkeypatch):
+    from test_engine_crash import _KillCtx
+    summary, took = _run_and_stop_soon(_real_teacher(env, monkeypatch, hang="load"))
+    assert took < 2 and summary == "stopped"
+    assert _KillCtx.started == 1 and env["engines"][0].state == "unloaded"
+
+
+def test_stop_before_the_teacher_exists_still_stops(env):
+    env["add"]("Send the campaign.")
+    holder = {}
+
+    def make_engine_then_stop(spec):   # stop() arrives while the engine is being made
+        holder["c"].stop()
+        return FakeEngine(spec, "x")
+
+    checker = env["make"](engine=make_engine_then_stop)
+    holder["c"] = checker
+    assert checker.run(never_stop) == "stopped"
+    assert env["engines"][0].unloaded and env["engines"][0].transcribed == 0
+
+
+def test_teacher_unloaded_before_judging(env):
+    env["add"]("Send the MailT campaign now.")
+    seen = []
+    ask = Judge(answer=lambda p: seen.append(env["engines"][0].unloaded) or p.whisper)
+    env["make"](whisper="Send the Mailzzy campaign now.", ask=ask).run(never_stop)
+    assert seen == [True]
+
+
+def test_claude_that_never_started_is_not_counted(env):
+    env["add"]("Send the MailT campaign now.")
+    ask = Judge(error=judge.JudgeUnavailable("The `claude` command isn't on PATH", ran=False))
+    env["make"](whisper="Send the Mailzzy campaign now.", terms=["Mailzzy"], ask=ask).run(never_stop)
+    assert env["store"].claude_calls_today(TODAY) == 0
+    assert env["store"].pending_count() == 1   # known terms were used instead
+
+
+def test_claude_that_ran_and_failed_is_counted(env):
+    env["add"]("Send the MailT campaign now.")
+    ask = Judge(error=judge.JudgeUnavailable("Claude exited with code 1: Not logged in", ran=True))
+    env["make"](whisper="Send the Mailzzy campaign now.", terms=["Mailzzy"], ask=ask).run(never_stop)
+    assert env["store"].claude_calls_today(TODAY) == 1
 
 
 def test_missing_audio_is_checked_once(env):

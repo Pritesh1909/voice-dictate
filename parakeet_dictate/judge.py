@@ -62,7 +62,14 @@ USER_PROMPT = "Judge the pairs in the JSON on stdin."
 
 
 class JudgeUnavailable(Exception):
-    """Claude could not be asked or did not give a usable answer; the caller falls back to known terms."""
+    """Claude could not be asked or did not give a usable answer; the caller falls back to known terms.
+
+    `ran` is False when `claude` never started (not on PATH, could not be launched): no call was made,
+    so it doesn't count toward [learning] claude_calls_per_day."""
+
+    def __init__(self, message: str, ran: bool = True):
+        super().__init__(message)
+        self.ran = ran
 
 
 @dataclass
@@ -136,7 +143,7 @@ def _ask_batch(batch: list[Pair], terms: str, run, claude: str) -> dict[int, str
         except subprocess.TimeoutExpired as exc:
             raise JudgeUnavailable(f"Claude didn't answer within {TIMEOUT_SECONDS} seconds") from exc
         except OSError as exc:
-            raise JudgeUnavailable(f"Claude could not be started: {exc}") from exc
+            raise JudgeUnavailable(f"Claude could not be started: {exc}", ran=False) from exc
     if done.returncode != 0:
         detail = (done.stderr or done.stdout or "").strip()[-300:]
         raise JudgeUnavailable(f"Claude exited with code {done.returncode}: {detail or '(no output)'}")
@@ -152,7 +159,7 @@ def ask_claude(pairs: list[Pair], terms: list[str], run=subprocess.run, claude: 
         return {}
     claude = claude or shutil.which("claude")
     if claude is None:
-        raise JudgeUnavailable("The `claude` command isn't on PATH")
+        raise JudgeUnavailable("The `claude` command isn't on PATH", ran=False)
     term_text = prompt_terms(terms)
     answers: dict[int, str] = {}
     for start in range(0, len(pairs), BATCH_SIZE):

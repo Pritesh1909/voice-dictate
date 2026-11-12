@@ -117,37 +117,41 @@ def test_no_pairs_asks_nothing():
     json.dumps({"is_error": True, "result": "Not logged in", "structured_output": {"items": []}}),
 ])
 def test_bad_json_raises_unavailable(stdout):
-    with pytest.raises(JudgeUnavailable):
+    with pytest.raises(JudgeUnavailable) as exc:
         ask([Pair(1, "a", "b")], FakeRun(done(stdout)))
+    assert exc.value.ran   # claude ran: the call counts toward the daily limit
 
 
 def test_failed_call_raises_unavailable():
-    with pytest.raises(JudgeUnavailable):
+    with pytest.raises(JudgeUnavailable) as exc:
         ask([Pair(1, "a", "b")], FakeRun(done(reply([]), returncode=1, stderr="boom")))
+    assert exc.value.ran
 
 
 def test_timeout_raises_unavailable():
     def hang(args, kwargs):
         raise subprocess.TimeoutExpired(args, kwargs["timeout"])
 
-    with pytest.raises(JudgeUnavailable):
+    with pytest.raises(JudgeUnavailable) as exc:
         ask([Pair(1, "a", "b")], FakeRun(hang))
+    assert exc.value.ran
 
 
 def test_cannot_start_raises_unavailable():
     def cannot(args, kwargs):
         raise FileNotFoundError(args[0])
 
-    with pytest.raises(JudgeUnavailable):
+    with pytest.raises(JudgeUnavailable) as exc:
         ask([Pair(1, "a", "b")], FakeRun(cannot))
+    assert not exc.value.ran   # never started: not a call
 
 
 def test_missing_claude_raises_unavailable(monkeypatch):
     monkeypatch.setattr(judge.shutil, "which", lambda name: None)
     run = FakeRun(done(reply([])))
-    with pytest.raises(JudgeUnavailable):
+    with pytest.raises(JudgeUnavailable) as exc:
         judge.ask_claude([Pair(1, "a", "b")], [], run=run)   # claude=None -> looked up on PATH
-    assert run.calls == []
+    assert run.calls == [] and not exc.value.ran
 
 
 def test_claude_found_on_path(monkeypatch):

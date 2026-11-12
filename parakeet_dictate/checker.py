@@ -84,14 +84,20 @@ class Checker:
         self._ask = ask
         self._now = now
         self._stop = threading.Event()
+        self._engine: Engine | None = None   # the teacher while it is loaded, so stop() can kill it
         self._day = ""
         self._waiting_for_claude: set[str] = set()   # recording ids over today's Claude calls
         self._checked = 0
         self._learned = 0
 
     def stop(self) -> None:
-        """End the current run at the next recording or Claude batch (the hotkey was pressed)."""
+        """End the current run (the hotkey was pressed). Kills Whisper's process at once, without waiting
+        for the recording it is on, so the graphics card is free for dictation; the run then ends at the
+        next recording or Claude batch. Call from any thread; returns immediately."""
         self._stop.set()
+        engine = self._engine
+        if engine is not None:
+            engine.kill()
 
     def run(self, should_stop: Callable[[], bool]) -> str:
         """Check the unchecked recordings, oldest first, until done or stopped. Returns a summary for the
@@ -114,10 +120,12 @@ class Checker:
             if stopped():
                 return "stopped"
             terms = list(self._terms())
-            engine = self._make_engine(teacher_spec(self._teacher_path, self._cfg.threads, self._cfg.language,
-                                                    judge.prompt_terms(terms)))
+            engine = self._engine = self._make_engine(
+                teacher_spec(self._teacher_path, self._cfg.threads, self._cfg.language, judge.prompt_terms(terms)))
+            if stopped():   # stop() came before self._engine was set, so it had nothing to kill
+                return "stopped"
             engine.warm()
-            ready = engine.wait_ready()
+            ready = engine.wait_ready()   # kill() ends this wait at once
             if stopped():
                 return "stopped"
             if not ready:
@@ -128,10 +136,11 @@ class Checker:
                 self._status(STATUS_NO_GPU)
                 return "error: no gpu"
             queue = self._listen(engine, todo, stopped)
+            self._unload_teacher(engine)   # off the graphics card while Claude thinks
             self._judge(queue, terms, stopped, today, now.strftime("%Y-%m-%d %H:%M"))
         except EngineError as e:
             if stopped():
-                return self._finish(stopped=True)   # the hotkey unloaded Whisper mid-call: not a crash
+                return self._finish(stopped=True)   # stop() killed Whisper mid-call: not a crash
             log.error("background check: Whisper stopped: %s", e)
             self._status(STATUS_CRASHED)
             return "error: teacher crashed"
@@ -143,8 +152,12 @@ class Checker:
             return f"error: {type(e).__name__}: {e}"
         finally:
             if engine is not None:
-                engine.unload()
+                self._unload_teacher(engine)
         return self._finish(stopped=stopped())
+
+    def _unload_teacher(self, engine: Engine) -> None:
+        self._engine = None
+        engine.unload()
 
     # --- steps ---------------------------------------------------------------------------------------
 
@@ -165,7 +178,7 @@ class Checker:
                 self._append(rec, parakeet, None, skipped="no audio")
                 continue
             samples = preprocess(audio, noise_reduction="auto")
-            if stopped():   # again: a transcribe after the hotkey unloaded Whisper would load it again
+            if stopped():   # again: the noise check in preprocess can take a moment
                 break
             whisper = cleaner.clean(engine.transcribe(samples)[0])
             if _words(parakeet) == _words(whisper):
@@ -192,12 +205,14 @@ class Checker:
                     self._waiting_for_claude.update(p.rec.id for p in queue[start:])
                     return
                 pairs = [judge.Pair(start + i, p.parakeet, p.whisper) for i, p in enumerate(batch)]
+                ran = True
                 try:
                     answers = self._ask(pairs, terms)
                 except judge.JudgeUnavailable as e:
                     log.warning("background check: Claude unavailable, learning only fixes to known terms: %s", e)
-                    use_claude = False
-                self._store.count_claude_call(today)
+                    use_claude, ran = False, e.ran
+                if ran:   # a call that never started (claude not installed) uses up nothing
+                    self._store.count_claude_call(today)
             for i, p in enumerate(batch):
                 if answers is None:
                     self._learn_known(p, known, now)
