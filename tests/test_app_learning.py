@@ -1,6 +1,10 @@
-"""Saving each finished dictation for the background learner (recordings.py), with the fake microphone and
-engine of test_app_flow. Nothing is typed into any window; recordings go to a temporary folder."""
+"""Background learning in the app, with the fake microphone and engine of test_app_flow: saving each finished
+dictation (recordings.py), Whisper's download, the idle loop that runs the checker, the hotkey stopping it,
+and automatic fixes in the clean-up. Nothing is typed into any window, no model is loaded and nothing is
+downloaded; every file goes to a temporary folder."""
+import dataclasses
 import logging
+import sys
 import threading
 import time
 import types
@@ -11,9 +15,9 @@ import numpy as np
 import pytest
 from test_app_flow import SR, FakeEngine, FakeRecorder, dictate, make_app, out, retry, speech  # noqa: F401
 
-from parakeet_dictate import config, models, recordings, winutil
+from parakeet_dictate import autolearn, config, idle, learn, models, recordings, teacher, winutil
 from parakeet_dictate.app import FAILED_NOTE, App, Session
-from parakeet_dictate.engine import EngineError
+from parakeet_dictate.engine import GPU_MARKER, Engine, EngineError, EngineSpec
 
 MODEL = "parakeet-tdt-0.6b-v3.gguf"
 
@@ -316,3 +320,444 @@ def test_prune_error_logged_not_raised_and_the_clear_out_carries_on(tmp_path, mo
         pruning(app)
         wait_for(lambda: len(calls) >= 2)
     assert app.notes == [] and logged(caplog, "folder locked")
+
+
+# --- background learning: Whisper, the idle loop, the hotkey -------------------------------------------
+
+WHISPER = "whisper-large-v3-turbo-Q8_0.gguf"
+LEARNING_THREADS = ("background-learning", "background-check", "whisper-setup")
+
+
+@pytest.fixture
+def learner(tmp_path, monkeypatch):
+    """`learner(**cfg)`: a learning_app with the background-learning state of a fresh app start, on a PC idle
+    for a long time and on mains power. teacher_ready=False: Whisper isn't there yet. Every status written to
+    state.json is in app.statuses. Background threads are ended when the test ends."""
+    monkeypatch.setattr(idle, "seconds_since_input", lambda: 1e6)
+    monkeypatch.setattr(idle, "on_mains_power", lambda: True)
+    apps = []
+
+    def make(teacher_ready=True, **cfg_over):
+        app = learning_app(tmp_path, FakeEngine(), **cfg_over)
+        del app._check_learned                     # the real one, on learned.toml and learned_auto.toml in tmp_path
+        app._learned_stamp = None
+        app.model_job, app.problem = "", None
+        app.context = types.SimpleNamespace(everywhere=[])
+        app.reload_if_changed = lambda: None
+        app._init_learning()
+        app.statuses = []
+        real = app.learning_store.set_status
+        app.learning_store.set_status = lambda text: (app.statuses.append(text), real(text))[1]
+        if teacher_ready:
+            app.teacher_path, app._teacher_tried = tmp_path / WHISPER, True
+        apps.append(app)
+        return app
+
+    yield make
+    for app in apps:
+        app._quitting.set()
+        if app.checker is not None:
+            app.checker.stop()
+    for t in threading.enumerate():
+        if t.name in LEARNING_THREADS:
+            t.join(5)
+
+
+class FakeTeacher:
+    """Whisper's engine as the checker uses it. transcribe() returns `text`; with block=True it waits until
+    kill() ends the process under it, then raises EngineError like a real engine does."""
+    device_type = "gpu"
+
+    def __init__(self, events: list, text: str = "", block: bool = False):
+        self.events, self.text, self.block = events, text, block
+        self.transcribing, self.killed = threading.Event(), threading.Event()
+
+    def warm(self) -> None:
+        pass
+
+    def wait_ready(self, timeout: float = 60.0) -> bool:
+        return True
+
+    def transcribe(self, samples):
+        self.transcribing.set()
+        if not self.block:
+            return self.text, 0.01
+        self.killed.wait(5)
+        raise EngineError("the engine process ended")
+
+    def unload(self) -> None:
+        self.events.append(("unload", threading.current_thread().name))
+
+    def kill(self) -> None:
+        self.events.append("kill")
+        self.killed.set()
+
+
+def kept(app, raw: str) -> str:
+    """A kept recording of `raw`, as a finished dictation leaves it."""
+    id = recordings.new_id(datetime.now())
+    recordings.save(app.paths.recordings_dir, speech(),
+                    recordings.Record(id, "", "notepad.exe", raw, [raw], raw, MODEL, "de"))
+    return id
+
+
+def fake_checker(result="nothing to check", runs=None, release=None):
+    """A Checker stand-in: run() notes should_stop() and returns `result` (after `release` is set, if given)."""
+    def run(should_stop):
+        if runs is not None:
+            runs.append(should_stop())
+        if release is not None:
+            release.wait(5)
+        return result
+    return types.SimpleNamespace(run=run, stop=release.set if release else lambda: None)
+
+
+def write_auto(app, *entries) -> None:
+    """learned_auto.toml with these automatic fixes (the Store writes it in the shape of learned.toml)."""
+    app.paths.learned_auto_file.parent.mkdir(parents=True, exist_ok=True)
+    app.paths.learned_auto_file.write_text(learn.dumps(entries), "utf-8")
+
+
+def add_learned(app, *entries) -> None:
+    app.paths.learned_file.parent.mkdir(parents=True, exist_ok=True)
+    learn.add(app.paths.learned_file, list(entries))
+
+
+def finish_check(app) -> None:
+    app._check_thread.join(5)
+    assert not app._check_thread.is_alive()
+
+
+# --- the hotkey --------------------------------------------------------------------------------------
+
+def test_hotkey_during_check_stops_teacher_first(learner):
+    """The hotkey while Whisper is in the middle of a recording: its process is killed at once, before the
+    microphone opens, and the hotkey never waits for that Whisper call (nor calls unload(), which would)."""
+    app = learner()
+    kept(app, "send the mail t campaign")
+    events = []
+    whisper = FakeTeacher(events, block=True)
+    app._new_teacher_engine = lambda spec: whisper
+    app._learning_tick()
+    assert whisper.transcribing.wait(5)                   # the check is waiting for Whisper
+    stop = app.checker.stop
+    app.checker.stop = lambda: (events.append("stop"), stop())
+
+    def start():
+        events.append("microphone")
+        raise OSError("test: no microphone")              # the dictation ends here: nothing more to fake
+
+    app.recorder = types.SimpleNamespace(start=start)
+    me = threading.current_thread().name
+    t0 = time.monotonic()
+    app._on_hotkey()
+    assert time.monotonic() - t0 < 1
+    finish_check(app)
+    assert [e for e in events if isinstance(e, str)] == ["stop", "kill", "microphone"]
+    assert ("unload", "background-check") in events and ("unload", me) not in events   # the checker's own thread
+    assert app.learning_paused is None                    # stopped by the user: not a crash, learning goes on
+
+
+def test_check_starting_just_as_the_hotkey_is_pressed_stops_too(learner):
+    """Checker.run begins by clearing an earlier stop(), so a check that starts right after the hotkey must
+    still see the user is back, also before the app's state says "recording"."""
+    app = learner()
+    assert app._should_stop_check() is False
+    app.recorder = types.SimpleNamespace(start=lambda: (_ for _ in ()).throw(OSError("test: no microphone")))
+    app._on_hotkey()                                      # no check running: nothing to stop, no error
+    assert app.state == "idle" and app._should_stop_check() is True
+
+
+# --- when the check runs -----------------------------------------------------------------------------
+
+@pytest.mark.parametrize("change", ["recording", "busy", "model job", "user back", "battery", "gpu marker",
+                                    "learning off", "quitting"])
+def test_check_stops_when_a_condition_goes(learner, monkeypatch, change):
+    app = learner()
+    assert app._should_stop_check() is False
+    if change in ("recording", "busy"):
+        app.state = change
+    elif change == "model job":
+        app.model_job = "downloading 12%"
+    elif change == "user back":
+        monkeypatch.setattr(idle, "seconds_since_input", lambda: 5.0)
+    elif change == "battery":
+        monkeypatch.setattr(idle, "on_mains_power", lambda: False)
+    elif change == "gpu marker":                          # dictation itself crashed on the graphics card
+        app.paths.data_dir.mkdir(parents=True, exist_ok=True)
+        (app.paths.data_dir / GPU_MARKER).write_text("{}", "utf-8")
+    elif change == "learning off":
+        app.cfg = dataclasses.replace(app.cfg, learning_enabled=False)
+    else:
+        app._quitting.set()
+    assert app._should_stop_check() is True
+
+
+def test_idle_minutes_from_the_settings(learner, monkeypatch):
+    app = learner(idle_minutes=5)
+    monkeypatch.setattr(idle, "seconds_since_input", lambda: 299.0)
+    assert app._should_stop_check() is True
+    monkeypatch.setattr(idle, "seconds_since_input", lambda: 301.0)
+    assert app._should_stop_check() is False
+
+
+def test_idle_tick_runs_the_check_only_when_idle_and_says_why_once(learner, monkeypatch):
+    app = learner()
+    runs = []
+    checker = fake_checker(runs=runs)
+    app._make_checker = lambda: checker
+    monkeypatch.setattr(idle, "seconds_since_input", lambda: 10.0)
+    for _ in range(3):
+        app._learning_tick()
+    assert runs == [] and app.statuses == ["Waits until the PC is idle"]   # written once, not every 30 s
+    assert app.learning_store.status() == "Waits until the PC is idle"
+    monkeypatch.setattr(idle, "seconds_since_input", lambda: 1e6)
+    app._learning_tick()
+    finish_check(app)
+    app._learning_tick()
+    finish_check(app)
+    assert runs == [False, False] and app.checker is checker              # one Checker for the app run
+    assert app.notes == []
+
+
+def test_one_check_at_a_time(learner):
+    app = learner()
+    runs, release = [], threading.Event()
+    app._make_checker = lambda: fake_checker(runs=runs, release=release)
+    app._learning_tick()
+    app._learning_tick()                                  # the first one is still running
+    release.set()
+    finish_check(app)
+    assert runs == [False]
+
+
+def test_checker_error_pauses_until_restart(learner):
+    app = learner()
+    runs = []
+    make = app._make_checker = lambda: fake_checker("error: teacher crashed", runs=runs)
+    app._learning_tick()
+    finish_check(app)
+    assert app.learning_paused == "error: teacher crashed"
+    for _ in range(3):
+        app._learning_tick()
+    assert runs == [False] and app.statuses == [] and app.notes == []   # the checker's own status stands
+    restarted = learner()
+    restarted._make_checker = make
+    assert restarted.learning_paused is None
+    restarted._learning_tick()
+    finish_check(restarted)
+    assert runs == [False, False]
+
+
+def test_learning_off_says_so_and_neither_downloads_nor_checks(learner, monkeypatch):
+    calls = []
+    monkeypatch.setattr(teacher, "has_discrete_gpu", lambda cmd, timeout=30: calls.append(cmd) or True)
+    app = learner(teacher_ready=False, learning_enabled=False)
+    app._make_checker = lambda: calls.append("check")
+    app._learning_tick()
+    app._learning_tick()
+    assert app.statuses == ["Off"] and app._check_thread is None
+    assert not any(t.name == "whisper-setup" for t in threading.enumerate()) and calls == []
+
+
+def test_status_write_errors_are_only_logged(learner, monkeypatch, caplog):
+    app = learner()
+
+    def locked(text):
+        raise TimeoutError("the learning state is locked by another process")
+
+    app.learning_store.set_status = locked
+    monkeypatch.setattr(idle, "seconds_since_input", lambda: 1.0)
+    with caplog.at_level(logging.WARNING, logger="parakeet_dictate.app"):
+        app._learning_tick()
+    assert logged(caplog, "locked by another process") and app.notes == []
+
+
+def test_idle_check_every_30_seconds_by_default():
+    assert App.IDLE_EVERY_SECONDS == 30
+
+
+def test_idle_loop_ticks_on_its_timer_and_ends_on_quit(learner, monkeypatch):
+    monkeypatch.setattr(App, "IDLE_EVERY_SECONDS", 0.01)
+    app = learner()
+    ticks = []
+
+    def tick():
+        ticks.append(1)
+        if len(ticks) == 1:
+            raise RuntimeError("tick failed")             # logged; the loop carries on
+
+    app._learning_tick = tick
+    app._start_learning()
+    wait_for(lambda: len(ticks) >= 3)
+    app._quitting.set()
+    wait_for(lambda: not any(t.name == "background-learning" for t in threading.enumerate()))
+
+
+def test_quit_kills_a_running_check(learner):
+    app = learner()
+    stopped = []
+    app.checker = types.SimpleNamespace(stop=lambda: stopped.append(1))
+    app.engine = types.SimpleNamespace(unload=lambda: None, state="unloaded")
+    app.hotkeys = types.SimpleNamespace(stop=lambda: None)
+    [quit_item] = [i for i in app._menu().items if isinstance(i.text, str) and i.text.startswith("Quit")]
+    quit_item(types.SimpleNamespace(stop=lambda: None))
+    assert stopped == [1] and app._quitting.is_set()
+
+
+# --- Whisper's download ------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("frozen", [False, True])
+def test_no_gpu_skips_download(learner, monkeypatch, frozen):
+    asked, ensured = [], []
+    if frozen:
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(teacher, "has_discrete_gpu", lambda cmd, timeout=30: asked.append(cmd) or False)
+    monkeypatch.setattr(teacher, "ensure", lambda *a, **k: ensured.append(a))
+    app = learner(teacher_ready=False)
+    app._setup_teacher()
+    assert asked == [[sys.executable] if frozen else [sys.executable, "-m", "parakeet_dictate"]]
+    assert ensured == [] and app.teacher_path is None
+    assert app.statuses == ["Waiting for a graphics card"] and app.notes == []
+
+
+def test_download_shows_progress_then_ready(learner, monkeypatch, tmp_path):
+    monkeypatch.setenv("APPDATA", str(tmp_path / "roaming"))
+    monkeypatch.setattr(teacher, "has_discrete_gpu", lambda cmd, timeout=30: True)
+    calls = []
+
+    def ensure(teacher_dir, orca_dir, progress, *, learning_dir=None):
+        calls.append((teacher_dir, orca_dir, learning_dir))
+        for done in (0, 100, 410, 412, 1000):
+            progress(done, 1000)
+        return tmp_path / WHISPER
+
+    monkeypatch.setattr(teacher, "ensure", ensure)
+    app = learner(teacher_ready=False)
+    app._setup_teacher()
+    assert calls == [(app.paths.teacher_dir, tmp_path / "roaming" / "orca" / "speech-models", app.paths.learning_dir)]
+    assert app.statuses == ["Downloading Whisper 0%", "Downloading Whisper 10%", "Downloading Whisper 41%",
+                            "Whisper ready"]
+    assert app.teacher_path == tmp_path / WHISPER and app.notes == []
+
+
+def test_whisper_setup_starts_once_in_the_background(learner, monkeypatch):
+    calls, release = [], threading.Event()
+
+    def gpu(cmd, timeout=30):
+        calls.append(threading.current_thread().name)
+        release.wait(5)
+        return False
+
+    monkeypatch.setattr(teacher, "has_discrete_gpu", gpu)
+    app = learner(teacher_ready=False)
+    app._learning_tick()
+    wait_for(lambda: calls)
+    app._learning_tick()                                  # while it still runs
+    release.set()
+    wait_for(lambda: app.statuses == ["Waiting for a graphics card"])
+    app._learning_tick()                                  # done: not again in this app run
+    assert calls == ["whisper-setup"] and app._check_thread is None
+
+
+def test_download_failure_is_a_status_and_retried_at_the_next_start(learner, monkeypatch):
+    monkeypatch.setattr(teacher, "has_discrete_gpu", lambda cmd, timeout=30: True)
+    tries = []
+
+    def ensure(*a, **k):
+        tries.append(1)
+        raise OSError("no network")
+
+    monkeypatch.setattr(teacher, "ensure", ensure)
+    app = learner(teacher_ready=False)
+    app._learning_tick()
+    wait_for(lambda: app.statuses == ["Download failed: no network"])
+    app._learning_tick()
+    assert tries == [1] and app.teacher_path is None and app.notes == []
+    restarted = learner(teacher_ready=False)
+    restarted._learning_tick()
+    wait_for(lambda: tries == [1, 1])
+
+
+def test_quitting_ends_the_download(learner, monkeypatch):
+    monkeypatch.setattr(teacher, "has_discrete_gpu", lambda cmd, timeout=30: True)
+    app = learner(teacher_ready=False)
+
+    def ensure(teacher_dir, orca_dir, progress, **k):
+        progress(10, 1000)
+        app._quitting.set()
+        progress(20, 1000)                                # the download ends here
+        raise AssertionError("not reached")
+
+    monkeypatch.setattr(teacher, "ensure", ensure)
+    app._setup_teacher()
+    assert app.statuses == ["Downloading Whisper 1%"] and app.teacher_path is None
+
+
+# --- what the checker is given -----------------------------------------------------------------------
+
+@pytest.mark.parametrize("setting, model_languages, expected",
+                         [("auto", ("en",), "en"), ("auto", ("de", "en"), "auto"), ("de", ("de", "en"), "de")])
+def test_teacher_spec_language_terms_and_live_settings(learner, setting, model_languages, expected):
+    app = learner(dictionary=(("Keycloak", ""),), context_enabled=True)
+    app.context = types.SimpleNamespace(everywhere=["ss-core-service"])
+    add_learned(app, ("Zanjo", "zan jo"))
+    write_auto(app, ("Mailzzy", "MailT"))                 # automatic fixes are not "your" terms
+    app._check_learned()
+    app.model = dataclasses.replace(app.model, languages=model_languages)
+    specs = []
+    app._new_teacher_engine = lambda spec: specs.append(spec) or FakeTeacher([], text="hello there")
+    checker = app._make_checker()
+    app.cfg = dataclasses.replace(app.cfg, language=setting, threads=3)   # Settings changed after it was made
+    kept(app, "hello there")
+    assert checker.run(lambda: False) == "Checked 1 dictation"
+    [spec] = specs
+    assert (spec.model, spec.language, spec.threads, spec.gpu_marker) == (str(app.teacher_path), expected, 3, "")
+    assert spec.prompt == "Keycloak, Zanjo, ss-core-service"
+
+
+def test_user_entries_are_yours_and_learned_toml_not_the_automatic_ones(learner):
+    app = learner(dictionary=(("Keycloak", ""), ("Mailzzy", "mail sey")))
+    add_learned(app, ("Zanjo", "zan jo"))
+    write_auto(app, ("Mailtrap", "mail t"))
+    app._check_learned()
+    assert app.learned and app.learned_auto
+    assert app._user_entries() == [("Keycloak", ""), ("Mailzzy", "mail sey"), *app.learned]
+
+
+def test_each_check_gets_a_new_teacher_engine(learner):
+    from parakeet_dictate.checker import teacher_spec
+    app = learner()
+    spec = teacher_spec(str(app.teacher_path), 4, "en", "")
+    a, b = app._new_teacher_engine(spec), app._new_teacher_engine(spec)
+    assert isinstance(a, Engine) and a is not b and a.state == "unloaded"   # a killed engine stays closed
+
+
+# --- automatic fixes in the clean-up -----------------------------------------------------------------
+
+def test_auto_fixes_used_by_cleaner(learner):
+    app = learner()
+    write_auto(app, ("Mailzzy", "MailT"))
+    app._check_learned()
+    assert "Mailzzy" in app.cleaner_for("x").clean("send the MailT campaign")
+    assert "Mailzzy" in app.cleaner.clean("send the MailT campaign")
+
+
+def test_a_new_auto_fix_is_picked_up_at_the_next_dictation(learner):
+    app = learner()
+    app._check_learned()
+    assert "Mailzzy" not in app.cleaner_for("x").clean("send the MailT campaign")
+    write_auto(app, ("Mailzzy", "MailT"))
+    app._check_learned()                                  # what each dictation does first
+    assert "Mailzzy" in app.cleaner_for("x").clean("send the MailT campaign")
+
+
+def test_user_learned_beats_auto_on_clash(learner):
+    app = learner(dictionary=(("Mailchimp", "mail c"),))
+    add_learned(app, ("Mailtrap", "MailT"))
+    write_auto(app, ("Mailzzy", "MailT"), ("Mailzzy", "mail c"))
+    app._check_learned()
+    cleaner = app.cleaner_for("x")
+    assert "Mailtrap" in cleaner.clean("send the MailT campaign")          # learned.toml beats the automatic fix
+    assert "Mailchimp" in cleaner.clean("open the mail c account")        # and so does your dictionary
+    assert "Mailzzy" not in cleaner.clean("send the MailT campaign via mail c")

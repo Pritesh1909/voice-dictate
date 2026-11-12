@@ -4,20 +4,23 @@ from __future__ import annotations
 import logging
 import os
 import queue
+import sys
 import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import pystray
 
 from . import APP_NAME, __version__
 from . import config as cfgmod
-from . import commands, context, correct, learn, models, output, recordings, winutil
+from . import autolearn, commands, context, correct, idle, learn, models, output, recordings, teacher, winutil
 from . import history as hist
 from .appsettings import settings_for
 from .audio import SR, Recorder, preprocess, resample, silence_stop_due, silence_stop_message
+from .checker import Checker
 from .engine import GPU_MARKER, Engine, EngineError, EngineSpec
 from .hotkey import HotkeyError, HotkeyThread, key_down
 from .hotkey import display as hotkey_display
@@ -38,6 +41,50 @@ PREVIEW_MIN_SECONDS = 0.6
 FAILED_NOTE = "Couldn't transcribe. The recording was kept: tray menu → Retry last recording."
 DOUBLED_NOTE = ("Retry couldn't tell which words were already typed, so it inserted them all. "
                 "Some words may now be doubled.")
+
+TEACHER_CONTEXT_TERMS = 50   # notes' terms (the top ones) given to Whisper next to your own dictionary's
+
+
+class _Quitting(Exception):
+    """Raised from the Whisper download's progress callback once the user quits: the download ends there."""
+
+
+def _mtime_ns(path: Path) -> int | None:
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+def _own_command() -> list[str]:
+    """This app's own command line, for teacher.has_discrete_gpu (it runs the app with --list-devices)."""
+    return [sys.executable] if getattr(sys, "frozen", False) else [sys.executable, "-m", "parakeet_dictate"]
+
+
+def _orca_models_dir() -> Path:
+    """Where Orca keeps its speech models: a Whisper download of its own there is used instead of ours."""
+    return Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming") / "orca" / "speech-models"
+
+
+class _TeacherSettings:
+    """The settings the checker reads, looked up in the app's current Config at each run (so a change in
+    Settings applies to the next check), except the language Whisper is told to expect."""
+
+    def __init__(self, app: "App"):
+        self._app = app
+
+    def __getattr__(self, name: str):
+        return getattr(self._app.cfg, name)
+
+    @property
+    def language(self) -> str:
+        """[model] language, but "en" for "auto" with an English-only dictation model: what it heard is
+        English. Otherwise as it is ("auto": Whisper finds the language itself)."""
+        app = self._app
+        lang = app.cfg.language
+        if lang == "auto" and app.model is not None and tuple(app.model.languages) == ("en",):
+            return "en"
+        return lang
 
 
 @dataclass(frozen=True, eq=False)
@@ -290,7 +337,11 @@ class Session:
 
 class App:
     history: "hist.History | None" = None   # recent dictations ([history]); set in __init__
+    learned_auto: list[tuple[str, str]] = []   # learned_auto.toml (background learning); set by _check_learned
+    checker: Checker | None = None           # the background checker, made at its first run
+    learning_paused: str | None = None       # the checker's "error: ..." result: no more checks until a restart
     PRUNE_EVERY_SECONDS = 24 * 3600         # how often old kept recordings are cleared out (tests shorten it)
+    IDLE_EVERY_SECONDS = 30                 # how often the background checker's conditions are looked at
 
     def __init__(self, paths: cfgmod.Paths):
         self.paths = paths
@@ -298,9 +349,10 @@ class App:
         self.sounds = winutil.Sounds(paths.data_dir)
         self.ico = write_ico(paths.data_dir / "icon.ico")
         self.learned: list[tuple[str, str]] = []   # learned.toml ("Correct last dictation…")
-        self._learned_stamp: int | None = None
+        self._learned_stamp: tuple | None = None   # (learned.toml, learned_auto.toml) mtimes
         self.cleaner = self._make_cleaner(self.cfg)
         self._check_learned()
+        self._init_learning()
         self.context = context.ContextScanner(paths.context_cache, *self._context_settings(self.cfg))
         self._vocab = self._vocabulary(self.cfg)      # notes' terms boosted in models that support it
         self.recorder = Recorder(self.cfg.input_device)
@@ -379,7 +431,6 @@ class App:
         Windows-only scan finds). If that finds nothing, search WSL too in the background.
         [model] folders are searched as well, either way. `keep`: the model in use stays picked when it
         is still found (only the list of folders changed)."""
-        from pathlib import Path
         if c.model_dir != "auto":
             fixed = models.inspect_path(Path(c.model_dir), "your settings")
             self.found = models.merge([fixed] if fixed else [], models.find_in(c.model_folders))
@@ -526,7 +577,6 @@ class App:
     def add_model(self, path) -> bool:
         """Check that `path` is a speech-to-text .gguf, add it to [model] folders in config.toml (comments
         kept) and switch to it. True when it was added (or was already listed)."""
-        from pathlib import Path
         from . import cfgedit
         p = Path(path)
         m = models.inspect(p, models.user_source(p))
@@ -540,8 +590,8 @@ class App:
             self._notify(f"Couldn't add {p.name} to your settings: {e}")
             return False
         with self._lock:
-            idle = self.state == "idle" and not self.model_job
-        if not idle:   # picked up (and listed under Model) at the next dictation
+            app_idle = self.state == "idle" and not self.model_job
+        if not app_idle:   # picked up (and listed under Model) at the next dictation
             self._notify(f"Added {m.name}. Pick it under Model in the tray menu once this dictation is done.")
             return True
         if m.in_wsl:
@@ -560,11 +610,12 @@ class App:
 
     def _make_cleaner(self, c: cfgmod.Config) -> Cleaner:
         self._cleaners: dict[tuple, Cleaner] = {}   # (program, languages) -> Cleaner, for these settings
-        return Cleaner.from_config(c, learned=self.learned)
+        return Cleaner.from_config(c, learned=self.learned + self.learned_auto)
 
     def cleaner_for(self, exe: str) -> Cleaner:
         """The clean-up for dictating into `exe` ("Code.exe"; "" = unknown): that program's
-        [dictionary.apps] terms before your own, and the filler words of the dictation language."""
+        [dictionary.apps] terms before your own, and the filler words of the dictation language.
+        Your [dictionary] comes before learned.toml, and both before the automatic fixes, so yours win."""
         langs = models.dictated_languages(self.model.languages if self.model else (), self.cfg.language)
         key = (cfgmod.app_key(exe), langs)
         cleaner = self._cleaners.get(key)
@@ -573,21 +624,21 @@ class App:
             log.info("clean-up for %s: %d program term(s), fillers for %s", exe or "an unknown program",
                      len(terms), "/".join(langs) or "an unknown language")
             cleaner = self._cleaners[key] = Cleaner.from_config(self.cfg, languages=langs, app_terms=terms,
-                                                                learned=self.learned)
+                                                                learned=self.learned + self.learned_auto)
         return cleaner
 
     def _check_learned(self) -> None:
-        """Pick up learned.toml when the correction window has saved to it (checked at each dictation)."""
-        try:
-            stamp = self.paths.learned_file.stat().st_mtime_ns
-        except OSError:
-            stamp = None
+        """Pick up learned.toml when the correction window has saved to it, and learned_auto.toml when
+        background learning has (checked at each dictation, and before each background check)."""
+        stamp = (_mtime_ns(self.paths.learned_file), _mtime_ns(self.paths.learned_auto_file))
         if stamp == self._learned_stamp:
             return
         self._learned_stamp = stamp
         self.learned = learn.load(self.paths.learned_file)
+        self.learned_auto = autolearn.load_active(self.paths.learned_auto_file)
         self.cleaner = self._make_cleaner(self.cfg)
-        log.info("learned words: %d entr%s", len(self.learned), "y" if len(self.learned) == 1 else "ies")
+        log.info("learned words: %d entr%s, %d automatic", len(self.learned),
+                 "y" if len(self.learned) == 1 else "ies", len(self.learned_auto))
 
     @staticmethod
     def _context_settings(c: cfgmod.Config) -> tuple:
@@ -877,6 +928,7 @@ class App:
                 self.overlay.flash("Click where the text should go", MUTED, 1500)   # the pill is in front
                 self.sounds.play("error")
                 return
+            self._stop_learning()   # first: Whisper's process ends now, the graphics card is free for dictation
             problem = self.reload_if_changed()
             if problem:
                 self._notify(problem)
@@ -1133,6 +1185,151 @@ class App:
         except Exception:
             log.exception("could not clear out old recordings")
 
+    # --- background learning: Whisper re-listens to kept recordings while the PC is idle -----------------
+    # Never a pop-up: what it is doing is the status line in Settings (state.json), problems go to the log.
+
+    def _init_learning(self) -> None:
+        self.learning_store = autolearn.Store(self.paths.learning_dir, self.paths.learned_auto_file)
+        self.teacher_path: Path | None = None   # Whisper's .gguf once it is there (and the PC has a graphics card)
+        self._teacher_tried = False             # Whisper's set-up ran in this app run (it is retried at the next)
+        self._check_thread: threading.Thread | None = None
+        self._status_said: str | None = None    # the last reason the idle loop wrote, so it is written once
+        self._dictation_asked_at = float("-inf")   # time.monotonic() of the last hotkey press
+
+    def _start_learning(self) -> None:
+        """Look at the checker's conditions now, then every IDLE_EVERY_SECONDS, in a daemon thread until quit."""
+        threading.Thread(target=self._learning_loop, daemon=True, name="background-learning").start()
+
+    def _learning_loop(self) -> None:
+        while True:
+            try:
+                self._learning_tick()
+            except Exception:
+                log.exception("background learning")
+            if self._quitting.wait(self.IDLE_EVERY_SECONDS):
+                return
+
+    def _learning_tick(self) -> None:
+        """Get Whisper (once per app run), then start a check when nothing stands in the way. When something
+        does, its reason is the status, written only when it changes. Until Whisper is ready the status is
+        its set-up's ("Downloading Whisper 41%"); after a check's error the checker's own status stands."""
+        if self.learning_paused or (self._check_thread is not None and self._check_thread.is_alive()):
+            return
+        if self.cfg.learning_enabled and not self._teacher_tried:
+            self._teacher_tried = True
+            threading.Thread(target=self._setup_teacher, daemon=True, name="whisper-setup").start()
+        c = self._learning_conditions()
+        reason = idle.why_not(c)
+        if reason is None:
+            self._start_check()
+        elif (c.teacher_ready or not c.enabled) and reason != self._status_said:
+            if self._learning_status(reason):
+                self._status_said = reason
+
+    def _learning_conditions(self) -> idle.Conditions:
+        since_hotkey = time.monotonic() - self._dictation_asked_at
+        return idle.Conditions(
+            enabled=self.cfg.learning_enabled, teacher_ready=self.teacher_path is not None,
+            app_idle=self.state == "idle" and not self.model_job,
+            idle_seconds=min(idle.seconds_since_input(), since_hotkey), idle_needed=self.cfg.idle_minutes * 60,
+            mains=idle.on_mains_power(), gpu_failed=(self.paths.data_dir / GPU_MARKER).exists(),
+            teacher_on_cpu=self.learning_paused == "error: no gpu")
+
+    def _should_stop_check(self) -> bool:
+        """The checker's should_stop: asked between recordings, with the conditions as they are now."""
+        return self._quitting.is_set() or idle.why_not(self._learning_conditions()) is not None
+
+    def _start_check(self) -> None:
+        with self._lock:
+            if self.state != "idle":
+                return
+            self._check_learned()   # fixes learned by the last check go into the clean-up it compares with
+        if self.checker is None:
+            self.checker = self._make_checker()
+        self._check_thread = threading.Thread(target=self._run_check, args=(self.checker,), daemon=True,
+                                              name="background-check")
+        self._check_thread.start()
+
+    def _run_check(self, checker: Checker) -> None:
+        """Thread body. An "error:" result (Whisper crashed, didn't load, or not on a graphics card) pauses
+        learning until the app starts again; the checker has written why to the status."""
+        result = checker.run(self._should_stop_check)
+        if result.startswith("error:"):
+            self.learning_paused = result
+            log.warning("background learning paused until the app restarts: %s", result)
+
+    def _make_checker(self) -> Checker:
+        return Checker(self.learning_store, self.paths.recordings_dir, self._new_teacher_engine, self.cleaner_for,
+                       self._teacher_terms, self._user_entries, _TeacherSettings(self), str(self.teacher_path))
+
+    @staticmethod
+    def _new_teacher_engine(spec: EngineSpec) -> Engine:
+        """A new engine at every check: one that stop() killed stays closed. Kept loaded until the checker
+        unloads it (no idle timer)."""
+        return Engine(spec, -1)
+
+    def _teacher_terms(self) -> list[str]:
+        """For Whisper's prompt, and the terms fixes may be learned for without Claude: your dictionary's,
+        learned.toml's, then the notes' top ones (judge.prompt_terms cuts the prompt to fit)."""
+        words = [term for term, _ in (*self.cfg.dictionary, *self.learned)]
+        if self.cfg.context_enabled:
+            words += list(self.context.everywhere)[:TEACHER_CONTEXT_TERMS]
+        return list(dict.fromkeys(words))
+
+    def _user_entries(self) -> list[tuple[str, str]]:
+        """Your entries (config.toml's [dictionary], learned.toml): an automatic fix clashing with one is dropped."""
+        return [*self.cfg.dictionary, *self.learned]
+
+    def _stop_learning(self) -> None:
+        """The hotkey was pressed: end a background check at once. Checker.stop kills Whisper's process
+        without taking a lock; never unload() it from here, that waits for the Whisper call in progress.
+        Also a check starting just now (Checker.run forgets an earlier stop) sees the user is back."""
+        self._dictation_asked_at = time.monotonic()
+        checker = self.checker
+        if checker is not None:
+            checker.stop()
+
+    def _setup_teacher(self) -> None:
+        """Thread body: Whisper for background learning, downloaded (886 MB) only on a PC with a discrete
+        graphics card. Orca's copy is used if it has one. A failure is tried again at the next app start."""
+        try:
+            if not teacher.has_discrete_gpu(_own_command()):
+                log.info("background learning: no discrete graphics card, Whisper is not downloaded")
+                self._learning_status("Waiting for a graphics card")
+                return
+            path = teacher.ensure(self.paths.teacher_dir, _orca_models_dir(), self._teacher_progress(),
+                                  learning_dir=self.paths.learning_dir)
+        except _Quitting:
+            return
+        except Exception as e:
+            log.warning("background learning: Whisper download failed: %s", e, exc_info=not isinstance(e, OSError))
+            self._learning_status(f"Download failed: {e}")
+            return
+        log.info("background learning: Whisper ready (%s)", path)
+        self.teacher_path = path
+        self._learning_status("Whisper ready")
+
+    def _teacher_progress(self):
+        last = [-1]
+
+        def cb(done: int, total: int) -> None:
+            if self._quitting.is_set():
+                raise _Quitting()
+            pct = int(done * 100 / max(total, 1))
+            if done < total and pct != last[0]:   # a finished (or already there) file says "Whisper ready"
+                last[0] = pct
+                self._learning_status(f"Downloading Whisper {pct}%")
+        return cb
+
+    def _learning_status(self, text: str) -> bool:
+        """The status line in Settings; best effort (False when it could not be written)."""
+        try:
+            self.learning_store.set_status(text)
+            return True
+        except (OSError, TimeoutError) as e:
+            log.warning("background learning: status not saved: %s", e)
+            return False
+
     def _recognition_failed(self, e: Exception, audio: np.ndarray, rate: int, partly_typed: bool) -> None:
         """Keep the recording (replacing an older failed one) so tray → Retry can transcribe it again."""
         if isinstance(e, EngineError):
@@ -1352,6 +1549,8 @@ class App:
 
         def quit_app(icon, item):
             self._quitting.set()
+            if self.checker is not None:
+                self.checker.stop()   # Whisper's process too
             self.engine.unload()
             self.hotkeys.stop()
             if self.overlay:
@@ -1402,6 +1601,7 @@ class App:
                 self._note(f"Ready. Press {self.cfg.hotkey} to dictate.")   # no pop-up at every start
             self.context.refresh()   # first look at the [context] folders, in the background
             self._start_prune()      # old kept recordings: now and then every day, in the background
+            self._start_learning()   # Whisper's download, then checks while the PC is idle, in the background
             winutil.trim_working_set()
 
         self.icon.run(setup=setup)

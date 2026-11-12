@@ -191,6 +191,14 @@ def test_empty_learned_auto_toml_loads(store):
     assert learn.load(store.learned_auto_file) == []
 
 
+def test_load_active_reads_learned_auto_toml(store):
+    assert autolearn.load_active(store.learned_auto_file) == []          # not written yet
+    two_sightings(store)
+    assert autolearn.load_active(store.learned_auto_file) == [("Mailzzy", ""), MAILZZY]
+    store.learned_auto_file.write_text("[dictionary\nhalf written", "utf-8")
+    assert autolearn.load_active(store.learned_auto_file) == []          # damaged: nothing, never an error
+
+
 def test_state_persists_across_store_objects(store):
     store.note("rec-1", [prop(MAILZZY)], [], "a", "2026-11-12 09:00")
     other = second_store(store)
