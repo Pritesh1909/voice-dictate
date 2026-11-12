@@ -112,6 +112,8 @@ def make_app(tmp_path, monkeypatch, cfg_text=""):
     app._engine_spec = lambda c: app.model
     app.notes = []
     app._notify = app.notes.append
+    app.quiet = []
+    app._note = app.quiet.append
     app.search_model = lambda: app.notes.append("searching WSL")
     app._adding_model = False
     # never a real pill window: a settings reload would otherwise create one
@@ -185,7 +187,7 @@ def test_add_model_file_edits_config_and_switches(tmp_path, monkeypatch):
     assert f"folders = ['{w}']" in text and text.index("folders") < text.index("[output]")
     assert config.parse(text).model_folders == (str(w),)
     assert app.model.path == w and app.cfg.model_folders == (str(w),)
-    assert app.notes[-1] == "Now using Whisper Small (3 languages)."
+    assert app.quiet[-1] == "Now using Whisper Small (3 languages)." and app.notes == []   # log only
     assert w in [m.path for m in app.found] and app._model_cache.read_text("utf-8") == str(w)
     # the same file again: not listed twice
     assert app.add_model(str(w)) and app.paths.config_file.read_text("utf-8").count(str(w)) == 1

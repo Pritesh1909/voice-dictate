@@ -3,7 +3,7 @@
 Offline push-to-talk dictation for Windows. It uses the speech models Orca already downloaded
 (**Parakeet TDT v2** by default; v3 and any newer model Orca adds show up in the tray menu automatically),
 runs them with the same engine Orca uses (transcribe.cpp, on the graphics card when there is one), removes filler words ("uh", "um", "ahh", …) and types the text into whatever window has focus.
-Nothing leaves the laptop, and no admin rights are needed.
+Your voice never leaves the laptop (only the optional *Learning in the background* can send short text, never audio, to Claude, and you can turn that off), and no admin rights are needed.
 
 ## Use
 
@@ -18,7 +18,7 @@ Nothing leaves the laptop, and no admin rights are needed.
 | New line / empty line | Say **"new line"** or **"new paragraph"** on its own, between two pauses |
 | Take back the last phrase | Say **"scratch that"** (or "delete that") on its own |
 | Stop without the hotkey | Say **"stop listening"** on its own |
-| Recognition failed | Tray icon → *Retry last recording* (or *Discard last recording*). The audio is kept in memory only, never on disk |
+| Recognition failed | Tray icon → *Retry last recording* (or *Discard last recording*). The audio for a retry is kept in memory only; recordings kept on disk for learning are a separate, optional thing (see *Learning in the background*) |
 | Send it straight away | Settings → General → Typing → *Press Enter after typing* |
 | Change settings | Tray icon → *Settings…* (applied as soon as the window closes) |
 
@@ -77,8 +77,8 @@ following Windows) with four pages, each made of titled groups:
 |---|---|
 | **General** | Start-up (start with Windows, sounds) · Microphone · Speech model (model, your model files and folders, runs on, language, *Find models*) · Typing · Pill (show, edge, distance, *Move the pill…*, *Reset*) |
 | **Shortcuts** | Dictate · Copy last dictation · Correct last dictation · History · hold time · Esc cancels |
-| **Improvements** | Dictionary (names and terms, "heard as", learned words) · Clean-up (fillers, repeated words, numbers, ticket prefixes) · Context words · Recognition (voice detector, audio clean-up, preferred words) |
-| **Extras** | Performance (memory, threads, pauses, longest dictation, *Free now*) · Spoken commands · Details · Privacy and files (log dictated text, keep a history, history length, *Open log*, *Open settings file*) |
+| **Improvements** | Dictionary (names and terms, "heard as", learned words) · Clean-up (fillers, repeated words, numbers, ticket prefixes) · Context words · Learning in the background (learn from my dictations, ask Claude, the automatic fixes with *Undo* and *Reset all*) · Recognition (voice detector, audio clean-up, preferred words) |
+| **Extras** | Performance (memory, threads, pauses, longest dictation, *Free now*) · Spoken commands · Details · Privacy and files (log dictated text, keep a history, history length, keep recordings for learning and for how many days, *Delete all* / *Open folder* for the recordings, *Open log*, *Open settings file*) |
 
 - **Change…** next to a shortcut listens for the next key combination: Ctrl/Alt/Shift/Win plus one key
   (F-keys may be used alone). Esc cancels; Backspace goes back to Ctrl+Q for Dictate and removes the
@@ -145,6 +145,72 @@ than four words and swaps of one ordinary word for another ("their" → "there")
 *Save* writes the ticked ones to `%APPDATA%\ParakeetDictate\learned.toml` (same layout as `[dictionary]`;
 your `config.toml` is never rewritten). They apply from the next dictation, after your own `[dictionary]`.
 The window runs as its own small process, so it can't disturb the tray app.
+
+### Learning in the background
+
+The model sometimes writes a name the same wrong way again and again ("MailT" for **Mailzzy**). The app
+can find these by itself: it keeps your recent dictations, and while the PC is otherwise idle a bigger
+speech model (Whisper Large v3 Turbo, "the teacher") listens to them again. Where the two models
+disagree, a fix is worked out; once the same fix has shown up in **2 different recordings** it is used from
+the next dictation on. It is on by default, never shows a pop-up and never gets in the way of dictating.
+
+- **What is saved, and where.** These files contain what you said. Each finished dictation (typed, or put
+  on the clipboard) is kept as a 16 kHz audio file plus a `.json` record next to it with the text as heard
+  and as typed, in `%LOCALAPPDATA%\ParakeetDictate\recordings\*.json` (and `.wav`). They are deleted after
+  **14 days** (`keep_days`), and if the folder grows past **1.5 GB** (`max_recordings_mb`) the oldest go
+  first. On a PC where learning can never run (no discrete graphics card, or one that dictation has crashed)
+  no recordings are kept. What the checker has looked at is in
+  `%LOCALAPPDATA%\ParakeetDictate\learning\checked.jsonl`: the text of the last **5000** checked dictations
+  (what Parakeet heard, what Whisper heard and the judged text), with no time limit. *Delete all* and turning
+  learning off leave it alone; to remove it, delete that file.
+- **Your voice never leaves the PC.** The audio is heard only by the two models on this PC. The only thing
+  that can go out is **text**: when two transcripts disagree, both are sent to Claude (`claude -p`, the Claude
+  Code you are already signed in to, no API key) to say which one is right. That is a few cents a day at most:
+  one call settles up to 30 dictations, and there are at most **20 calls a day** (`claude_calls_per_day`).
+  If Claude isn't installed (or *Ask Claude* is off), only fixes to names you already have (your dictionary,
+  your learned words and names from your notes) are learned, and the other disagreements from that run are
+  not looked at again. If Claude runs but can't answer (not signed in, a usage limit, offline, too slow), or
+  the day's calls are used up, the dictations still waiting for Claude are left for later: the next day, or
+  the next time the app starts.
+- **When it runs.** Only when all of these are true: learning is on and Whisper is ready; no dictation is going
+  on; there has been no keyboard or mouse input for **3 minutes** (`idle_minutes`); the PC is on mains power
+  (not on battery); and the PC has a discrete graphics card (Whisper runs on it, never on the CPU, so
+  dictation is never slowed down). The moment you press the dictation shortcut the check stops and Whisper
+  is shut down, so dictation starts at once. If Whisper ever crashes, learning pauses until the app is
+  restarted; it never switches dictation to the CPU.
+- **Whisper.** It is one download of 886 MB, started the first time the app runs with learning on, and only on a
+  PC with a discrete graphics card that dictation hasn't crashed. Turning learning off stops a download in
+  progress; it carries on where it stopped when learning is turned on again. It is stored in `%LOCALAPPDATA%\ParakeetDictate\teacher\whisper-large-v3-turbo\`
+  (checked against its SHA-256 before use) and never appears in the Model menu. If Orca has already
+  downloaded the same Whisper build, that copy is reused instead and nothing is downloaded. Uninstalling
+  removes ours.
+- **What gets learned.** Only spelling fixes for names and terms ("MailT" → **Mailzzy**), the same kind as in
+  *Learn from corrections*; punctuation, rewording and swaps of ordinary words are ignored, and so is a
+  recording where Whisper only wrote nonsense on noise. The fixes are in
+  `%APPDATA%\ParakeetDictate\learned_auto.toml`, which also remembers the ones you undid, so after a
+  reinstall they are still listed and undone ones stay undone. Your `config.toml` and `learned.toml` are
+  never touched, and when one of your entries and an automatic fix clash, yours wins.
+- **See and undo them.** Settings → Improvements → **Learning in the background** shows a status line (for example
+  "Waits until the PC is idle" or "Checked 12 dictations, learned 1 fix") and every automatic fix: what was
+  heard, what it becomes, the day it was learned and how often it was seen. **Undo** removes one at once, and a
+  fix you undo is **never learned again**. **Reset all** (it asks first) removes them all, and none of them is learned again either.
+- **Turn it off.** Settings → Improvements → Learning in the background → *Learn from my dictations* off
+  (`[learning] enabled = false`): nothing is checked, downloaded or saved from then on. To keep learning but
+  never ask Claude, turn *Ask Claude to judge disagreements* off. To keep no audio at all, turn off Settings →
+  Extras → Privacy and files → *Keep recordings for learning*; *Delete all* in the same group erases the
+  ones already saved. Neither removes the checked text in `...\learning\checked.jsonl`: delete that file.
+
+All the settings are in `[learning]`:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` | Check kept recordings in the background and learn fixes from them |
+| `keep_recordings` | `true` | Keep each dictation's audio and record (needed for learning; `false` = no audio is kept) |
+| `keep_days` | `14` | Delete kept recordings older than this (1 to 365) |
+| `max_recordings_mb` | `1500` | Keep at most this much, the oldest deleted first (100 to 20000) |
+| `idle_minutes` | `3` | Minutes without keyboard or mouse input before a check starts (1 to 120) |
+| `use_claude` | `true` | Let Claude judge disagreements (text only, never audio); `false` = only fixes to names you already have (dictionary, learned words, names from your notes) are learned |
+| `claude_calls_per_day` | `20` | At most this many Claude calls a day (0 to 200, 0 = never) |
 
 ### Context words
 
@@ -284,13 +350,17 @@ A new dictation within the 30 s reuses the loaded model and starts instantly. Ch
   `%LOCALAPPDATA%\ParakeetDictate\`. Recognised text is **not** logged unless `[output] log_transcripts = true`.
 - Dictation history: in memory only by default; `%LOCALAPPDATA%\ParakeetDictate\history.jsonl` only with
   `[history] keep = "disk"`.
+- Learning in the background (see above): automatic fixes in `%APPDATA%\ParakeetDictate\learned_auto.toml`;
+  kept recordings (audio, and the text as heard and typed) in `%LOCALAPPDATA%\ParakeetDictate\recordings\`;
+  the text of the last 5000 checked dictations in `...\learning\checked.jsonl`;
+  Whisper in `...\teacher\whisper-large-v3-turbo\`.
 
 ## Install
 
 Run `build\installer\ParakeetDictate-Setup-<version>.exe`. It installs for the current user only (no admin)
 into `%LOCALAPPDATA%\Programs\Parakeet Dictate`, adds a Start menu entry, can start with Windows, and has an
 uninstaller in *Settings → Apps*. The app bundles its own Python, so the target PC needs nothing else.
-Uninstalling keeps your settings (`%APPDATA%\ParakeetDictate`) and removes logs and any copied or downloaded model.
+Uninstalling keeps your settings (`%APPDATA%\ParakeetDictate`, including the automatic fixes) and removes logs, saved recordings and any copied or downloaded model (Whisper too).
 
 ## Where the model comes from (`[model] dir = "auto"`)
 

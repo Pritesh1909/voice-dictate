@@ -50,6 +50,26 @@ class Paths:
         """Recent dictations, only with [history] keep = "disk"."""
         return self.data_dir / "history.jsonl"
 
+    @property
+    def recordings_dir(self) -> Path:
+        """Kept recordings (a .wav and a .json record each), only with [learning] keep_recordings."""
+        return self.data_dir / "recordings"
+
+    @property
+    def learning_dir(self) -> Path:
+        """What the background checker keeps between runs (its state and the list of recordings it has read)."""
+        return self.data_dir / "learning"
+
+    @property
+    def teacher_dir(self) -> Path:
+        """The Whisper model the background checker listens with (not a dictation model: not in the Model menu)."""
+        return self.data_dir / "teacher"
+
+    @property
+    def learned_auto_file(self) -> Path:
+        """Fixes found by the background checker (learned.toml stays the user's own)."""
+        return self.config_dir / "learned_auto.toml"
+
     @classmethod
     def default(cls) -> "Paths":
         roaming = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
@@ -132,6 +152,13 @@ class Config:
     apps: tuple[tuple[str, AppOverride], ...]      # (exe name, lower case, without ".exe"; overrides)
     history_keep: str        # off | session (memory only) | disk (history.jsonl)
     history_max_items: int
+    learning_enabled: bool   # check kept recordings in the background and learn fixes from them
+    keep_recordings: bool    # keep each dictation's audio (and a record of it) in recordings/
+    keep_days: int           # delete kept recordings older than this
+    max_recordings_mb: int   # keep at most this much audio, the oldest deleted first
+    idle_minutes: int        # the checker waits for this long without keyboard or mouse input
+    use_claude: bool         # may send text (never audio) to Claude to confirm a fix
+    claude_calls_per_day: int   # 0 = never ask Claude
     source_mtime: float = field(default=0.0, compare=False)
 
 
@@ -238,6 +265,13 @@ def parse(text: str, defaults_text: str | None = None) -> Config:
         apps=_apps(d),
         history_keep=_get(d, "history", "keep", str, lambda v: v in ("off", "session", "disk")),
         history_max_items=_get(d, "history", "max_items", int, lambda v: 10 <= v <= 5000),
+        learning_enabled=_get(d, "learning", "enabled", bool),
+        keep_recordings=_get(d, "learning", "keep_recordings", bool),
+        keep_days=_get(d, "learning", "keep_days", int, lambda v: 1 <= v <= 365),
+        max_recordings_mb=_get(d, "learning", "max_recordings_mb", int, lambda v: 100 <= v <= 20000),
+        idle_minutes=_get(d, "learning", "idle_minutes", int, lambda v: 1 <= v <= 120),
+        use_claude=_get(d, "learning", "use_claude", bool),
+        claude_calls_per_day=_get(d, "learning", "claude_calls_per_day", int, lambda v: 0 <= v <= 200),
     )
 
 

@@ -16,6 +16,10 @@ import sys  # noqa: E402
 
 def main() -> int:
     multiprocessing.freeze_support()
+    if len(sys.argv) >= 2 and sys.argv[1] == "--list-devices":
+        # Before anything else: no settings, log or folders are touched. A missing file name must not fall
+        # through to starting the tray app.
+        return list_devices(sys.argv[2]) if len(sys.argv) >= 3 else 2
     from . import APP_NAME, winutil
     from .config import ConfigError, Paths
 
@@ -61,6 +65,39 @@ def main() -> int:
     except Exception:
         log.exception("fatal")
         raise
+    return 0
+
+
+def list_devices(out_path: str) -> int:
+    """ParakeetDictate.exe --list-devices out.json : write the speech engine's devices to out.json as JSON,
+    [[type, name], ...] (type is "gpu" for a discrete card, "igpu" or "cpu"), and exit 0. On any error out.json
+    is not written, the error goes to out.json.err (and to stderr, when there is one), and the exit code is 1.
+    The tray app never loads the engine itself, so it asks a short-lived process like this one
+    (teacher.has_discrete_gpu). Files, not stdout or stderr: the windowed .exe has neither."""
+    import json
+
+    tmp = out_path + ".tmp"
+    try:
+        import transcribe_cpp as tc
+        tc.set_log_callback(None)  # native logging is not wanted
+        text = json.dumps([[d.device_type, d.name] for d in tc.backends()])
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, out_path)  # whole or not at all
+    except Exception as e:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        error = f"{type(e).__name__}: {e}"
+        try:
+            with open(out_path + ".err", "w", encoding="utf-8") as f:   # the caller logs this
+                f.write(error)
+        except OSError:
+            pass
+        if sys.stderr is not None:
+            print(error, file=sys.stderr)
+        return 1
     return 0
 
 

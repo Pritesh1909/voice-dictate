@@ -157,7 +157,7 @@ def test_your_dictionary_beats_learned_beats_context(keys):
 def test_learned_file_is_picked_up_when_it_changes(tmp_path):
     paths = config.Paths(tmp_path / "r", tmp_path / "l")
     paths.ensure()
-    app = NS(paths=paths, cfg=config.parse(""), learned=[], _learned_stamp=None, model=None)
+    app = NS(paths=paths, cfg=config.parse(""), learned=[], learned_auto=[], _learned_stamp=None, model=None)
     app._make_cleaner = lambda c: App._make_cleaner(app, c)
     app.cleaner = app._make_cleaner(app.cfg)
     App._check_learned(app)

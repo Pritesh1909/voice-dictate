@@ -283,6 +283,8 @@ def fake_app(monkeypatch, keys_held=0, lost=False, silent_for=0.0, silence_stop=
     a = types.SimpleNamespace(cfg=cfg, recorder=rec, hotkeys=types.SimpleNamespace(vk=0x51), _session=1,
                               state="recording", _lock=threading.Lock(), notes=[], finished=[])
     a._notify = a.notes.append
+    a.quiet = []
+    a._note = a.quiet.append
 
     def finish():
         a.finished.append(True)
@@ -296,7 +298,8 @@ def fake_app(monkeypatch, keys_held=0, lost=False, silent_for=0.0, silence_stop=
 def test_tap_mode_stops_after_silence(monkeypatch):
     a = fake_app(monkeypatch, silent_for=61)
     appmod.App._watch_release(a, 1)
-    assert a.finished and a.notes == ["Stopped after a minute of silence."]
+    # stopping for silence is only logged: no Windows notification
+    assert a.finished and a.notes == [] and a.quiet == ["Stopped after a minute of silence."]
 
 
 def test_recent_speech_postpones_silence_stop(monkeypatch):

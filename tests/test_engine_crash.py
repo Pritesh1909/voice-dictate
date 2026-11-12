@@ -3,6 +3,7 @@
 import json
 import multiprocessing
 import threading
+import time
 
 import numpy as np
 import pytest
@@ -200,3 +201,145 @@ def test_read_gpu_marker(tmp_path):
     assert read_gpu_marker(str(p)) == {}
     p.write_text('{"device": "X"}', "utf-8")
     assert read_gpu_marker(str(p)) == {"device": "X"}
+
+
+# --- kill(): the hotkey ends the Whisper teacher at once ----------------------------------------------
+
+class _KillableChild:
+    """The child's pipe end plus what terminate() does to a real process: `killed` is set."""
+    def __init__(self, conn):
+        self.conn = conn
+        self.killed = threading.Event()
+
+    def close(self):
+        pass
+
+
+class _KillableProcess:
+    """A fake engine process that terminate() really ends: its thread stops and closes its pipe end, as
+    Windows does for a terminated process (so the parent's poll/recv see the pipe end, not a reply)."""
+    def __init__(self, target, args, daemon=True, name=""):
+        self.child, spec = args
+        self.exitcode = None
+        self._t = threading.Thread(target=self._run, args=(target, spec), daemon=True)
+
+    def _run(self, target, spec):
+        try:
+            target(self.child, spec)
+        finally:
+            self.child.conn.close()
+            self.exitcode = 1 if self.child.killed.is_set() else 0
+
+    def start(self):
+        _KillCtx.started += 1
+        self._t.start()
+
+    def is_alive(self):
+        return self._t.is_alive()
+
+    def join(self, timeout=None):
+        self._t.join(timeout)
+
+    def terminate(self):
+        self.child.killed.set()
+
+
+class _KillCtx:
+    Process = _KillableProcess
+    started = 0
+
+    @staticmethod
+    def Pipe():
+        a, b = multiprocessing.Pipe()
+        return a, _KillableChild(b)
+
+
+def killable_worker(hang=""):
+    """A fake engine._worker on a graphics card that hangs while loading or decoding until terminated."""
+    def worker(child, spec):
+        conn = child.conn
+        conn.send(("loading", "gpu", "Fake RTX"))
+        if hang == "load":
+            child.killed.wait(10)
+            return
+        conn.send(("ready", 0.1, "on Fake RTX", 0, ("gpu", "Fake RTX"), ""))
+        while not child.killed.is_set():
+            if not conn.poll(0.02):
+                continue
+            msg = conn.recv()
+            if msg[0] == "quit":
+                return
+            if msg[0] == "decode":
+                if hang == "decode":
+                    child.killed.wait(10)
+                    return
+                conn.send(("text", "hello from Fake RTX", 0.01))
+    return worker
+
+
+@pytest.fixture
+def killable(monkeypatch, tmp_path):
+    """An Engine whose fake process can be killed; returns (engine, marker path)."""
+    monkeypatch.setattr(eng.mp, "get_context", lambda kind: _KillCtx)
+    monkeypatch.setattr(_KillCtx, "started", 0)
+    marker = tmp_path / "gpu-failed.json"
+
+    def make(hang="", device="auto"):
+        monkeypatch.setattr(eng, "_worker", killable_worker(hang))
+        return Engine(EngineSpec("m.gguf", 4, device=device, gpu_marker=str(marker)), unload_after=-1), marker
+    return make
+
+
+def _kill_soon(e, after=0.2):
+    t = threading.Timer(after, e.kill)
+    t.start()
+    return t
+
+
+def test_kill_ends_a_long_transcribe_at_once(killable):
+    e, marker = killable(hang="decode")
+    e.warm()
+    assert e.wait_ready(5)
+    _kill_soon(e)
+    t0 = time.monotonic()
+    with pytest.raises(EngineError, match="stopped"):
+        e.transcribe(AUDIO)
+    assert time.monotonic() - t0 < 1.5
+    assert not marker.exists()          # a kill is not a GPU crash: dictation stays on the card
+    assert _KillCtx.started == 1        # and not retried on the CPU
+    e.unload()
+
+
+def test_a_killed_engine_never_loads_again(killable):
+    e, marker = killable()
+    assert e.transcribe(AUDIO)[0] == "hello from Fake RTX"
+    e.kill()
+    with pytest.raises(EngineError, match="stopped"):
+        e.transcribe(AUDIO)
+    with pytest.raises(EngineError, match="stopped"):
+        e.warm()
+    e.unload()
+    with pytest.raises(EngineError, match="stopped"):
+        e.transcribe(AUDIO)
+    assert _KillCtx.started == 1 and not marker.exists()
+
+
+def test_kill_while_loading_ends_the_wait(killable):
+    e, marker = killable(hang="load")
+    e.warm()
+    _kill_soon(e)
+    t0 = time.monotonic()
+    assert e.wait_ready(10) is False
+    assert time.monotonic() - t0 < 1.5
+    time.sleep(0.2)                     # the loading thread sees the pipe end: no CPU retry, no marker
+    assert _KillCtx.started == 1 and not marker.exists()
+    e.unload()
+
+
+def test_kill_is_harmless_when_nothing_runs(killable):
+    e, marker = killable()
+    e.kill()
+    e.kill()
+    with pytest.raises(EngineError):
+        e.warm()
+    assert _KillCtx.started == 0
