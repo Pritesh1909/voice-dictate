@@ -100,6 +100,7 @@ class Config:
     log_transcripts: bool
     overlay: bool
     overlay_position: str
+    overlay_margin: int     # pixels from the screen edge; -1 = default
     input_device: str
     silence_stop_seconds: int  # 0 = off
     commands_enabled: bool
@@ -186,6 +187,7 @@ def parse(text: str, defaults_text: str | None = None) -> Config:
         log_transcripts=_get(d, "output", "log_transcripts", bool),
         overlay=_get(d, "overlay", "enabled", bool),
         overlay_position=_get(d, "overlay", "position", str, lambda v: v in ("top", "bottom")),
+        overlay_margin=_get(d, "overlay", "margin", int, lambda v: -1 <= v <= 600),
         input_device=_get(d, "audio", "input_device", str),
         silence_stop_seconds=_get(d, "audio", "silence_stop_seconds", int, lambda v: v == 0 or 5 <= v <= 3600),
         commands_enabled=_get(d, "commands", "enabled", bool),

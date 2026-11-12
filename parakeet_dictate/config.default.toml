@@ -137,6 +137,9 @@ log_transcripts = false
 enabled = true
 # "bottom" or "top" of the screen.
 position = "bottom"
+# How far from that edge of the screen, in pixels (at 100% display scaling). -1 = 24 at the top, 56 at
+# the bottom. At the top, 60-80 puts it just below most window title bars and tab strips.
+margin = -1
 
 [audio]
 # Part of the microphone's name, e.g. "Headset". Empty = the Windows default input.

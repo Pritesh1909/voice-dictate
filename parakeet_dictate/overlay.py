@@ -51,6 +51,14 @@ def _dpi_scale() -> float:
         return 1.0
 
 
+def pill_y(top: int, bottom: int, height: int, position: str, margin: int, scale: float) -> int:
+    """Screen y of the pill: `margin` pixels (at 100% scaling) below the top of the work area or above
+    the bottom (the taskbar is outside the work area). margin < 0 keeps the defaults: 24 top, 56 bottom."""
+    if position == "top":
+        return top + int((24 if margin < 0 else margin) * scale)
+    return bottom - height - int((56 if margin < 0 else margin) * scale)
+
+
 def fit_tail(text: str, max_chars: int) -> str:
     """The end of `text` in at most max_chars characters: the newest words matter most."""
     text = " ".join(text.split())
@@ -75,6 +83,7 @@ class Overlay:
     def __init__(self, position: str = "bottom", wide: bool = False):
         self.position = position
         self.wide = wide            # live streaming: room for the words heard but not typed yet
+        self.margin = -1            # pixels from the screen edge (at 100% scaling); -1 = 24 at the top, 56 at the bottom
         self._preview_fn = lambda: ""
         self._ready = threading.Event()
         self._root: tk.Tk | None = None
@@ -151,7 +160,7 @@ class Overlay:
         user32.GetMonitorInfoW(mon, ctypes.byref(mi))
         wa = mi.rcWork
         x = (wa.left + wa.right - self.w) // 2
-        y = wa.top + int(24 * self.s) if self.position == "top" else wa.bottom - self.h - int(56 * self.s)
+        y = pill_y(wa.top, wa.bottom, self.h, self.position, self.margin, self.s)
         user32.SetWindowPos(self.hwnd, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW)
 
     def _show(self, mode: str, **kw) -> None:

@@ -318,6 +318,8 @@ class App:
         self._session = 0
         self.current: Session | None = None
         self.overlay: Overlay | None = Overlay(self.cfg.overlay_position, wide=self.cfg.stream_while_speaking) if self.cfg.overlay else None
+        if self.overlay:
+            self.overlay.margin = self.cfg.overlay_margin
 
     # --- model ------------------------------------------------------------------------------------
 
@@ -544,7 +546,7 @@ class App:
             self.overlay.close()
             self.overlay = Overlay(c.overlay_position, wide=c.stream_while_speaking) if c.overlay else None
         if self.overlay:
-            self.overlay.position = c.overlay_position
+            self.overlay.position, self.overlay.margin = c.overlay_position, c.overlay_margin
         if c.model_dir != self.cfg_model_dir:
             self.cfg_model_dir = c.model_dir
             self._resolve_model(c)
