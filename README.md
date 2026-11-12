@@ -12,21 +12,26 @@ Nothing leaves the laptop, and no admin rights are needed.
 | Dictate (tap mode) | Press **Ctrl+Q**, speak, press **Ctrl+Q** again |
 | Dictate (hold mode) | Hold **Ctrl+Q** while speaking, then let go |
 | Cancel a recording | **Esc** (nothing is typed) |
-| Retype the last result | Tray icon → *Copy last dictation*, then paste |
-| Fix a word for next time | Tray icon → *Correct last dictation…*: fix the text, tick the spellings to learn, *Save* |
+| Retype the last result | Tray icon → *Copy last dictation*, then paste — or set a shortcut for it (Settings → Shortcuts) |
+| Fix a word for next time | Tray icon → *Correct last dictation…* (or its shortcut): fix the text, tick the spellings to learn, *Save* |
 | New line / empty line | Say **"new line"** or **"new paragraph"** on its own, between two pauses |
 | Take back the last phrase | Say **"scratch that"** (or "delete that") on its own |
 | Stop without the hotkey | Say **"stop listening"** on its own |
 | Recognition failed | Tray icon → *Retry last recording* (or *Discard last recording*). The audio is kept in memory only, never on disk |
-| Send it straight away | `[output] press_enter = true` presses Enter after the text is typed |
-| Change settings | Tray icon → *Settings…* (applied on the next dictation) |
+| Send it straight away | Settings → General → Typing → *Press Enter after typing* |
+| Change settings | Tray icon → *Settings…* (applied as soon as the window closes) |
+
+The tray menu only holds what is used day to day: *Copy last dictation*, *Correct last dictation…*,
+*Settings…* and *Quit* (with the shortcut shown next to an item that has one). *Retry* / *Discard last
+recording*, *Done moving the pill* and *Download Parakeet v2 model* appear only when they apply.
+Everything else is in the Settings window.
 
 A small pill at the bottom of the screen you're working on shows **● Listening** (with a live mic
 meter and timer), then **Transcribing…**, then **✓ Typed** (or *Cancelled* / *No speech heard*). It stays on
 top of all windows, never takes focus and lets clicks pass through. Turn it off or move it to the top with
 `[overlay]` in the settings. When the microphone clips it turns red and reads **Too loud**.
 
-**Put the pill anywhere:** tray → *Move the pill…* shows it with "Drag me · Enter to save · Esc to cancel".
+**Put the pill anywhere:** Settings → General → Pill → *Move the pill…* shows it with "Drag me · Enter to save · Esc to cancel".
 Drag it with the left mouse button to any spot on any monitor, then press **Enter**, double-click it, or pick
 *Done moving the pill* in the tray menu (Esc cancels). Only while you move it does the pill take the mouse
 and keyboard; afterwards it is click-through and never-focused again, and the window you were in gets the
@@ -34,7 +39,7 @@ focus back. No dictation starts meanwhile: the hotkey just saves the position an
 kept in `%LOCALAPPDATA%\ParakeetDictate\pill_position.json` (the monitor's name and where on it, as a share
 of the screen, so a resolution or scaling change keeps it in place) and the pill always stays fully on that
 screen. With a saved spot the pill **stays on that monitor** instead of following the window you type into;
-when that monitor isn't connected it goes back to its usual place. Tray → *Reset pill position* forgets it.
+when that monitor isn't connected it goes back to its usual place. *Reset* next to it forgets it.
 
 In tap mode a dictation stops by itself (and types what you said) after a minute without speech
 (`[audio] silence_stop_seconds`, 0 = off). If the microphone is unplugged mid-dictation it stops the same way;
@@ -57,20 +62,28 @@ Ctrl+Q is taken over system-wide while the app runs, so other apps no longer rec
 ### Settings window
 
 Tray menu → **Settings…** (or double-click the tray icon) opens a Windows 11 style window (light or dark,
-following Windows) with a page per area: General (dictation shortcut, hold time, Esc, start with Windows,
-sounds), Microphone, Speech model (including **Custom model folders**: extra .gguf files or folders to find
-models in), Typing, Clean-up (fillers, dictionary, "heard as"), Pill, Commands and Context words.
+following Windows) with four pages, each made of titled groups:
 
-- **Change…** next to the shortcut listens for the next key combination: Ctrl/Alt/Shift/Win plus one key
-  (F-keys may be used alone). Esc cancels, Backspace goes back to Ctrl+Q. Combinations Windows keeps for
-  itself (Alt+Tab, Win+L, ...) or everyday ones (Ctrl+C, Ctrl+V, ...) are refused, and so is one another
-  program already holds ("in use by another app").
+| Page | Groups |
+|---|---|
+| **General** | Start-up (start with Windows, sounds) · Microphone · Speech model (model, your model files and folders, runs on, language, *Find models*) · Typing · Pill (show, edge, distance, *Move the pill…*, *Reset*) |
+| **Shortcuts** | Dictate · Copy last dictation · Correct last dictation · hold time · Esc cancels |
+| **Improvements** | Dictionary (names and terms, "heard as", learned words) · Clean-up (fillers, repeated words) · Context words · Recognition (voice detector, audio clean-up, preferred words) |
+| **Extras** | Performance (memory, threads, pauses, longest dictation, *Free now*) · Spoken commands · Details · Privacy and files (*Open log*, *Open settings file*) |
+
+- **Change…** next to a shortcut listens for the next key combination: Ctrl/Alt/Shift/Win plus one key
+  (F-keys may be used alone). Esc cancels; Backspace goes back to Ctrl+Q for Dictate and removes the
+  shortcut for the other two. Combinations Windows keeps for itself (Alt+Tab, Win+L, ...), everyday ones
+  (Ctrl+C, Ctrl+V, ...), one already used by another of these shortcuts, and one another program holds
+  ("in use by another app") are refused. In the file: `[hotkey] keys`, `copy_last`, `correct_last`.
 - **Save** (enabled once something changed) writes only the settings you changed into `config.toml`;
   every comment and every other line stays as it was. The result is checked first: if it isn't valid, the
   problem is shown and nothing is written. The tray app picks the new settings up as soon as the window
   closes and says "Settings saved."
+- Buttons that need the tray app (*Move the pill…*, *Reset*, *Find models*, *Free now*) are carried out
+  when the window closes (*Move the pill…* saves and closes it straight away).
 - Per-program settings (`[apps."program.exe"]`, `[dictionary.apps."program.exe"]`) and exact replacements
-  stay in the file: **Open settings file** opens it (also in the tray menu).
+  stay in the file: Extras → *Open settings file*.
 
 The window is its own short-lived process (`ParakeetDictate.exe --settings`, or
 `python -m parakeet_dictate --settings` from source), like the correction window.

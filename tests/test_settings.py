@@ -422,6 +422,39 @@ def test_model_list_follows_the_custom_folders(window):
     assert settings_ui.normalize(window.field(("model", "dir")).spec, "auto") == "auto"
 
 
+def test_pages_are_grouped(window):
+    from parakeet_dictate import settings_ui
+    assert [name for name, _ in settings_ui.PAGES] == ["General", "Shortcuts", "Improvements", "Extras"]
+    general = dict(settings_ui.PAGES)["General"]
+    assert [g for g, _ in general] == ["Start-up", "Microphone", "Speech model", "Typing", "Pill"]
+
+
+def test_optional_shortcut_recorder(window):
+    rec = window.field(("hotkey", "copy_last")).control
+    assert rec.shown.cget("text") == "None"
+    rec.start()
+    rec.handle(0x51, {"ctrl"})                       # Ctrl+Q is Dictate already
+    assert rec.listening and "already the Dictate shortcut" in rec.status.cget("text")
+    rec.handle(0x43, {"ctrl", "alt"})
+    assert not rec.listening and rec.get() == "ctrl+alt+c" and rec.shown.cget("text") == "Ctrl+Alt+C"
+    rec.start()
+    rec.handle(0x08, set())                          # Backspace: no shortcut
+    assert rec.get() == ""
+
+
+def test_action_buttons_ask_the_tray(window, paths):
+    import json
+    window.do_action("free_memory")
+    window.do_action("reset_pill")
+    req = json.loads((paths.data_dir / "settings_request.json").read_text("utf-8"))
+    assert req["actions"] == ["free_memory", "reset_pill"] and not window.closed
+    window.do_action("move_pill")                    # nothing changed: just closes, tray moves the pill
+    assert window.closed and "move_pill" in json.loads(
+        (paths.data_dir / "settings_request.json").read_text("utf-8"))["actions"]
+    window.do_action("open_log")
+    assert "no log" in window.msg.cget("text").lower()
+
+
 def test_open_settings_file_button(window, paths):
     window.open_settings_file()
     assert window.opened == [paths.config_file]

@@ -205,7 +205,7 @@ def record_key(vk: int, mods: Iterable[str], current: str,
 
 # --- choices the window offers ---------------------------------------------------------------------
 
-AUTO_MODEL_LABEL = "Automatic (the best one found, or the one picked in the tray menu)"
+AUTO_MODEL_LABEL = "Automatic (the best model found on this PC)"
 
 
 def _norm(p: str) -> str:
