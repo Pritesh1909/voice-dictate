@@ -52,7 +52,7 @@ def test_app_terms_win_over_personal_ones():
 
 
 def _app(cfg_text="", languages=("en",)):
-    ns = NS(cfg=config.parse(cfg_text), model=NS(languages=languages), learned=[])
+    ns = NS(cfg=config.parse(cfg_text), model=NS(languages=languages), learned=[], learned_auto=[])
     App._make_cleaner(ns, ns.cfg)
     return ns
 

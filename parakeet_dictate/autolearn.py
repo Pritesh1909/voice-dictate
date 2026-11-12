@@ -50,6 +50,12 @@ HEADER = ("# Fixes learned automatically by Parakeet Dictate (background learnin
 _T = TypeVar("_T")
 
 
+def load_active(path: Path) -> list[Entry]:
+    """The active fixes for the clean-up, read from learned_auto.toml (learn.load: the [meta] tables are
+    ignored, and a missing or damaged file is [] and never an error)."""
+    return learn.load(path)
+
+
 def entry_key(e: Entry) -> str:
     term, heard_as = e
     return f"{heard_as} -> {term}"
