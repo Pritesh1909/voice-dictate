@@ -78,6 +78,8 @@ terms = ["Keycloak", "Inkfree", "SoftSages", "CodeCommit", "Flyway", "DataGrip",
 [output]
 # "type" sends the text as keystrokes and leaves the clipboard alone.
 # "paste" puts it on the clipboard, presses Ctrl+V, then restores what was on the clipboard.
+# Either way, if the text can't be typed (no window has focus, or the window runs as administrator),
+# it is put on the clipboard instead and a notification says so. Anything already typed stays.
 method = "type"
 # Type each phrase as soon as it is transcribed, while you keep talking (needs process_while_speaking).
 # Nothing is typed while Ctrl/Alt/Shift/Win is held (hold-to-talk), so letters never turn into shortcuts;
@@ -86,6 +88,10 @@ method = "type"
 type_while_speaking = true
 # Add a space after each dictation so the next one doesn't stick to it.
 add_trailing_space = true
+# Press Enter once after the text is typed, e.g. to send a chat message or run a command straight away.
+# Only when text was actually typed: not after a cancelled dictation, nothing heard, or text that went to
+# the clipboard because it couldn't be typed.
+press_enter = false
 # Short beeps when recording starts / stops / is cancelled.
 sounds = true
 # Stop automatically after this many seconds.
