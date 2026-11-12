@@ -308,6 +308,64 @@ def pulse_look(phase: float, level: float) -> tuple[float, float]:
     return 1 + (.5 + .6 * min(1.0, max(0.0, level))) * e, .7 * (1 - e)
 
 
+RIPPLE_LIFE = 1.5           # seconds a ripple takes to spread out and fade
+RIPPLE_MAX = 7              # rings drawn at most at once
+
+
+def ripple_rate(level: float) -> float:
+    """Ripples per second: a slow 0.6 when it is quiet (so it still shows it is listening), up to 4.5
+    when you speak loudly."""
+    return .6 + 3.9 * min(1.0, max(0.0, level))
+
+
+def ripple_look(age: float, strength: float) -> tuple[float, float, float]:
+    """(scale, opacity, line width px at 100 %) of a ripple `age` s old that was sent out at voice
+    `strength` 0..1: like a ring on water it spreads from the button's edge (further when louder:
+    1.7 to 2.55 times the button) and fades, a louder one brighter and thicker."""
+    p = min(1.0, max(0.0, age / RIPPLE_LIFE))
+    e = 1 - (1 - p) ** 2.2                       # fast at first, then slowing, like a water ring
+    s = min(1.0, max(0.0, strength))
+    scale = 1 + (.7 + .85 * s) * e
+    opacity = (.22 + .6 * s) * (1 - p) ** 1.4
+    width = 1.2 + 1.8 * s * (1 - .5 * p)
+    return scale, opacity, width
+
+
+class RippleEmitter:
+    """Sends out ripples as the voice comes and goes. Louder means more of them and stronger ones; a
+    sudden rise (the start of a word) sends one straight away, so the rings follow the rhythm of speech.
+    Pure state, no drawing: step() returns what to draw."""
+
+    def __init__(self):
+        self.rings: list[tuple[float, float]] = []      # (born at, strength)
+        self._credit = 0.0
+        self._last_t: float | None = None
+        self._floor = 0.0                                # recent quiet level, for "a word starts"
+        self._last_burst = -1.0
+
+    def step(self, t: float, level: float) -> list[tuple[float, float, float]]:
+        v = min(1.0, max(0.0, level))
+        first = self._last_t is None
+        dt = 0.0 if first else min(.25, max(0.0, t - self._last_t))
+        self._last_t = t
+        if first:
+            self._emit(t, max(v, .15))                   # one right away when listening starts
+        self._credit += dt * ripple_rate(v)
+        if v - self._floor > .18 and t - self._last_burst > .18:
+            self._emit(t, v)                             # a word starts: a ring now
+            self._last_burst = t
+            self._credit = min(self._credit, .5)
+        while self._credit >= 1.0:
+            self._credit -= 1.0
+            self._emit(t, max(v, .15))
+        self._floor = min(v, self._floor + dt * .8)      # follows quiet down at once, rises slowly
+        self.rings = [(b, s) for b, s in self.rings if t - b < RIPPLE_LIFE][-RIPPLE_MAX:]
+        return [ripple_look(t - b, s) for b, s in self.rings]
+
+    def _emit(self, t: float, strength: float) -> None:
+        self.rings.append((t, strength))
+
+
 def core_scale(level: float) -> float:
     """The button grows a little with the voice: 1 + lvl·.06."""
     return 1 + .06 * min(1.0, max(0.0, level))
@@ -760,6 +818,8 @@ class ButtonPainter(_Sprites):
         self.shell = self.size              # never changes: every frame is the whole window
         self.c = p + self.w / 2             # the button's centre in the window (both ways)
         self._phase, self._last_t = 0.0, None
+        self._ripples = RippleEmitter()
+        self._ripple_shapes: dict = {}
 
     def full(self, band):
         return band
@@ -832,16 +892,55 @@ class ButtonPainter(_Sprites):
             return img
         return self._cached(("btn-halo", color, lq), make)
 
-    def _ring(self, color: str, scale: float, opacity: float):
-        """The pulse ring: a 1.5 px circle line the size of the button, scaled (line and all)."""
+    def _ring(self, color: str, scale: float, opacity: float, width: float | None = None):
+        """A ring round the button: by default the design's 1.5 px pulse line the size of the button,
+        scaled (line and all); with `width` (px at 100 %) a ripple line of that width."""
         sq, oq = round(scale * 40) / 40, round(opacity * 32) / 32
-        r, bw = BTN_D * self.s * sq / 2, 1.5 * self.s * sq
+        wq = None if width is None else round(width * 2) / 2
+        if wq is not None:
+            # Ripples: the ring is drawn once per size and width at full strength (kept only while
+            # listening, see _ripple_shapes) and faded per frame by scaling its alpha.
+            sq = round(scale * 16) / 16
+            oq = round(opacity * 16) / 16
+            base_img, o = self._ring_shape(color, sq, wq)
+            return self._faded(base_img, oq), o
+        r = BTN_D * self.s * sq / 2
+        bw = 1.5 * self.s * sq
         rgba = _rgb(color) + (round(255 * oq),)
 
         def draw(dr, k, X):
             c, R = X(self.c), r * k
             dr.ellipse((c - R, c - R, c + R - 1, c + R - 1), outline=rgba, width=max(1, round(bw * k)))
-        return self._region(("ring", color, sq, oq), r + 2, draw)
+        return self._region(("ring", color, sq, oq, wq), r + 2, draw)
+
+    def _ring_shape(self, color: str, sq: float, wq: float):
+        """A ripple ring at full opacity, kept per size and line width in _ripple_shapes, which is
+        emptied when the dictation ends (drop_ripples), so the memory is only used while listening."""
+        key = (color, sq, wq)
+        hit = self._ripple_shapes.get(key)
+        if hit is not None:
+            return hit
+        r, bw = BTN_D * self.s * sq / 2, wq * self.s
+        rgba = _rgb(color) + (255,)
+        k = self.SS
+        o = math.floor(self.c - r - 2)
+        n = math.ceil(self.c + r + 2) - o
+        big = Image.new("RGBA", (n * k, n * k), (0, 0, 0, 0))
+        c, R = (self.c - o) * k, r * k
+        ImageDraw.Draw(big).ellipse((c - R, c - R, c + R - 1, c + R - 1), outline=rgba, width=max(1, round(bw * k)))
+        hit = self._ripple_shapes[key] = (big.reduce(k), o)
+        return hit
+
+    def drop_ripples(self) -> None:
+        """Forget the ripple rings (called when listening ends)."""
+        self._ripple_shapes.clear()
+        self._ripples = RippleEmitter()
+
+    @staticmethod
+    def _faded(img, opacity: float):
+        out = img.copy()
+        out.putalpha(img.getchannel("A").point(lambda v, f=opacity: round(v * f)))
+        return out
 
     def _spinner(self, angle: float):
         """Processing: a 48-unit arc of the r 27 circle (stroke 2, round ends) starting at `angle`."""
@@ -919,6 +1018,8 @@ class ButtonPainter(_Sprites):
 
     def ready(self, hover: bool = False):
         """Idle: the dark circle with the mic (a lighter circle while the mouse is on it)."""
+        if self._ripple_shapes:
+            self.drop_ripples()
         frame = self._blank()
         frame.alpha_composite(self._core(1.0, BTN_CORE, hover))
         self._put(frame, self._glyph("mic", FG))
@@ -932,11 +1033,14 @@ class ButtonPainter(_Sprites):
         lvl = max(level, TYPING_LVL) if writing else min(1.0, max(0.0, level))
         frame = self._blank()
         frame.alpha_composite(self._halo(color, lvl))
-        phase = self._advance(t, lvl)
+        if self._last_t is None or t - self._last_t > .5:      # a new dictation: start the ripples afresh
+            self._ripples = RippleEmitter()
+        self._advance(t, lvl)
         if not writing:
-            sc, op = pulse_look(phase, lvl)
-            if op > .01:
-                self._put(frame, self._ring(color, sc, op))
+            # Voice ripples: rings spread from the button like on water, more and stronger when louder.
+            for sc, op, width in self._ripples.step(t, level):
+                if op > .01:
+                    self._put(frame, self._ring(color, sc, op, width))
         cs = core_scale(lvl)
         frame.alpha_composite(self._core(cs, BTN_CORE, hover))
         if writing:
@@ -947,6 +1051,8 @@ class ButtonPainter(_Sprites):
 
     def working(self, t: float, hover: bool = False):
         """Processing: the mic dimmed to .45 and a blue arc turning round the edge."""
+        if self._ripple_shapes:                # listening is over: the ripple rings aren't needed
+            self.drop_ripples()
         frame = self._blank()
         frame.alpha_composite(self._core(1.0, BTN_CORE, hover))
         self._put(frame, self._glyph("mic", FG, .45))
@@ -956,6 +1062,8 @@ class ButtonPainter(_Sprites):
     def flash(self, color: str, since: float = 1e9, hover: bool = False):
         """A result, `since` seconds after it showed: Done (light circle, dark check, one blue pulse
         ring), or the other flash colours' circle and glyph."""
+        if self._ripple_shapes:
+            self.drop_ripples()
         state = button_state("flash", color=color)
         fill, glyph = flash_core(state)
         frame = self._blank()
