@@ -327,7 +327,7 @@ def test_prune_error_logged_not_raised_and_the_clear_out_carries_on(tmp_path, mo
 # --- background learning: Whisper, the idle loop, the hotkey -------------------------------------------
 
 WHISPER = "whisper-large-v3-turbo-Q8_0.gguf"
-LEARNING_THREADS = ("background-learning", "background-check", "whisper-setup")
+LEARNING_THREADS = ("background-learning", "background-check", "background-check-watch", "whisper-setup")
 
 
 @pytest.fixture
@@ -882,3 +882,104 @@ def test_user_learned_beats_auto_on_clash(learner):
     assert "Mailtrap" in cleaner.clean("send the MailT campaign")          # learned.toml beats the automatic fix
     assert "Mailchimp" in cleaner.clean("open the mail c account")        # and so does your dictionary
     assert "Mailzzy" not in cleaner.clean("send the MailT campaign via mail c")
+
+
+# --- 0.9.1: stopping a check when you come back, and a status line that keeps up -------------------------
+
+def test_user_back_mid_recording_stops_the_check_at_once(learner, monkeypatch):
+    """Touching the mouse or keyboard while Whisper reads a recording ends the check within about half a
+    second. The checker only asks between recordings, so a watcher asks for it while it works."""
+    monkeypatch.setattr(App, "STOP_POLL_SECONDS", 0.05)
+    app = learner()
+    kept(app, "send the mail t campaign")
+    events = []
+    whisper = FakeTeacher(events, block=True)
+    app._new_teacher_engine = lambda spec: whisper
+    app._learning_tick()
+    assert whisper.transcribing.wait(5)                   # Whisper is in the middle of the recording
+    t0 = time.monotonic()
+    monkeypatch.setattr(idle, "seconds_since_input", lambda: 2.0)   # the user moved the mouse
+    assert whisper.killed.wait(2)
+    assert time.monotonic() - t0 < 1
+    finish_check(app)
+    assert app.learning_paused is None                    # stopped because the user is back: not a crash
+
+
+def test_status_follows_the_user_after_a_check(learner, monkeypatch):
+    """A check's summary stands while the PC stays idle; when the user is back, the status says so again,
+    even though that was also the status before the check."""
+    app = learner()
+    summaries = ["Checked 3 dictations, learned 1 fix"]
+
+    def run(should_stop):
+        if summaries:
+            app.learning_store.set_status(summaries.pop())
+            return "Checked 3 dictations, learned 1 fix"
+        return "nothing to check"
+
+    app._make_checker = lambda: types.SimpleNamespace(run=run, stop=lambda: None)
+    monkeypatch.setattr(idle, "seconds_since_input", lambda: 10.0)
+    app._learning_tick()
+    monkeypatch.setattr(idle, "seconds_since_input", lambda: 1e6)
+    app._learning_tick()
+    finish_check(app)
+    app._learning_tick()                                  # nothing new: the summary stays
+    finish_check(app)
+    assert app.learning_store.status() == "Checked 3 dictations, learned 1 fix"
+    monkeypatch.setattr(idle, "seconds_since_input", lambda: 10.0)
+    app._learning_tick()
+    assert app.learning_store.status() == "Waits until the PC is idle"
+
+
+def test_nothing_left_to_check_says_up_to_date_once(learner, monkeypatch):
+    app = learner()
+    app._make_checker = lambda: fake_checker("nothing to check")
+    monkeypatch.setattr(idle, "seconds_since_input", lambda: 10.0)
+    app._learning_tick()
+    monkeypatch.setattr(idle, "seconds_since_input", lambda: 1e6)
+    for _ in range(3):
+        app._learning_tick()
+        finish_check(app)
+    assert app.learning_store.status() == "Up to date"
+    assert app.statuses.count("Up to date") == 1          # not rewritten every 30 s
+
+
+@pytest.mark.parametrize("result, status", [
+    ("error: learning state: disk full", "Paused: the learning files couldn't be saved"),
+    ("error: RuntimeError", "Paused: something went wrong (see the log)"),
+])
+def test_a_pause_the_checker_did_not_explain_still_says_paused(learner, result, status):
+    app = learner()
+    app.learning_store.set_status("Whisper ready")
+    app._make_checker = lambda: fake_checker(result)
+    app._learning_tick()
+    finish_check(app)
+    assert app.learning_paused == result
+    assert app.learning_store.status() == status
+
+
+def test_turning_learning_off_and_on_while_paused(learner):
+    app = learner()
+    app._make_checker = lambda: fake_checker("error: teacher crashed")
+    app.learning_store.set_status("Paused: Whisper stopped working")   # what the checker writes before it returns
+    app._learning_tick()
+    finish_check(app)
+    app.cfg = dataclasses.replace(app.cfg, learning_enabled=False)
+    app._learning_tick()
+    assert app.learning_store.status() == "Off"
+    app.cfg = dataclasses.replace(app.cfg, learning_enabled=True)
+    app._learning_tick()
+    assert app.learning_store.status() == "Paused: Whisper stopped working"
+
+
+def test_learning_back_on_after_set_up_found_no_graphics_card(learner, monkeypatch):
+    monkeypatch.setattr(teacher, "has_discrete_gpu", lambda cmd, timeout=30: False)
+    app = learner(teacher_ready=False)
+    app._learning_tick()
+    wait_for(lambda: app.learning_store.status() == "Waiting for a graphics card")
+    app.cfg = dataclasses.replace(app.cfg, learning_enabled=False)
+    app._learning_tick()
+    assert app.learning_store.status() == "Off"
+    app.cfg = dataclasses.replace(app.cfg, learning_enabled=True)
+    app._learning_tick()
+    assert app.learning_store.status() == "Waiting for a graphics card"
