@@ -43,6 +43,11 @@ DOUBLED_NOTE = ("Retry couldn't tell which words were already typed, so it inser
                 "Some words may now be doubled.")
 
 TEACHER_CONTEXT_TERMS = 50   # notes' terms (the top ones) given to Whisper next to your own dictionary's
+# Settings status line for background learning (besides the checker's and idle.why_not's own texts)
+STATUS_UP_TO_DATE = "Up to date"
+PAUSED_STATE = "Paused: the learning files couldn't be saved"
+PAUSED_OTHER = "Paused: something went wrong (see the log)"
+CHECKER_EXPLAINS = ("error: teacher crashed", "error: no gpu", "error: teacher failed to load")  # wrote their own
 
 
 class _Quitting(Exception):
@@ -344,6 +349,7 @@ class App:
     PRUNE_EVERY_SECONDS = 3600              # how often old kept recordings are cleared out: hourly, so a laptop
                                             # that sleeps at night still keeps none past keep_days (tests shorten it)
     IDLE_EVERY_SECONDS = 30                 # how often the background checker's conditions are looked at
+    STOP_POLL_SECONDS = 0.5                 # while a check runs: how often it is asked whether the user is back
 
     def __init__(self, paths: cfgmod.Paths):
         self.paths = paths
@@ -1199,7 +1205,8 @@ class App:
         self.teacher_path: Path | None = None   # Whisper's .gguf once it is there (and the PC has a graphics card)
         self._teacher_tried = False             # Whisper's set-up ran in this app run (it is retried at the next)
         self._check_thread: threading.Thread | None = None
-        self._status_said: str | None = None    # the last reason the idle loop wrote, so it is written once
+        self._teacher_status = ""               # what Whisper's set-up last said ("Waiting for a graphics card")
+        self._paused_status = ""                # the status when learning paused, shown again if it is turned back on
         self._dictation_asked_at = float("-inf")   # time.monotonic() of the last hotkey press
 
     def _start_learning(self) -> None:
@@ -1217,9 +1224,13 @@ class App:
 
     def _learning_tick(self) -> None:
         """Get Whisper (once per app run), then start a check when nothing stands in the way. When something
-        does, its reason is the status, written only when it changes. Until Whisper is ready the status is
-        its set-up's ("Downloading Whisper 41%"); after a check's error the checker's own status stands."""
-        if self.learning_paused or (self._check_thread is not None and self._check_thread.is_alive()):
+        does, its reason is the status. Until Whisper is ready the status is its set-up's ("Downloading
+        Whisper 41%"); after a check's error, the pause's. Turning learning off says "Off", and turning it
+        back on shows the set-up's or the pause's status again."""
+        if self._check_thread is not None and self._check_thread.is_alive():
+            return
+        if self.learning_paused:
+            self._say(self._paused_status if self.cfg.learning_enabled else "Off")
             return
         if self.cfg.learning_enabled and not self._teacher_tried:
             self._teacher_tried = True
@@ -1228,9 +1239,17 @@ class App:
         reason = idle.why_not(c)
         if reason is None:
             self._start_check()
-        elif (c.teacher_ready or not c.enabled) and reason != self._status_said:
-            if self._learning_status(reason):
-                self._status_said = reason
+        elif c.teacher_ready or not c.enabled:
+            self._say(reason)
+        else:
+            self._say(self._teacher_status)
+
+    def _say(self, text: str) -> None:
+        """The status line, written only when state.json doesn't already say it (the idle loop asks every
+        30 s). Comparing with the file, not with what was last written here, keeps it right after a check
+        or the set-up wrote their own."""
+        if text and self.learning_store.status() != text:
+            self._learning_status(text)
 
     def _learning_conditions(self) -> idle.Conditions:
         since_hotkey = time.monotonic() - self._dictation_asked_at
@@ -1257,12 +1276,38 @@ class App:
         self._check_thread.start()
 
     def _run_check(self, checker: Checker) -> None:
-        """Thread body. An "error:" result (Whisper crashed, didn't load, or not on a graphics card) pauses
-        learning until the app starts again; the checker has written why to the status."""
-        result = checker.run(self._should_stop_check)
+        """Thread body. An "error:" result pauses learning until the app starts again. For Whisper crashing,
+        not loading, or not being on a graphics card the checker has written why; for anything else the
+        status says it paused. A check that found nothing new says "Up to date", unless the last check's
+        summary ("Checked 3 dictations") is still showing."""
+        done = threading.Event()
+        threading.Thread(target=self._watch_check, args=(checker, done), daemon=True,
+                         name="background-check-watch").start()
+        try:
+            result = checker.run(self._should_stop_check)
+        finally:
+            done.set()
         if result.startswith("error:"):
+            if result not in CHECKER_EXPLAINS:
+                self._say(PAUSED_STATE if result.startswith("error: learning state") else PAUSED_OTHER)
+            self._paused_status = self.learning_store.status()
             self.learning_paused = result
             log.warning("background learning paused until the app restarts: %s", result)
+        elif result == "nothing to check" and not self.learning_store.status().startswith("Checked "):
+            self._say(STATUS_UP_TO_DATE)
+
+    def _watch_check(self, checker: Checker, done: threading.Event) -> None:
+        """Stops the check within STOP_POLL_SECONDS of the user coming back (or the PC going on battery,
+        ...), also in the middle of a recording or while Whisper loads: the checker itself asks only
+        between recordings. Checker.stop kills Whisper's process without taking a lock."""
+        while not done.wait(self.STOP_POLL_SECONDS):
+            try:
+                if self._should_stop_check():
+                    checker.stop()
+                    return
+            except Exception:
+                log.exception("background check watcher")
+                return
 
     def _make_checker(self) -> Checker:
         return Checker(self.learning_store, self.paths.recordings_dir, self._new_teacher_engine, self.cleaner_for,
@@ -1308,12 +1353,12 @@ class App:
         try:
             if (self.paths.data_dir / GPU_MARKER).exists():
                 log.info("background learning: dictation crashed the graphics card before, Whisper is not downloaded")
-                self._learning_status(STATUS_NO_GPU)
+                self._teacher_said(STATUS_NO_GPU)
                 return
             if not teacher.has_discrete_gpu(_own_command()):
                 log.info("background learning: no discrete graphics card, Whisper is not downloaded")
                 self._no_discrete_gpu = True
-                self._learning_status("Waiting for a graphics card")
+                self._teacher_said("Waiting for a graphics card")
                 return
             path = teacher.ensure(self.paths.teacher_dir, _orca_models_dir(), self._teacher_progress(),
                                   learning_dir=self.paths.learning_dir)
@@ -1321,15 +1366,15 @@ class App:
             if not self._quitting.is_set():   # learning was turned off
                 log.info("background learning: turned off, the Whisper download stopped")
                 self._teacher_tried = False
-                self._learning_status("Off")
+                self._teacher_said("Off")
             return
         except Exception as e:
             log.warning("background learning: Whisper download failed: %s", e, exc_info=not isinstance(e, OSError))
-            self._learning_status(f"Download failed: {e}")
+            self._teacher_said(f"Download failed: {e}")
             return
         log.info("background learning: Whisper ready (%s)", path)
         self.teacher_path = path
-        self._learning_status("Whisper ready")
+        self._teacher_said("Whisper ready")
 
     def _teacher_progress(self):
         last = [-1]
@@ -1340,8 +1385,14 @@ class App:
             pct = int(done * 100 / max(total, 1))
             if done < total and pct != last[0]:   # a finished (or already there) file says "Whisper ready"
                 last[0] = pct
-                self._learning_status(f"Downloading Whisper {pct}%")
+                self._teacher_said(f"Downloading Whisper {pct}%")
         return cb
+
+    def _teacher_said(self, text: str) -> None:
+        """A status from Whisper's set-up, remembered so the idle loop can show it again (learning off, then on).
+        Written before it is remembered, so the idle loop never sees it before state.json does (and writes it twice)."""
+        self._learning_status(text)
+        self._teacher_status = text
 
     def _learning_status(self, text: str) -> bool:
         """The status line in Settings; best effort (False when it could not be written)."""

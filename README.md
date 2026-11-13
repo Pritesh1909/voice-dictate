@@ -176,7 +176,8 @@ the next dictation on. It is on by default, never shows a pop-up and never gets 
   on; there has been no keyboard or mouse input for **3 minutes** (`idle_minutes`); the PC is on mains power
   (not on battery); and the PC has a discrete graphics card (Whisper runs on it, never on the CPU, so
   dictation is never slowed down). The moment you press the dictation shortcut the check stops and Whisper
-  is shut down, so dictation starts at once. If Whisper ever crashes, learning pauses until the app is
+  is shut down, so dictation starts at once. Touching the mouse or keyboard, or unplugging the laptop,
+  stops it within about a second too, even in the middle of a recording. If Whisper ever crashes, learning pauses until the app is
   restarted; it never switches dictation to the CPU.
 - **Whisper.** It is one download of 886 MB, started the first time the app runs with learning on, and only on a
   PC with a discrete graphics card that dictation hasn't crashed. Turning learning off stops a download in
@@ -191,7 +192,8 @@ the next dictation on. It is on by default, never shows a pop-up and never gets 
   reinstall they are still listed and undone ones stay undone. Your `config.toml` and `learned.toml` are
   never touched, and when one of your entries and an automatic fix clash, yours wins.
 - **See and undo them.** Settings → Improvements → **Learning in the background** shows a status line (for example
-  "Waits until the PC is idle" or "Checked 12 dictations, learned 1 fix") and every automatic fix: what was
+  "Waits until the PC is idle", "Checked 12 dictations, learned 1 fix", or "Up to date" when every saved
+  dictation has been checked) and every automatic fix: what was
   heard, what it becomes, the day it was learned and how often it was seen. **Undo** removes one at once, and a
   fix you undo is **never learned again**. **Reset all** (it asks first) removes them all, and none of them is learned again either.
 - **Turn it off.** Settings → Improvements → Learning in the background → *Learn from my dictations* off
