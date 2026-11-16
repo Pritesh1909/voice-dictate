@@ -5,6 +5,10 @@ transcribe-cpp-native==0.4.1
 # Microphone capture (PortAudio), opened only while recording.
 sounddevice==0.5.6
 numpy==2.5.4
+# Pausing music while dictating: the Windows media sessions (WinRT), on a thread of their own.
+winrt-runtime==4.1.0
+winrt-Windows.Foundation==4!10.0.28000.2957
+winrt-Windows.Media.Control==4!10.0.28000.2957
 # Tray icon (plain Win32, no GUI toolkit) + icon drawing.
 pystray==0.19.5
 Pillow==13.0.0

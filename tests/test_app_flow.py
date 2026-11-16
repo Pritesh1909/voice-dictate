@@ -98,6 +98,7 @@ def make_app(engine, audio=None, live=False, **cfg_over):
                            "keep_recordings": False,    # this app has no data folder to keep them in
                            **cfg_over})
     app = App.__new__(App)          # no tray, hotkey, microphone or model process
+    app.media = types.SimpleNamespace(pause=lambda: None, resume=lambda: None, wait=lambda t=5: None)
     app.cfg, app.cleaner = cfg, Cleaner.from_config(cfg)
     app.target_exe, app._cleaners, app.model = "", {}, None   # per-program clean-up (cleaner_for)
     app.target_hwnd, app.target_terms, app.learned = 0, [], []  # "scratch that" window, context words, learned
@@ -283,3 +284,25 @@ def test_live_with_no_window_copies_everything(out):
     dictate(app)
     assert out.typed == [] and out.clip == ["First part. Second part."]
     assert app.notes == [output.NO_TARGET_NOTE]
+
+
+# --- music paused while dictating: played again when the recording stops or is cancelled ------------
+
+def test_music_resumes_when_recording_stops_or_is_cancelled(out):
+    app = make_app(FakeEngine("Hello.", "Again."))
+    calls = []
+    app.media = types.SimpleNamespace(pause=lambda: calls.append("pause"), resume=lambda: calls.append("resume"))
+    app.recorder.close = lambda: None
+    app.recorder.started_at = time.monotonic()
+    app._session, app.state = 1, "recording"
+    app.current = Session(app, 1, use_vad=False)
+    app._finish_locked()
+    assert calls == ["resume"]
+    end = time.monotonic() + 5
+    while app.state != "idle" and time.monotonic() < end:
+        time.sleep(0.01)
+    app._session, app.state = 3, "recording"
+    app.current = s = Session(app, 3, use_vad=False)
+    app._on_cancel()
+    s._worker.join(2)
+    assert calls == ["resume", "resume"]

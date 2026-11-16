@@ -187,6 +187,9 @@ input_device = ""
 # forgotten tap doesn't keep the microphone open. Only in tap mode, never while you hold the keys.
 # 0 = never stop for silence (max_seconds still applies).
 silence_stop_seconds = 60
+# Pause music and videos that are playing (Spotify, a browser tab, ...) while you dictate, and play them
+# again when the recording ends. Music you had paused yourself stays paused.
+pause_media = true
 
 [commands]
 # Say a command on its own, between two pauses, and it is carried out instead of typed. Capitals and

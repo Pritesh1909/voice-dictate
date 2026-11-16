@@ -99,6 +99,7 @@ def make_app(tmp_path, monkeypatch, cfg_text=""):
     paths.data_dir.mkdir(parents=True, exist_ok=True)
     paths.config_file.write_text(cfg_text or config.DEFAULT_FILE.read_text("utf-8"), "utf-8")
     app = App.__new__(App)
+    app.media = types.SimpleNamespace(pause=lambda: None, resume=lambda: None, wait=lambda t=5: None)
     app.paths, app.cfg = paths, config.load(paths)
     app.cfg_model_dir, app.cfg_model_folders = app.cfg.model_dir, app.cfg.model_folders
     app.model, app.found, app.problem, app.model_job, app.icon, app.overlay = None, [], None, "", None, None

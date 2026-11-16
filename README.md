@@ -54,6 +54,11 @@ In tap mode a dictation stops by itself (and types what you said) after a minute
 (`[audio] silence_stop_seconds`, 0 = off). If the microphone is unplugged mid-dictation it stops the same way;
 if the microphone named in `[audio] input_device` isn't there, the Windows default is used and a notification says so.
 
+**Music pauses while you dictate.** Music or a video that is playing (Spotify, Amazon Music, a YouTube tab,
+Media Player: anything the Windows volume flyout shows) is paused when a recording starts, so it isn't picked up
+by the microphone, and played again as soon as the recording stops or is cancelled. Music you had paused yourself
+stays paused. Off: Settings → General → Microphone → *Pause music while dictating* (`[audio] pause_media`).
+
 **Transcribes while you talk.** Each time you pause for 0.8 s, the part before the pause is transcribed in
 the background, so when you stop only the last bit is left and the text appears almost right away. Tested:
 the split result is word-for-word the same as transcribing everything at once. Tune with
@@ -75,7 +80,7 @@ following Windows) with five pages, each made of titled groups:
 
 | Page | Groups |
 |---|---|
-| **General** | Start-up (start with Windows, sounds) · Microphone · Speech model (model, your model files and folders, runs on, language, *Find models*) · Typing · Pill (show, edge, distance, *Move the pill…*, *Reset*) |
+| **General** | Start-up (start with Windows, sounds) · Microphone (microphone, stop after silence, pause music) · Speech model (model, your model files and folders, runs on, language, *Find models*) · Typing · Pill (show, edge, distance, *Move the pill…*, *Reset*) |
 | **Shortcuts** | Dictate · Copy last dictation · Correct last dictation · History · hold time · Esc cancels |
 | **Improvements** | Dictionary (names and terms, "heard as", learned words) · Clean-up (fillers, repeated words, numbers, ticket prefixes) · Context words · Learning in the background (learn from my dictations, ask Claude, the automatic fixes with *Undo* and *Reset all*) · Recognition (voice detector, audio clean-up, preferred words) |
 | **Extras** | Performance (memory, threads, pauses, longest dictation, *Free now*) · Spoken commands · Details · Privacy and files (log dictated text, keep a history, history length, keep recordings for learning and for how many days, *Delete all* / *Open folder* for the recordings, *Open log*, *Open settings file*) |

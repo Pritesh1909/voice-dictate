@@ -35,7 +35,7 @@ VSVersionInfo(
     --add-data "$root\parakeet_dictate\config.default.toml;parakeet_dictate" `
     --add-data "$root\parakeet_dictate\fonts;parakeet_dictate\fonts" `
     --collect-all transcribe_cpp --collect-all transcribe_cpp_native --collect-all _sounddevice_data `
-    --collect-all sv_ttk --collect-submodules tomlkit --hidden-import parakeet_dictate.settings_ui `
+    --collect-all sv_ttk --collect-all winrt --collect-submodules tomlkit --hidden-import parakeet_dictate.settings_ui `
     --hidden-import parakeet_dictate.history_ui `
     --exclude-module pytest --exclude-module PyInstaller `
     --paths $root --distpath (Join-Path $build 'dist') --workpath (Join-Path $build 'work') --specpath $build `

@@ -24,6 +24,7 @@ from .checker import STATUS_NO_GPU, Checker
 from .engine import GPU_MARKER, Engine, EngineError, EngineSpec
 from .hotkey import HotkeyError, HotkeyThread, key_down
 from .hotkey import display as hotkey_display
+from .media import MediaPauser
 from .overlay import GREEN, MUTED, RED, Overlay
 from .segmenter import Segmenter, VadSegmenter
 from .textclean import Cleaner
@@ -420,6 +421,7 @@ class App:
         self.paths = paths
         self.cfg = cfgmod.load(paths)
         self.sounds = winutil.Sounds(paths.data_dir)
+        self.media = MediaPauser()   # pauses music while you dictate ([audio] pause_media)
         self.ico = write_ico(paths.data_dir / "icon.ico")
         self.learned: list[tuple[str, str]] = []   # learned.toml ("Correct last dictation…")
         self._learned_stamp: tuple | None = None   # (learned.toml, learned_auto.toml) mtimes
@@ -1023,6 +1025,8 @@ class App:
             self._mic_warning_shown = warning
             self.state = "recording"
             log.info("recording started at %d Hz", self.recorder.rate)
+            if self.cfg.pause_media:
+                self.media.pause()   # the music would be in the recording; played again when it ends
             self._session += 1
             session = self._session
             self.target_exe = winutil.foreground_exe()   # for its [dictionary.apps] terms and [apps] settings
@@ -1101,6 +1105,7 @@ class App:
             if self.state != "recording":
                 return
             self.recorder.cancel()
+            self.media.resume()
             self.hotkeys.escape_off()
             self.state = "idle"
             self._session += 1
@@ -1117,6 +1122,7 @@ class App:
     def _finish_locked(self) -> None:
         log.info("recording stopped after %.1fs", time.monotonic() - self.recorder.started_at)
         self.recorder.close()
+        self.media.resume()   # the microphone is closed: the music can play while the text is typed
         self.hotkeys.escape_off()
         self.state = "busy"
         self._session += 1
@@ -1689,6 +1695,8 @@ class App:
 
         def quit_app(icon, item):
             self._quitting.set()
+            self.media.resume()   # quitting mid-dictation leaves no music paused
+            self.media.wait(2)
             if self.checker is not None:
                 self.checker.stop()   # Whisper's process too
             self.engine.unload()

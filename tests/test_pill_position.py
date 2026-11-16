@@ -301,6 +301,7 @@ class FakePill:
 
 def make_app(tmp_path):
     app = App.__new__(App)
+    app.media = types.SimpleNamespace(pause=lambda: None, resume=lambda: None, wait=lambda t=5: None)
     app.paths = types.SimpleNamespace(data_dir=tmp_path)
     app.state, app._lock, app.icon = "idle", threading.Lock(), None
     app.overlay = FakePill()

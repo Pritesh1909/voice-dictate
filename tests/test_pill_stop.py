@@ -76,6 +76,7 @@ def test_click_elsewhere_does_nothing(monkeypatch):
 def test_app_stops_only_a_recording():
     calls = []
     app = App.__new__(App)
+    app.media = types.SimpleNamespace(pause=lambda: None, resume=lambda: None, wait=lambda t=5: None)
     app._lock, app.state = threading.Lock(), "recording"
     app._finish_locked = lambda: calls.append("finish")
     app.stop_from_pill()

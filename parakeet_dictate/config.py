@@ -141,6 +141,7 @@ class Config:
     overlay_always: bool    # button style: stay on screen when idle (click to start dictating)
     input_device: str
     silence_stop_seconds: int  # 0 = off
+    pause_media: bool          # pause playing music/videos while recording
     commands_enabled: bool
     commands: tuple[tuple[str, str], ...]          # (normalized phrase, action)
     context_enabled: bool
@@ -254,6 +255,7 @@ def parse(text: str, defaults_text: str | None = None) -> Config:
         == "always",
         input_device=_get(d, "audio", "input_device", str),
         silence_stop_seconds=_get(d, "audio", "silence_stop_seconds", int, lambda v: v == 0 or 5 <= v <= 3600),
+        pause_media=_get(d, "audio", "pause_media", bool),
         commands_enabled=_get(d, "commands", "enabled", bool),
         commands=_commands(d),
         context_enabled=_get(d, "context", "enabled", bool),

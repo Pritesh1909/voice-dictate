@@ -58,6 +58,8 @@ PAGES: list[tuple[str, list[tuple[str, list[Spec]]]]] = [
             S(("audio", "silence_stop_seconds"), "int", "Stop after silence (seconds)",
               "Ends a tapped dictation when nothing has been said this long. 0 = never.",
               lo=0, hi=3600, step=5),
+            S(("audio", "pause_media"), "switch", "Pause music while dictating",
+              "Music or videos that are playing pause while you speak, then carry on."),
         ]),
         ("Speech model", [
             S(("model", "dir"), "model", "Model",

@@ -68,6 +68,7 @@ def test_extras_register_and_report_clashes(monkeypatch):
 
 def _app(tmp_path, **cfg):
     app = App.__new__(App)
+    app.media = types.SimpleNamespace(pause=lambda: None, resume=lambda: None, wait=lambda t=5: None)
     app.paths = config.Paths(tmp_path / "cfg", tmp_path / "data")
     app.paths.data_dir.mkdir(parents=True)
     app.cfg = config.Config(**{**config.parse("").__dict__, **cfg})
