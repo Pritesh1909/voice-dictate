@@ -12,6 +12,10 @@ caches them, so later processes don't pay it again.
 If the engine process dies while loading or decoding on a graphics card (a driver crash takes the whole
 process down, so no error message arrives), that is written to gpu-failed.json in the data folder, and
 device = "auto" uses only the CPU from then on, retrying the failed request there once.
+
+A model that can stream (Parakeet Unified EN, for example) can also be fed a phrase bit by bit while it is
+spoken (stream()); it answers with the words it is sure of and the ones it may still change. Models that
+can't (Parakeet v2 and v3) only ever read whole phrases.
 """
 from __future__ import annotations
 
@@ -31,6 +35,14 @@ DEVICES = ("auto", "gpu", "igpu", "cpu")
 GPU_MARKER = "gpu-failed.json"
 LOAD_TIMEOUT = 60.0      # the first GPU run compiles shaders (~20 s), which fits
 DECODE_TIMEOUT = 60.0
+STREAM_TIMEOUT = 10.0    # one piece of a phrase (about 0.25 s of audio) takes ~0.05 s on a graphics card
+# Parakeet Unified EN streams in steps of STREAM_CHUNK_MS, looking STREAM_RIGHT_MS ahead. Its own default
+# (1 s steps, ~1.1 s ahead) settles words ~1.5 s after they are said; these settle them ~0.45 s after, and
+# matched the whole-phrase read nearly as well (measured on six real dictations: 96.1% vs 96.9% of words).
+# They take about twice the work: fine on a discrete card (8x faster than speech on an RTX 2050), too
+# close to the voice on integrated graphics (Iris Xe: 21 s for 32 s), which keeps the default.
+STREAM_CHUNK_MS = 560
+STREAM_RIGHT_MS = 160
 
 
 @dataclass(frozen=True)
@@ -133,8 +145,27 @@ def _load(spec: EngineSpec, report=lambda device_type, name: None):
         note = f"on {name}"
         if tried:
             note += f" (fell back after: {'; '.join(tried)})"
-        return model, session, vocab, language, note, lang_note, (dev.device_type, name)
+        return model, session, vocab, language, note, lang_note, (dev.device_type, name), _can_stream(model)
     raise RuntimeError("could not load the model on any device: " + "; ".join(tried))
+
+
+def _can_stream(model) -> bool:
+    try:
+        return bool(model.capabilities.supports_streaming)
+    except Exception:
+        return False
+
+
+def _stream_options(model, device_type: str | None):
+    """The stream settings for this model on this device (None = the model's own defaults)."""
+    if device_type != "gpu":
+        return None
+    try:
+        import transcribe_cpp as tc
+        o = tc.ParakeetBufferedStreamOptions(chunk_ms=STREAM_CHUNK_MS, right_ms=STREAM_RIGHT_MS)
+        return o if model.accepts(o) else None
+    except Exception:
+        return None
 
 
 def _load_vad(path: str):
@@ -156,23 +187,59 @@ def _worker(conn, spec: EngineSpec) -> None:  # runs in the child process
     try:
         t = time.perf_counter()
         # `model` must stay referenced while the session is used
-        model, session, vocab, language, note, lang_note, device = _load(
+        model, session, vocab, language, note, lang_note, device, streams = _load(
             spec, lambda kind, name: conn.send(("loading", kind, name)))
         conn.send(("loading", "cpu", "voice detector"))
         vad_model, vad, vad_frame, vad_note = _load_vad(spec.vad)
         if vad_note:
             note += f"; {vad_note}"
-        conn.send(("ready", time.perf_counter() - t, note, vad_frame, device, lang_note))
+        conn.send(("ready", time.perf_counter() - t, note, vad_frame, device, lang_note, streams))
     except Exception as e:
         conn.send(("error", f"{type(e).__name__}: {e}"))
         return
+    extra = {"prompt": spec.prompt} if spec.prompt else {}
+    stream = None          # the phrase being streamed, if any (one at a time; a decode ends it)
+    stream_opts = _stream_options(model, device[0]) if streams else None
+
+    def end_stream():
+        nonlocal stream
+        if stream is not None:
+            try:
+                stream.reset()
+            except Exception:
+                pass
+            stream = None
+
     while True:
         try:
             msg = conn.recv()
         except (EOFError, OSError):
             return  # parent went away
         if msg[0] == "quit":
+            end_stream()
             return
+        if msg[0] == "stream":  # ("stream", samples, new) -> ("partial", committed, tentative, seconds)
+            t = time.perf_counter()
+            try:
+                if msg[2]:
+                    end_stream()
+                    try:
+                        stream = session.stream(vocabulary=vocab, language=language, family=stream_opts, **extra)
+                    except Exception:
+                        if stream_opts is None:
+                            raise
+                        log.warning("stream settings refused; using the model's own")
+                        stream_opts = None
+                        stream = session.stream(vocabulary=vocab, language=language, **extra)
+                elif stream is None:
+                    raise RuntimeError("no phrase is being streamed")
+                stream.feed(msg[1])
+                txt = stream.text()
+                conn.send(("partial", txt.committed, txt.tentative, time.perf_counter() - t))
+            except Exception as e:
+                end_stream()
+                conn.send(("error", f"{type(e).__name__}: {e}"))
+            continue
         if msg[0] == "vad":  # ("vad", samples, new_stream, flush) -> ("probs", scores of completed frames)
             try:
                 if msg[2]:
@@ -185,9 +252,9 @@ def _worker(conn, spec: EngineSpec) -> None:  # runs in the child process
                 conn.send(("error", f"{type(e).__name__}: {e}"))
             continue
         if msg[0] == "decode":
+            end_stream()  # the session reads one thing at a time
             t = time.perf_counter()
             try:
-                extra = {"prompt": spec.prompt} if spec.prompt else {}
                 r = session.run(msg[1], vocabulary=vocab, language=language, **extra)
                 conn.send(("text", r.text, time.perf_counter() - t))
             except Exception as e:
@@ -217,6 +284,7 @@ class Engine:
         self.note = ""
         self.load_seconds = 0.0
         self.vad_frame = 0          # samples per voice-detector score; 0 = no detector loaded
+        self.streams = False        # the loaded model can be fed a phrase bit by bit (stream())
         self.device: tuple[str, str] | None = None     # (device type, name) the model is loaded on
         self._loading: tuple[str, str] | None = None   # what the engine process is loading on right now
         self._why_cpu = ""          # why "auto" runs on the CPU this time (a recorded GPU crash)
@@ -270,6 +338,7 @@ class Engine:
         self._ready.clear()
         self._error = None
         self.device = self._loading = None
+        self.streams = False
         self._gen += 1
         threading.Thread(target=self._await_ready, args=(parent, self._gen), daemon=True).start()
 
@@ -291,6 +360,7 @@ class Engine:
                 self._error = STOPPED   # killed on purpose: not a crash, nothing to retry
             elif msg[0] == "ready":
                 self.load_seconds, note, self.vad_frame, self.device, lang_note = msg[1:6]
+                self.streams = bool(msg[6]) if len(msg) > 6 else False
                 self.note = f"{note}; {self._why_cpu}" if self._why_cpu else note
                 log.info("model loaded in %.1fs %s", self.load_seconds, self.note)
                 if lang_note:
@@ -368,6 +438,13 @@ class Engine:
         """"gpu", "igpu" or "cpu": the kind of device the model loaded on, once wait_ready() is True."""
         return self.device[0] if self.device else None
 
+    @property
+    def can_stream(self) -> bool:
+        """Worth streaming: the loaded model can stream and runs on a graphics card. On the CPU streaming
+        falls behind the voice (measured: 32 s of speech took 34 s on an i7-1260P), so phrases are read
+        whole there, as with models that can't stream."""
+        return self.streams and _on_gpu(self.device_type)
+
     def wait_ready(self, timeout: float = LOAD_TIMEOUT) -> bool:
         """Wait for the model (started by warm()). False if it failed, timed out or was unloaded."""
         return self._ready.wait(timeout) and not self._error and self._proc is not None and not self._closed
@@ -410,6 +487,35 @@ class Engine:
             log.warning("voice detector failed: %s", msg[1])
             return None
         return msg[1]
+
+    def stream(self, samples, new: bool) -> tuple[str, str, float] | None:
+        """Feed the next piece of the phrase being spoken (16 kHz); new = it starts a phrase. Returns
+        (words it is sure of, words it may still change, seconds taken), each covering the phrase so far,
+        or None when streaming failed (the caller then reads whole phrases). A transcribe() in between
+        ends the phrase being streamed."""
+        if not self.wait_ready() or not self.streams:
+            return None
+        with self._lock:
+            conn = self._conn
+            if conn is None:
+                return None
+            try:
+                conn.send(("stream", samples, new))
+                if not conn.poll(STREAM_TIMEOUT):
+                    log.warning("streaming timed out; restarting the engine")
+                    self.unload()   # a late reply would otherwise be read as the answer to the next request
+                    return None
+                msg = conn.recv()
+            except (EOFError, OSError) as e:
+                if not self._closed:
+                    self._gpu_crashed(self.device, "streaming")
+                log.warning("streaming: %s", e)
+                self.unload()
+                return None
+        if msg[0] != "partial":
+            log.warning("streaming failed: %s", msg[1])
+            return None
+        return msg[1], msg[2], msg[3]
 
     def done(self) -> None:
         """A dictation ended (typed, cancelled or nothing heard).
