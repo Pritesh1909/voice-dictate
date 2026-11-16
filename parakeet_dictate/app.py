@@ -37,6 +37,13 @@ MIC_LOST = "Microphone disconnected. Dictation stopped."
 # Session._preview), once it holds this much audio.
 PREVIEW_EVERY = 0.5
 PREVIEW_MIN_SECONDS = 0.6
+# A model that streams gets the phrase being spoken in pieces of at least this much audio instead. If it
+# falls behind (more than STREAM_SLOW seconds of model time per second of speech, once STREAM_JUDGE_SECONDS
+# have been streamed, or one piece takes STREAM_STALL seconds) the dictation goes back to re-reading.
+STREAM_MIN_PIECE = 0.1
+STREAM_SLOW = 0.6
+STREAM_JUDGE_SECONDS = 3.0
+STREAM_STALL = 3.0
 
 FAILED_NOTE = "Couldn't transcribe. The recording was kept: tray menu → Retry last recording."
 DOUBLED_NOTE = ("Retry couldn't tell which words were already typed, so it inserted them all. "
@@ -129,7 +136,8 @@ class Session:
         self.matcher = commands.CommandMatcher(app.cfg.commands, self.out.commands)
         self.hwnd = app.target_hwnd                       # "scratch that" only backspaces in this window
         live = self.parallel and self.out.type_while_speaking
-        # Live streaming: re-read the phrase being spoken and type its words before the pause.
+        # Live streaming: type the words of the phrase being spoken before the pause. A model that streams
+        # (on a graphics card) is fed the phrase as it grows; any other model re-reads it (see _preview).
         self.stream = (live and self.vad_mode and app.cfg.stream_while_speaking and self.out.method == "type")
         self.typer = (output.PhraseTyper(self.cleaner.clean, self.out.method, self.out.add_trailing_space,
                                          matcher=self.matcher, can_backspace=self._same_window,
@@ -142,6 +150,11 @@ class Session:
         self._preview_part = -1          # which phrase it was for, and how much audio it had
         self._preview_len = 0
         self.preview_seconds = 0.0
+        self._native: bool | None = None  # the model streams: decided once it has loaded (_maybe_stream)
+        self._fed_part = -1              # the phrase being streamed, and how much of its audio was sent
+        self._fed_len = 0
+        self.stream_seconds = 0.0        # model time spent streaming, and the audio it covered (samples)
+        self._streamed = 0
         self.total_samples = 0
         self.parts = 0
         self.decode_seconds = 0.0
@@ -188,7 +201,7 @@ class Session:
                 parts = self.vad_seg.push(x16, probs) if not final else self.vad_seg.flush_with(x16, probs)
                 for part in parts:
                     self._enqueue(part, SR)
-                if self.stream and not final:
+                if self.stream and not final and not self._maybe_stream():
                     self._maybe_preview()
                 return
             self._fall_back(x16)
@@ -226,6 +239,55 @@ class Session:
         self._busy += 1
         self._q.put((self.parts, samples, rate))
         self.parts += 1
+
+    def _maybe_stream(self) -> bool:
+        """With a model that streams, running on a graphics card: send the new audio of the phrase being
+        spoken to the worker, which feeds it to the model and types the words the model is sure of. False
+        when this dictation re-reads the open phrase instead (other models, the CPU, or streaming failed)."""
+        if self._native is None:
+            self._native = bool(getattr(self.app.engine, "can_stream", False))
+            if self._native:
+                log.info("streaming each phrase to the model as it is spoken")
+        if not self._native:
+            return False
+        audio = self.vad_seg.open_audio() if self.vad_seg is not None else None
+        if audio is None or audio.size == 0:
+            return True
+        new = self._fed_part != self.parts or audio.size < self._fed_len
+        start = 0 if new else self._fed_len
+        if audio.size - start < STREAM_MIN_PIECE * SR:
+            return True
+        self._fed_part, self._fed_len = self.parts, audio.size
+        self._q.put(("feed", self.parts, audio[start:].copy(), new))
+        return True
+
+    def _feed(self, part: int, samples, new: bool) -> None:
+        """Worker: stream a piece of the open phrase, unless that phrase has ended meanwhile (its final read
+        is queued, and that one counts). The words typed here are corrected by the final read, as with
+        re-reading. If streaming fails or falls behind the voice, the rest of the dictation re-reads."""
+        if part != self.parts or not self._native or self._cancelled or self._error:
+            return
+        try:
+            r = self.app.engine.stream(samples, new)
+        except Exception as e:
+            log.warning("streaming failed: %s", e)
+            r = None
+        if r is None:
+            self._stop_streaming("the model stopped streaming")
+            return
+        sure, maybe, secs = r
+        self.stream_seconds += secs
+        self._streamed += samples.size
+        heard = self._streamed / SR
+        if secs > STREAM_STALL or (heard >= STREAM_JUDGE_SECONDS and self.stream_seconds > STREAM_SLOW * heard):
+            self._stop_streaming(f"too slow ({self.stream_seconds:.1f}s for {heard:.1f}s of speech)")
+        if part == self.parts and self.typer and (sure.strip() or maybe.strip()):
+            self.typer.preview((sure + maybe).strip(), stable=sure.strip())
+
+    def _stop_streaming(self, why: str) -> None:
+        if self._native:
+            log.warning("streaming stopped for this dictation: %s; re-reading phrases instead", why)
+        self._native = False
 
     def _maybe_preview(self) -> None:
         """Ask for a provisional read of the phrase being spoken, when the worker has nothing else to do,
@@ -274,6 +336,9 @@ class Session:
                 return
             if item[0] == "preview":
                 self._preview(item[1], item[2])
+                continue
+            if item[0] == "feed":
+                self._feed(item[1], item[2], item[3])
                 continue
             try:
                 if self._cancelled or self._error:
@@ -1086,7 +1151,8 @@ class App:
             self.last_stats = (f"{spoken:.1f}s speech in {session.parts} part(s), "
                                f"{'voice detector' if session.vad_mode else 'loudness'} cuts; "
                                f"text done {waited:.1f}s after you stopped")
-            log.info("dictation: %s (model time %.1fs)", self.last_stats, session.decode_seconds)
+            log.info("dictation: %s (model time %.1fs, streaming %.1fs)", self.last_stats, session.decode_seconds,
+                     session.stream_seconds)
             if self.cfg.log_transcripts:
                 log.info("raw: %r | clean: %r", raw, text)
             if not text:

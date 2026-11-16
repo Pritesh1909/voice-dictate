@@ -56,6 +56,8 @@ process_while_speaking = true
 # pause the whole phrase is read once more and, if that differs, the end is corrected with Backspace
 # (only in the window you started in). Needs the voice detector, [output] type_while_speaking and
 # method = "type". false = type each phrase at the pause.
+# A model that can stream (Parakeet Unified EN), on a graphics card, is fed the phrase as you speak
+# instead of re-reading it: the same result, typed about half a second behind your voice.
 stream_while_speaking = true
 # A pause at least this long (seconds) ends a phrase, which is then transcribed in the background.
 # Shorter = text sooner but more risk of splitting a sentence. 0.6 is what Orca uses with its voice detector.

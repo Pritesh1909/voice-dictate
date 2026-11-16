@@ -239,6 +239,17 @@ def _bare(word: str) -> str:
     return word.rstrip(".,;:!?…")
 
 
+def _agree(a: list[str], b: list[str]) -> int:
+    """How many words at the start of a and b are the same ("admin." at the end of one read is "admin"
+    in the next)."""
+    n = 0
+    for x, y in zip(a, b):
+        if _bare(x) != _bare(y):
+            break
+        n += 1
+    return n
+
+
 class PhraseTyper:
     """Types finished phrases in order while the user keeps talking.
 
@@ -287,23 +298,23 @@ class PhraseTyper:
     def _backspace_ok(self) -> bool:
         return self.method == "type" and self.failed is None and bool(self._can_backspace())
 
-    def preview(self, raw: str) -> None:
+    def preview(self, raw: str, stable: str | None = None) -> None:
         """A provisional read of the phrase still being spoken (live streaming).
 
-        Parakeet reads a whole phrase at a time, so the app re-reads the open phrase about twice a
+        Parakeet v2 and v3 read a whole phrase at a time, so the app re-reads the open phrase about twice a
         second. A word is typed once two reads in a row agree on it and it isn't the last word (the
-        last one is still being said). Words that could still become part of a dictionary term, and a
+        last one is still being said). A model that streams says itself which words it won't change
+        (`stable`, the start of `raw`): those are typed without waiting for a second read, and so is
+        any word two updates in a row agree on (the model settles words a second or two late). Words that could still become part of a dictionary term, and a
         phrase that could be a spoken command, wait. Words typed are never taken back here: when the
         phrase ends, add() corrects them against the final read."""
         if not self.stream or self.cancelled or self.stopped or self.failed is not None:
             return
         words = self._clean(raw).split()
         with self._lock:
-            agree = 0
-            for a, b in zip(self._prev_words, words):
-                if _bare(a) != _bare(b):   # "admin." at the end of one read is "admin" in the next
-                    break
-                agree += 1
+            agree = _agree(self._prev_words, words)
+            if stable is not None:
+                agree = max(agree, _agree(self._clean(stable).split(), words))
             self._prev_words = words
             n = min(agree, len(words) - 1)
             if self._matcher and self._matcher.could_start(" ".join(words)):

@@ -174,3 +174,39 @@ def test_streaming_setting():
     assert config.parse("[model]\nstream_while_speaking = false").stream_while_speaking is False
     with pytest.raises(config.ConfigError):
         config.parse("[model]\nstream_while_speaking = 'yes'")
+
+
+# --- a model that streams says which words are settled ----------------------------------------------
+
+def test_settled_words_are_typed_at_once():
+    s = Screen()
+    t = typer(s)
+    t.preview("I think we should", stable="I think")
+    assert s.text == "I think"                     # no second read needed
+    assert t.tentative == "we should"
+    t.preview("I think we should deploy the", stable="I think we should deploy")
+    assert s.text == "I think we should deploy"
+    t.add("I think we should deploy the core service first.")
+    t.pump()
+    assert s.text == "I think we should deploy the core service first. "
+    assert all(k == "type" for k, _ in s.log)
+
+
+def test_a_settled_part_of_a_word_is_not_typed():
+    s = Screen()
+    t = typer(s)
+    t.preview("the microservices", stable="the micro")   # "micro" is only the start of a word
+    assert s.text == "the"
+    t.preview("the micro", stable="the micro")            # nothing after it yet: it may still grow
+    assert s.text == "the"
+
+
+def test_settled_number_words_still_wait_for_the_number_to_end():
+    s = Screen()
+    t = typer(s)
+    t.preview("Wait twenty five", stable="Wait twenty")
+    t.preview("Wait twenty five percent", stable="Wait twenty five")
+    t.add("Wait twenty five percent.")
+    t.pump()
+    assert s.text == "Wait 25%. "
+    assert all(k == "type" for k, _ in s.log)

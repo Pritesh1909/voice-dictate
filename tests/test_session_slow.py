@@ -144,3 +144,41 @@ def test_falls_back_to_loudness_detector(vad_engine, monkeypatch, tmp_path):
     s, raw, sent, _ = run_session(vad_engine, speech(tmp_path), monkeypatch)
     assert not s.vad_mode
     assert "Mailzzy campaign" in "".join(t for _, t in sent)
+
+
+@pytest.fixture(scope="module")
+def unified_engine():
+    """Parakeet Unified EN, a model that streams, on the graphics card (skipped when either is missing)."""
+    vad = models.find_vad("auto")
+    found = [m for m in models.find(include_wsl=False) if "unified" in m.path.name.lower()]
+    if vad is None or not found:
+        pytest.skip("Parakeet Unified EN or Silero VAD not on this PC")
+    c = config.parse("")
+    e = Engine(EngineSpec.for_model(found[0], c.threads, device="auto", vad=str(vad)), unload_after=-1)
+    e.warm()
+    assert e.wait_ready() and e.streams, e.note
+    if not e.can_stream:
+        e.unload()
+        pytest.skip(f"no graphics card ({e.note})")
+    yield e
+    e.unload()
+
+
+def test_a_streaming_model_types_words_before_the_pause(unified_engine, monkeypatch, tmp_path):
+    audio = speech(tmp_path)
+    screen = [""]
+    s, raw, sent, stopped = run_session(unified_engine, audio, monkeypatch, screen=screen,
+                                        stream_while_speaking=True)
+    t0 = stopped - audio.size / SR
+    print(f"\nscreen: {screen[0]!r}\nstreaming: {s.stream_seconds:.2f}s of model time, "
+          f"re-reads: {s.preview_seconds:.2f}s")
+    for t, x in sent:
+        print(f"  {t - t0:6.2f}s  {x!r}")
+    assert s._native, "fell back to re-reading"
+    assert s.preview_seconds == 0                             # nothing was re-read
+    assert s.stream_seconds < 0.5 * audio.size / SR           # well ahead of the voice
+    # the same text as reading each phrase whole: the final reads decide it
+    assert screen[0] == Cleaner.from_config(config.parse("")).clean(raw) + " "
+    assert "deploy the core service first." in screen[0]
+    # words went out before the first phrase ended (it ends about 4 s in)
+    assert min(t - t0 for t, _ in sent) < 0.5 + 3.4

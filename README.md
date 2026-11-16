@@ -277,6 +277,19 @@ press_enter = true
   in full; if that differs, the end is corrected with Backspace (type mode, same window only — otherwise the
   typed words stay and the rest is added). Measured on TTS speech: words landed every ~0.5 s and the final text
   was identical to phrase-at-a-time typing, with no corrections needed.
+- **Real streaming with models that support it** (Parakeet Unified EN, which Orca downloads as
+  "parakeet-unified-en-0.6b"; pick it in Settings → Speech model): on a graphics card the phrase being spoken
+  is fed to the model in quarter-second pieces instead of being re-read, and the words it is sure of (or that
+  two updates in a row agree on) are typed. The pause, the final full read, the corrections and the spoken
+  commands work exactly as above, so the text you end up with is the same. Nothing to switch on: it is used
+  whenever the chosen model can stream and runs on a graphics card. Parakeet v2 and v3 can't stream and keep
+  re-reading; so does any model on the CPU, where streaming falls behind the voice (measured on an i7-1260P:
+  32 s of speech took 34 s). If streaming fails or falls behind during a dictation (more than 0.6 s of model
+  time per second of speech), that dictation goes back to re-reading without losing a word.
+  Measured on an RTX 2050: words land ~0.45 s after they are said (steps of 0.56 s, 0.16 s look-ahead;
+  the model's own setting is ~1.5 s), about as soon as re-reading with v2, for a fixed cost per piece
+  instead of re-reading a phrase that keeps growing. Integrated graphics (Iris Xe) uses the model's own
+  setting, which it keeps up with.
 - **Audio clean-up** before recognition: DC offset removed, silence trimmed, quiet speech raised (max 8×),
   and padding at the end so the last word isn't cut.
 - **Background-noise reduction** (`[accuracy] noise_reduction`, default `"auto"`): steady noise such as a fan,
