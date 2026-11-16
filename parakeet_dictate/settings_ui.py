@@ -11,13 +11,14 @@ from __future__ import annotations
 
 import logging
 import os
+import platform
 import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from . import APP_NAME, config, hotkey
+from . import APP_NAME, __version__, config, hotkey
 from .commands import ACTIONS
 from . import settings_store as store_mod
 from .settings_store import Key, Store
@@ -31,7 +32,7 @@ log = logging.getLogger(__name__)
 class Spec:
     key: Key | None          # None for things that aren't in config.toml (start with Windows, notes)
     kind: str                # switch | choice | combo | int | float | csv | list | pairs | commands |
-                             # hotkey | startup | model | mic | vad | learned_auto | note
+                             # hotkey | startup | model | mic | vad | learned_auto | note | action | info
     label: str
     help: str = ""
     choices: tuple[tuple[str, str], ...] = ()   # (value, label)
@@ -39,6 +40,7 @@ class Spec:
     hi: float = 0
     step: float = 1
     browse: str = ""         # list editors: "" (type entries), "folders", "files+folders"
+    fact: str = ""           # info rows: which ABOUT fact is shown on the right (choices: buttons next to it)
 
 
 S = Spec
@@ -218,8 +220,49 @@ PAGES: list[tuple[str, list[tuple[str, list[Spec]]]]] = [
               choices=(("open_log", "Open log"), ("open_file", "Open settings file"))),
         ]),
     ]),
+    ("About", [
+        ("Parakeet Dictate", [
+            S(None, "info", "Version", "Offline push-to-talk dictation for Windows. Your voice never leaves this PC.",
+              fact="version"),
+            S(None, "info", "Speech engine",
+              "transcribe.cpp, the engine Orca uses. Models that can stream (Parakeet Unified EN) are fed your "
+              "voice as you speak when they run on a graphics card; others read each phrase at the pause.",
+              fact="engine"),
+            S(None, "info", "Python", "", fact="python"),
+        ]),
+        ("Files", [
+            S(None, "info", "Data folder", "Settings, log, history and learned words.", fact="data_dir",
+              choices=(("open_data", "Open folder"), ("open_log", "Open log"))),
+        ]),
+        ("Credits", [
+            S(None, "info", "Speech models", "Found in Orca's folder, or downloaded from Hugging Face.",
+              fact="models"),
+            S(None, "info", "Font", "", fact="font"),
+            S(None, "info", "Look", "", fact="theme"),
+        ]),
+    ]),
 ]
 del S
+
+
+def _engine_version() -> str:
+    from importlib import metadata
+    try:
+        return f"transcribe.cpp {metadata.version('transcribe-cpp')}"
+    except Exception:
+        return "transcribe.cpp"
+
+
+# What the About page shows on the right of each info row (paths: config.Paths).
+ABOUT: dict[str, Callable[[Any], str]] = {
+    "version": lambda paths: __version__ + ("" if getattr(sys, "frozen", False) else " (run from source)"),
+    "engine": lambda paths: _engine_version(),
+    "python": lambda paths: platform.python_version(),
+    "data_dir": lambda paths: str(paths.data_dir),
+    "models": lambda paths: "NVIDIA Parakeet",
+    "font": lambda paths: "Inter (SIL Open Font License 1.1)",
+    "theme": lambda paths: "Sun Valley (sv-ttk)",
+}
 
 def normalize(spec: Spec, v: Any) -> Any:
     """Values as the window compares them (heard_as text -> list, None -> empty)."""
@@ -561,6 +604,22 @@ class SettingsWindow:
         if spec.help:
             ttk.Label(text, text=spec.help, style="Help.TLabel", justify="left",
                       wraplength=self.px(540 if spec.kind in BELOW else 290)).pack(anchor="w")
+        if spec.kind == "info":             # not a setting: a fact, and maybe buttons next to it
+            right = ttk.Frame(card, style="Row.TFrame")
+            right.grid(row=0, column=1, sticky="e", padx=(self.px(12), 0))
+            try:
+                value = ABOUT[spec.fact](self.store.paths)
+            except Exception as e:
+                value = f"unknown ({type(e).__name__})"
+            label = ttk.Label(right, text=value, style="Strong.TLabel", justify="right",
+                              wraplength=self.px(290))
+            label.pack(side="left")
+            self.about = getattr(self, "about", {})
+            self.about[spec.fact] = label
+            for action, text in spec.choices:
+                ttk.Button(right, text=text, command=lambda a=action: self.do_action(a)).pack(
+                    side="left", padx=(self.px(8), 0))
+            return
         if spec.kind == "action":
             buttons = ttk.Frame(card, style="Row.TFrame")
             buttons.grid(row=0, column=1, sticky="e", padx=(self.px(12), 0))
@@ -614,6 +673,8 @@ class SettingsWindow:
                           "free_memory": "The model is unloaded when this window closes."}[action])
         elif action == "open_log":
             self._open_if_there(paths.log_file, "There is no log yet.")
+        elif action == "open_data":
+            self._open_if_there(paths.data_dir, "There is no data folder yet.")
         elif action == "open_learned":
             self._open_if_there(paths.learned_file,
                                 'No learned words yet. Use "Correct last dictation" to teach some.')

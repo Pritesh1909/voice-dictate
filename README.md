@@ -71,7 +71,7 @@ Ctrl+Q is taken over system-wide while the app runs, so other apps no longer rec
 ### Settings window
 
 Tray menu → **Settings…** (or double-click the tray icon) opens a Windows 11 style window (light or dark,
-following Windows) with four pages, each made of titled groups:
+following Windows) with five pages, each made of titled groups:
 
 | Page | Groups |
 |---|---|
@@ -79,6 +79,7 @@ following Windows) with four pages, each made of titled groups:
 | **Shortcuts** | Dictate · Copy last dictation · Correct last dictation · History · hold time · Esc cancels |
 | **Improvements** | Dictionary (names and terms, "heard as", learned words) · Clean-up (fillers, repeated words, numbers, ticket prefixes) · Context words · Learning in the background (learn from my dictations, ask Claude, the automatic fixes with *Undo* and *Reset all*) · Recognition (voice detector, audio clean-up, preferred words) |
 | **Extras** | Performance (memory, threads, pauses, longest dictation, *Free now*) · Spoken commands · Details · Privacy and files (log dictated text, keep a history, history length, keep recordings for learning and for how many days, *Delete all* / *Open folder* for the recordings, *Open log*, *Open settings file*) |
+| **About** | Parakeet Dictate (version, speech engine, Python) · Files (data folder with *Open folder* / *Open log*) · Credits |
 
 - **Change…** next to a shortcut listens for the next key combination: Ctrl/Alt/Shift/Win plus one key
   (F-keys may be used alone). Esc cancels; Backspace goes back to Ctrl+Q for Dictate and removes the

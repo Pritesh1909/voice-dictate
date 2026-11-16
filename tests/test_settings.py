@@ -428,7 +428,7 @@ def test_model_list_follows_the_custom_folders(window):
 
 def test_pages_are_grouped(window):
     from parakeet_dictate import settings_ui
-    assert [name for name, _ in settings_ui.PAGES] == ["General", "Shortcuts", "Improvements", "Extras"]
+    assert [name for name, _ in settings_ui.PAGES] == ["General", "Shortcuts", "Improvements", "Extras", "About"]
     general = dict(settings_ui.PAGES)["General"]
     assert [g for g, _ in general] == ["Start-up", "Microphone", "Speech model", "Typing", "On-screen indicator"]
     assert window.field(("overlay", "style")).control.get() == "pill"
@@ -539,3 +539,17 @@ def test_scrollbar_drag_moves_once_per_frame_and_stays_in_range(window):
 def test_open_settings_file_button(window, paths):
     window.open_settings_file()
     assert window.opened == [paths.config_file]
+
+
+def test_about_page_shows_the_version_and_the_data_folder(window, paths):
+    from parakeet_dictate import __version__
+    window.show("About")
+    shown = {k: v.cget("text") for k, v in window.about.items()}
+    assert shown["version"].startswith(__version__)
+    assert shown["engine"].startswith("transcribe.cpp")
+    assert shown["data_dir"] == str(paths.data_dir)
+    assert not window.dirty()                            # nothing on it is a setting
+    paths.data_dir.mkdir(parents=True, exist_ok=True)
+    (paths.data_dir / "x.txt").write_text("x")
+    window.do_action("open_data")
+    assert window.opened[-1] == paths.data_dir
